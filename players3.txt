@@ -1,0 +1,3 @@
+pid=8518
+scanned 543 MB, 0 player-shaped objects
+libg_base 0x7727a35000

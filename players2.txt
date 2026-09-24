@@ -1,0 +1,2 @@
+scanned 370 MB, 0 player-shaped objects
+libg_base 0x771e6a2000

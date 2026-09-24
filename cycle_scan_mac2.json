@@ -1,0 +1,2 @@
+pid=9952
+{"event":"mumu_cycle_vector_scan","pid":9952,"vector_count":47,"pairs":[{"header0":"0x78857002a0","data0":"0xb4000077969c28d0","values0":[6,3,7,4],"header1":"0x78857002b0","data1":"0xb4000077a7311500","values1":[5,1,0,2],"distance":16}]}

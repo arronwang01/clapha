@@ -1,0 +1,18 @@
+# Supercell's game library -- proprietary, never redistribute
+*.so
+libg-*
+
+# upstream reference clone (its own repo)
+ref-cr-native-sandbox/
+
+# build outputs, logs, deck exchange files, match recordings
+build/
+artifacts/
+
+# game screenshots
+screen*.png
+
+# python / macOS
+__pycache__/
+*.pyc
+.DS_Store

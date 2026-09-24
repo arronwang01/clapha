@@ -1,0 +1,110 @@
+{
+  "schema_version": 2,
+  "kind": "mumu_readonly_pointer_contract",
+  "derived_from": "IMAX9D/cr-native-sandbox bindings/mumu-live-160402002-arm64.json",
+  "version_code": 160402012,
+  "abi": "arm64-v8a",
+  "libg_sha256": "aec6cc5e473edc809f10c157ae553dbbb8724d816f34148344b7f94a67e5a97c",
+  "observed_resource_version": "16.402.13",
+  "host": "MuMu Player Pro on macOS arm64 (native, tagged heap pointers)",
+  "manager_global_rva": "0x1a57e88",
+  "manager_global_rva_upstream_002": "0x1a569a8",
+  "pointer_tagging": "mask 0x00FFFFFFFFFFFFFF before any pread; Android top-byte heap tags (0xb4) are present here",
+  "manager_to_context": "0x28",
+  "context_to_battle": "0x90",
+  "battle_tick": "0x60",
+  "applied_replay_tick": "0x1bc",
+  "battle_to_player_state": "0xa8",
+  "verified": [
+    "manager_global_rva",
+    "manager_to_context",
+    "context_to_battle",
+    "battle_tick",
+    "battle_to_player_state",
+    "player_hand_vector",
+    "player_cycle_vector",
+    "player_elixir_raw",
+    "entity registry/collection",
+    "entity_fields",
+    "screen_calibration"
+  ],
+  "unverified_on_this_build": [
+    "ability availability/cooldown/charges",
+    "refill timer",
+    "game mode discriminator"
+  ],
+  "screen": {
+    "physical": [
+      1440,
+      2560
+    ],
+    "aspect": "9:16 (same as upstream 1080x1920)",
+    "recalibration_required": false,
+    "verified_by": "Cannon cell 170 landed at canonical (8500,9500), zero native-unit error",
+    "arena_box_px": [
+      79,
+      214,
+      1361,
+      1968
+    ],
+    "hand_points_px": [
+      [
+        446,
+        2278
+      ],
+      [
+        720,
+        2278
+      ],
+      [
+        994,
+        2278
+      ],
+      [
+        1267,
+        2278
+      ]
+    ],
+    "do_not_apply_extra_y_offset": "upstream ScreenLayout already shifts one tile (.685/32)",
+    "x_mirror": "canonical x is mirrored for BOTH sides: x_fraction = 1 - canonical_x/18000",
+    "upstream_bug": "upstream ScreenLayout mirrors only for side 1; see mac012/layout_fix.py",
+    "verified_side_0": "cell 165 -> native (3499,10307) after fix; (14500,9500) before"
+  },
+  "memory_access": "read_only",
+  "scope": "training camp only",
+  "player_state_to_players": [
+    "0xe0",
+    "0xe8"
+  ],
+  "player_hand_vector": "0x210",
+  "player_cycle_vector": "0x220",
+  "player_elixir_raw": "0x2f8",
+  "elixir_units_per_point": 10000,
+  "entity_fields": {
+    "category": "0x08",
+    "kind": "0x30",
+    "side": "0x78",
+    "x": "0x7c",
+    "y": "0x80",
+    "card_id": "0xac",
+    "level_zero_based": "0x120",
+    "behavior": "0x11c",
+    "components": "0x18",
+    "hp_component_in_components": "0x10",
+    "hp_pair_in_component": "0x10"
+  },
+  "observed_arena_coordinates": {
+    "x_towers": [
+      3500,
+      9000,
+      14500
+    ],
+    "y_king": [
+      3000,
+      29000
+    ],
+    "note": "same native units as upstream (side1 = local player at high y)"
+  },
+  "opponent_hand": "hidden (all -1) in training camp on this build; not recovered",
+  "opponent_deck": "not readable for any opponent type (trainer or real account): deck_card_ids stays empty"
+}

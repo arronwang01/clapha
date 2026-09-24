@@ -1,0 +1,19 @@
+{
+  "_comment": "Accounts the bot is allowed to play against. Add only accounts you own.",
+  "allow_bots": true,
+  "allowed": [
+    
+    {
+      "account_lo": 88303124,
+      "label": "Beater (own second account)"
+    },
+    {
+      "account_lo": 48410163,
+      "label": "own second account"
+    },
+    {
+      "account_lo": 79227807,
+      "label": "own main account"
+    }
+  ]
+}
