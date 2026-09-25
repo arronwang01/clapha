@@ -40,6 +40,10 @@ struct PendingInfo: Decodable {
     let kind: String
     let name: String
     let remainingTicks: Int
+    let screenX: Int?
+    let screenY: Int?
+    let screenW: Int?
+    let screenH: Int?
 }
 
 struct BotInfo: Decodable {

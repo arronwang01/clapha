@@ -53,7 +53,8 @@ HOG26_DECK = {26000021: 0,   # Hog Rider
               26000030: 0}   # Ice Spirit
 
 
-def pending_commands(queue: list, accounts, tick: int) -> list[dict]:
+def pending_commands(queue: list, accounts, tick: int, local_side=None,
+                     layout=None) -> list[dict]:
     """Every command in the queue, both sides, for the board's ghost markers.
 
     A command executes COMMAND_AGE_TICKS after its issue tick; until then it is only a
@@ -70,7 +71,22 @@ def pending_commands(queue: list, accounts, tick: int) -> list[dict]:
         remaining = issue + COMMAND_AGE_TICKS - int(tick)
         if side is None or remaining < 0:
             continue
-        out.append({'x': entry.get('x'), 'y': entry.get('y'), 'side': int(side),
+        screen = None
+        if layout is not None and local_side in (0, 1) and kind == 'card' \
+                and entry.get('x') is not None and entry.get('y') is not None:
+            # Device pixels, through the same verified geometry the taps use, so an overlay
+            # on the emulator window lines up with the game.
+            column = min(X_TILES - 1, max(0, int(entry['x']) // 1000))
+            row = min(Y_TILES - 1, max(0, int(entry['y']) // 1000))
+            try:
+                screen = layout.deployment_point(screen_cell(column, row, local_side), local_side)
+            except (ValueError, TypeError):
+                screen = None
+        out.append({'screen_x': screen[0] if screen else None,
+                    'screen_y': screen[1] if screen else None,
+                    'screen_w': getattr(layout, 'width', None),
+                    'screen_h': getattr(layout, 'height', None),
+                    'x': entry.get('x'), 'y': entry.get('y'), 'side': int(side),
                     'card_id': card_id, 'form': form, 'kind': kind,
                     'name': ('ability' if kind == 'ability' else
                              V.CARDS.get(card_id, {}).get('name', str(card_id))),
@@ -1147,8 +1163,9 @@ class Handler(BaseHTTPRequestHandler):
                 for player in frame['players']:
                     revealed[player['side']] = []
                 body = {'ok': True, 'age': age, 'pending': pending, 'lag_ticks': gap,
-                        'pending_commands': pending_commands(queue, accounts,
-                                                             frame.get('game_tick') or 0),
+                        'pending_commands': pending_commands(
+                            queue, accounts, frame.get('game_tick') or 0,
+                            health.get('local_side'), BOT.layout),
                         'session': V.SESSION.name, 'bot': bot, 'revealed': revealed,
                         **V.to_state(frame, health)}
             else:

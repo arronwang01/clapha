@@ -19,6 +19,8 @@ struct ContentView: View {
     @StateObject private var device2: DeviceModel
     @State private var page = 1
     @State private var showTools = false
+    @State private var overlayOn = false
+    @State private var overlay = MuMuOverlay()
     private let live: Bool
 
     @MainActor
@@ -30,7 +32,8 @@ struct ContentView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            TopBar(tasks: tasks, page: $page, device1: device1, device2: device2, showTools: $showTools)
+            TopBar(tasks: tasks, page: $page, device1: device1, device2: device2, showTools: $showTools,
+                   overlayOn: $overlayOn)
             Divider()
             if !device1.reachable && !device2.reachable {
                 HStack(spacing: 10) {
@@ -54,11 +57,24 @@ struct ContentView: View {
                     .frame(height: 340)
             }
         }
+        .onChange(of: overlayOn) { _, on in updateOverlay(on) }
+        .onChange(of: page) { _, _ in updateOverlay(overlayOn) }
         .onAppear {
             appLog("window appeared (live=\(live))")
             guard live else { return }
             device1.startPolling()
             device2.startPolling()
+        }
+    }
+}
+
+extension ContentView {
+    /// The overlay follows the device on the current page.
+    func updateOverlay(_ on: Bool) {
+        if on {
+            overlay.show(board: (page == 1 ? device1 : device2).board)
+        } else {
+            overlay.hide()
         }
     }
 }
@@ -71,6 +87,7 @@ struct TopBar: View {
     @ObservedObject var device1: DeviceModel
     @ObservedObject var device2: DeviceModel
     @Binding var showTools: Bool
+    @Binding var overlayOn: Bool
 
     private func tab(_ device: DeviceModel) -> String {
         device.summary.inBattle ? "\(device.title) · in battle" : device.title
@@ -86,6 +103,9 @@ struct TopBar: View {
             .pickerStyle(.segmented)
             .labelsHidden()
             .frame(maxWidth: 380)
+            Toggle(isOn: $overlayOn) { Label("Overlay on MuMu", systemImage: "circle.dashed") }
+                .toggleStyle(.button)
+                .help("Draws cards that are played but not landed yet on top of the MuMu window. Click-through.")
             Spacer()
             Button {
                 tasks.run("Start emulators and bot", "./start-consoles.sh")
