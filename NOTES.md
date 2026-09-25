@@ -1298,3 +1298,24 @@ Facts the new model must be built around:
   friend's) -- first test: is the current global x86_64 library readable.
 - **Baseline to beat:** FirstLight fl:hog2 via our pipeline, 3-1 vs the user's main account in
   friendlies (all overtime); results logged per model.
+
+## Null's engine setup (CR_4k), checked 2026-09-25 evening
+
+- **Evo Elite Barbarians is in the engine's data.** CR_4k runs FirstLight's offline engine: Null's
+  libg SHA 110aa2b5... (same file as cr-engine-extraction/binary) with content 15.535.86
+  (fingerprint.json SHA-256 e0cb2fb9..., 986 update files incl. angry_barbarian_evo.toml). The
+  old converter lost it because it used the 15.535.29 sandbox's card list, not the engine's data.
+- **The "four lazily-fetched files" are not missing.** ghost_ev1, goblin_hut_rework,
+  hero_form/balloon_hero_spell and skeleton_balloon_ev1 are inside the Null's APK itself
+  (assets/csv_logic/...), byte-identical (SHA-1) to the fingerprint's entries. No fidelity issue;
+  the old MACOS-PORT note was wrong.
+- **Null's "broken" = full disk.** files/crlive (the probe's per-battle recordings, ~106 MB per
+  match) had filled the 10 GB AVD; an interrupted content update left fingerprint "15.535.3" with
+  most update files gone. Recordings (129 files, 4.3 GB, md5-verified) moved to
+  cr-engine-extraction/macos-port/recordings/crlive_emulator_2026-09-25/; official Clash Royale,
+  APKPure and their downloads removed (user's instruction: only Null's on that device). The
+  client then re-downloaded 15.535.86 and reached the menu. 6+ GB free = ~60 recorded battles:
+  offload crlive periodically.
+- The Sep 10 backup /data/local/tmp/gamedata.tgz holds the same 15.535.86 content (same
+  fingerprint) if the update directory is ever damaged again.
+
