@@ -231,7 +231,12 @@ def archetype_by_card() -> dict[int, tuple[int, str]]:
             for form_id_key, names in (
                     ('hero_form_id', (info.get('hero_character'),)),
                     ('evolution_form_id', (unit_form.get(int(info['card_id'])),
-                                           info.get('evolution_form')))):
+                                           info.get('evolution_form'),
+                                           # the summoned unit's name: evo Elite Barbarians is
+                                           # AngryBarbarian_EV1 in their catalog, while the card
+                                           # is AngryBarbarians_EV1 and its spec names no unit
+                                           f"{info['summon_character']}_EV1"
+                                           if info.get('summon_character') else None))):
                 form_id = info.get(form_id_key)
                 if not form_id or int(form_id) in table:
                     continue

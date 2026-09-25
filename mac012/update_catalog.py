@@ -2,8 +2,14 @@
 
 Every card the tables list is kept or added: id, internal name, type (by table), elixir,
 rarity and availability come from the build; metadata the old catalog carried for a card
-(display name, evolution/hero/ability fields) is preserved. New cards get their internal name
-as display name. The file records the build it was last checked against.
+(display name, hero/ability fields) is preserved. New cards get their internal name as display
+name. The file records the build it was last checked against.
+
+Evolutions come from the build's own spells_evolved table, not from the old catalog: a row
+without NotInUse is a released evolution, and its id is 13,000,000 + its row. (Carrying the old
+list over lost evo Elite Barbarians, AngryBarbarians_EV1, released after 15.535 and in 40% of
+the IL_Replay battles.) Heroes are still carried over: spells_hero_form lists placeholder heroes
+for nearly every card with no release flag, so it cannot say which heroes exist.
 
     python3 mac012/update_catalog.py [VERSION] [--write]
 """
@@ -50,6 +56,23 @@ def main(argv: list[str]) -> int:
                 if prior.get(key) != entry.get(key):
                     changed.append(f"{cid} {row['Name']}: {key} {prior.get(key)} -> {entry.get(key)}")
         cards.append(entry)
+    by_name = {entry['internal_name']: entry for entry in cards}
+    for index, row in enumerate(G.read_table(version, 'spells_evolved.csv')):
+        name = row.get('Name', '')
+        base = by_name.get(name[:-4]) if name.endswith('_EV1') else None
+        if base is None:
+            continue
+        released = not truthy(row.get('NotInUse'))
+        form_id = 13_000_000 + index
+        if released and (base.get('evolution_form'), base.get('evolution_form_id')) != (name, form_id):
+            changed.append(f"{base['card_id']} {base['internal_name']}: evolution "
+                           f"{base.get('evolution_form')} -> {name} ({form_id})")
+            base['evolution_form'], base['evolution_form_id'] = name, form_id
+            base.setdefault('evolution_cycles', None)
+        elif not released and base.get('evolution_form') == name:
+            changed.append(f"{base['card_id']} {base['internal_name']}: evolution {name} is not "
+                           f"in use in this build -> removed")
+            base['evolution_form'] = base['evolution_form_id'] = base['evolution_cycles'] = None
     print(f'{version}: {len(cards)} cards; added {len(added)}, changed {len(changed)}')
     for line in added + changed:
         print('   ', line)

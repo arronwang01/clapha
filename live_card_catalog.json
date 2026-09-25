@@ -1373,8 +1373,8 @@
    "hero_ability_cast_time_ms": null,
    "hero_ability_trigger_delay_ms": null,
    "hero_ability_cooldown_ms": null,
-   "evolution_form": null,
-   "evolution_form_id": null,
+   "evolution_form": "AngryBarbarians_EV1",
+   "evolution_form_id": 13000043,
    "evolution_cycles": null
   },
   {
@@ -4738,5 +4738,5 @@
   }
  ],
  "game_version_checked": "160402012",
- "checked_utc": "2026-09-25T03:47:42.727346+00:00"
+ "checked_utc": "2026-09-25T21:13:13.530268+00:00"
 }
