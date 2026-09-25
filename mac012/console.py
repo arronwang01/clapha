@@ -350,7 +350,7 @@ class Bot:
                   f'({entry["x"]}, {entry["y"]}), off {off:.1f} tiles'
                   + ('  <-- MISPLACED' if off > 1.5 else ''))
 
-    def _lookup_opponent(self, accounts, side: int) -> None:
+    def _lookup_opponent(self, accounts, side: int, battle=None) -> None:
         """Opponent's tag and currently equipped deck from the official API, in the
         background (never delays a decision). A prior, not ground truth: logged and saved to
         build/opponent_decks/, while the tracker still learns their real deck card by card.
@@ -369,6 +369,15 @@ class Bot:
             self.note(f'opponent {info["tag"]} {info["name"]} ({info["trophies"]} trophies), '
                       f'equipped deck per API: {cards}')
             self.opponent_intel = info
+            # Kept with the match recording (same session folder as frames.jsonl /
+            # queue.jsonl), so training data carries what the API said about each opponent.
+            try:
+                V.SESSION.mkdir(parents=True, exist_ok=True)
+                with open(V.SESSION / 'opponent_intel.jsonl', 'a', encoding='utf-8') as handle:
+                    handle.write(json.dumps({'battle': battle, 'side': 1 - side,
+                                             'looked_up': time.time(), **info}) + '\n')
+            except OSError:
+                pass
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -696,7 +705,7 @@ class Bot:
                     deck_note = ('opponent deck not published - learning it from their plays '
                                  '(Training Camp, or the other console is not running)')
                 self.note(deck_note)
-                self._lookup_opponent(accounts, side)
+                self._lookup_opponent(accounts, side, frame['chain']['battle'])
                 observation, fl_battle = FLO.build(
                     frame, health, episode_id=str(frame['chain']['battle']))
                 try:
