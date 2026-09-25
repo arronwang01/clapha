@@ -29,3 +29,6 @@ ref-firstlight/
 # probe APK builds (contain the game's libraries)
 sandbox/loadprobe/out/
 sandbox/loadprobe/debug.keystore
+
+# local IL conversion runs (game-derived data)
+runs/
