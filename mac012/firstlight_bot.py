@@ -101,6 +101,7 @@ class FirstLightRunner:
         self.opponent_seen: list[int] = []      # distinct opponent cards, first-seen order
         self.refused: list[tuple[int, int, str]] = []   # (side, card, reason), for the console
         self._processed: set = set()            # plays / reveals already registered
+        self._attributed_abilities: set[int] = set()
 
     def start_battle(self, our_deck, opponent_deck, actor_owner: int,
                      observation, initial_elixir, our_forms=None,
@@ -136,6 +137,7 @@ class FirstLightRunner:
         self.session.start_episode(observation, initial_elixir=initial_elixir)
         self.actor_owner = actor_owner
         self.opponent_seen, self.refused, self._processed = [], [], set()
+        self._attributed_abilities: set[int] = set()
         self.opponent_source = 'published' if known else 'learned'
         if not known:
             self._forget_opponent_deck()
@@ -192,6 +194,74 @@ class FirstLightRunner:
         if reason is None and owner != self.actor_owner and card_id not in self.opponent_seen:
             self.opponent_seen.append(card_id)
         return reason
+
+    def attribute_opponent_abilities(self, plays, opponent_player: dict | None) -> list[str]:
+        """Join each opponent ability activation in the queue to the hero that cast it.
+
+        The queue says only "side X activated an ability" (card id 65535). The opponent's own
+        ability controllers are in the frame (reader: player+0x3a0/+0x3a8, selected character),
+        so the hero is known exactly when they have one, and when they have two it is the one
+        whose charges are now spent and not yet attributed. The hero card then gets its
+        FirstLight ability contract in the tracker (cost, charges, cooldown) and the play is
+        marked with `ability_card`, which play_events turns into a public, exact-cost
+        activation -- so the opponent's elixir estimate pays for it. Returns log lines.
+        """
+        from firstlight_obs import ability_by_card, hero_card_by_character
+        tracker = self._tracker()
+        if tracker is None:
+            return []
+        opponent = 1 - self.actor_owner
+        heroes = hero_card_by_character()
+        controllers = []
+        for raw in (opponent_player or {}).get('abilities') or ():
+            card = heroes.get(int(raw.get('character_id') or 0) & 0xFFFFFFFF)
+            if card is not None:
+                controllers.append((card, int(raw.get('charges', -1))))
+        notes = []
+        for play in plays or ():
+            if play.get('kind') != 'ability' or int(play.get('side', -1)) != opponent:
+                continue
+            key = ('ability', play.get('issue_tick'), play.get('seq'))
+            if key in self._processed:
+                continue
+            candidates = sorted({card for card, _ in controllers})
+            if len(candidates) > 1:
+                spent = sorted({card for card, charges in controllers if charges == 0}
+                               - self._attributed_abilities)
+                candidates = spent if len(spent) == 1 else candidates
+            if len(candidates) != 1:
+                if not controllers:
+                    continue    # controllers not read yet this frame: try again next turn
+                self._processed.add(key)
+                notes.append(f'opponent ability at t={play["tick"] / 20:.1f}s could not be joined '
+                              f'to one hero {candidates} - not charged to their elixir')
+                continue
+            self._processed.add(key)
+            card = candidates[0]
+            joined = ability_by_card().get(card)
+            if joined is None:
+                notes.append(f'opponent hero {card} has no FirstLight ability - not charged')
+                continue
+            _ability_id, spec = joined
+            cost = getattr(spec, 'elixir_cost', None)
+            if cost is None:
+                notes.append(f'opponent hero {card}: ability cost unknown - not charged')
+                continue
+            self._see(opponent, card)
+            charges = int(getattr(spec, 'charges', None) or 1)
+            cooldown_ms = int(getattr(spec, 'cooldown_ms', None) or 0) or 50
+            tracker.ability_cost_by_owner_card[opponent].setdefault(card, float(cost))
+            tracker.ability_cooldown_ticks_by_owner_card[opponent].setdefault(
+                card, max(1, -(-cooldown_ms // 50)))
+            tracker.ability_max_charges_by_owner_card[opponent].setdefault(card, charges)
+            self._attributed_abilities.add(card)
+            play['ability_card'] = card
+            play['ability_cost'] = float(cost)
+            from firstlight_obs import CARDS
+            name = CARDS.get(card, {}).get('display_name') or card
+            notes.append(f'opponent used {name} hero ability at t={play["tick"] / 20:.1f}s '
+                         f'- {float(cost):g} elixir charged to them')
+        return notes
 
     def register_plays(self, plays, revealed=None) -> list[tuple[int, int, str]]:
         """Register every card either player has shown, before the observation is built.

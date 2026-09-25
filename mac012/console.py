@@ -340,7 +340,7 @@ class Bot:
             elif kind == 'unattributed':
                 self.note(f'queue: a play of {V.CARDS.get(play.get("card_id"), {}).get("name", raw)}'
                           f' could not be attributed to a side - not registered')
-            elif kind == 'ability':
+            elif kind == 'ability' and play.get('ability_card') is None:
                 self.note(f't={play["tick"]/20:5.1f}s  side {play["side"]} activated an ability')
 
     def _report_latency(self, flight: dict) -> None:
@@ -720,6 +720,10 @@ class Bot:
                     who = 'opponent' if owner != side else 'own'
                     self.note(f'{who} {V.CARDS.get(card_id, {}).get("name", card_id)} NOT '
                               f'registered: {reason}')
+                opponent_player = next((p for p in frame['players']
+                                        if p.get('side') == 1 - side), None)
+                for line in runner.attribute_opponent_abilities(executed, opponent_player):
+                    self.note(line)
                 self._report_queue_oddities(executed, handled_queue)
                 seen = {side: revealed_cards.get(side, []),
                         1 - side: [c for c in revealed_cards.get(1 - side, [])

@@ -897,8 +897,21 @@ def play_events(plays, tick: int, decks: dict | None, battle):
             if command in seen_commands:
                 continue
             seen_commands.add(command)
+        if play.get('kind') == 'ability' and play.get('ability_card') is not None:
+            # An opponent hero ability the runner joined to its hero
+            # (attribute_opponent_abilities). Public (everyone sees it cast) and its cost is
+            # fixed, so the tracker may charge it exactly. Our own abilities are not sent:
+            # their state comes from memory (own_runtime_states).
+            owner, hero = int(play['side']), int(play['ability_card'])
+            events.append(EventV1(
+                tick=int(play['tick']), event_type='ability_activation', owner=owner,
+                card_id=hero,
+                data={'source_card_id': hero, 'fair_ability_activation_exact': True,
+                      'native_event_id': f"{play.get('issue_tick')}:{play.get('seq')}:{owner}",
+                      'source': 'native_command_queue'}))
+            continue
         if play.get('kind', 'card') != 'card':
-            continue   # champion ability activations: not a card play (see viewer)
+            continue   # unattributed abilities, unknown ids: reported by the console
         card_id, side = int(play['card_id']), int(play['side'])
         if card_id == MIRROR_CARD_ID or (decks is not None and card_id not in decks.get(side, ())):
             battle.untracked_plays.add((side, card_id))
