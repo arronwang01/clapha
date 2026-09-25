@@ -1266,3 +1266,35 @@ guessed. `mac012/test_opponent_ability.py`: one hero and two heroes, both sides:
 by the ability's 3 elixir (2.82 after 10 ticks of regen), 0 decide errors. Suites re-run:
 opponent_registry, hero_evo, effects -- OK. Not yet seen live: needs a friendly where the
 opponent account uses a hero ability (log line "opponent used <hero> hero ability").
+
+## TRAINING BRIEF (start here for the training session, 2026-09-25)
+
+Facts the new model must be built around:
+- **Command delay is part of the game:** every command executes at issue + 21 ticks (1.05 s),
+  for humans too. Our own overhead on top: ~4-6 ticks decision -> issued (inference 70-130 ms,
+  tap ~40 ms). FirstLight trained with ~1-5 ticks (self-play) and IL aligned to execution, so
+  its models never learned the delay. Plan: train with the real age (FirstLight's engine
+  supports scheduled execution), ideally with the delay as an input so a change needs no retrain.
+- **Opponent commands are visible ~0.7 s (median 14 ticks) before they land** (queue_lead.py).
+  The model should get them as "pending", distinct from real units.
+- **Readable live, per 50 ms frame:** units (position, hp, attack stage/timers, charge, deploy
+  remaining, target, own data id), towers, projectiles/area effects in flight, own hand / next /
+  cycle / elixir, both elixirs (opponent's exact, excluded by FAIR), evolution progress
+  (player+0x2e8), hero ability controllers both sides (+0x3a0/+0x3a8), command queue (both
+  sides), reveal lists. Opponent hand/cycle: NOT available mid-battle (proven).
+- **Opponent deck:** API deck by player tag (opponent_intel.py), trusted until contradicted;
+  otherwise learned card by card. Recorded per match.
+- **Not read yet:** combat events (damage, stun/freeze, rage, shields), tower troop identity,
+  per-turn decision logging. Decide per the chosen input set.
+- **Data on disk per match** (artifacts/viewer-sessions/<time>/): frames.jsonl (20 Hz board),
+  queue.jsonl (every play/ability, both sides), opponent_intel.jsonl; results in
+  build/results.jsonl. Human matches recorded too -> imitation data aligned to *decision* time.
+- **Tiers:** deployable = what this client holds; an oracle (opponent hand) cannot run live ->
+  use only as critic/teacher.
+- **Robustness:** prefer inputs a screen reader could also supply; memory-only extras are a
+  bonus (root/memory access could be closed by a game update).
+- **Compute / sandbox:** the ARM64 game library is encrypted and runs only inside the real app
+  (gate 1 closed). An x86_64 sandbox needs an Intel/AMD PC (campus Windows + 4080, or a
+  friend's) -- first test: is the current global x86_64 library readable.
+- **Baseline to beat:** FirstLight fl:hog2 via our pipeline, 3-1 vs the user's main account in
+  friendlies (all overtime); results logged per model.
