@@ -268,6 +268,39 @@ class FirstLightRunner:
                 forms[int(card_id)] = 1 if ready else 0
         return forms
 
+    def warm_up(self) -> float:
+        """One throwaway decision on a synthetic board, before any battle; returns ms taken.
+
+        The first forward pass pays for torch's lazy initialisation (measured live: 461 ms for
+        the first decision of a match against ~80 ms after), which cost the policy a decision
+        turn every match. The throwaway episode is ended, so no state carries into a battle.
+        """
+        import time
+        import firstlight_obs as FLO
+        deck = [26000021, 27000000, 26000014, 26000038, 26000030, 26000010, 28000011, 28000000]
+        towers = [{'address': f'0xb4000000000a{i:04x}', 'category': 1, 'kind': 0, 'side': o,
+                   'x': x, 'y': y, 'card_id': -1, 'level': 14, 'hp': 2600, 'max_hp': 2600,
+                   'behavior_state_raw': 0} for i, (x, y, o, _k) in enumerate(FLO.TOWERS)]
+
+        def frame(tick):
+            players = [{'side': s, 'elixir_raw': 70000, 'deck_card_ids': deck,
+                        'deck_form_flags': [0] * 8,
+                        'hand_deck_indices': [0, 1, 2, 3] if s == 0 else [-1] * 4,
+                        'cycle_deck_indices': [4, 5, 6, 7] if s == 0 else [],
+                        'next_deck_index': 4 if s == 0 else -1} for s in (0, 1)]
+            return {'game_tick': tick, 'battle_active': True, 'players': players,
+                    'entities': [dict(t) for t in towers], 'chain': {'battle': 'warm-up'}}
+
+        started = time.time()
+        observation, battle = FLO.build(frame(0), {'local_side': 0}, 'warm-up')
+        self.start_battle(deck, deck, 0, observation, {0: 7.0, 1: 7.0})
+        for tick in (90, 95, 100):
+            observation, battle = FLO.build(frame(tick), {'local_side': 0}, 'warm-up',
+                                            battle=battle)
+            self.decide(observation)
+        self.end_battle()
+        return (time.time() - started) * 1000.0
+
     def turn_tick(self, tick: int) -> int:
         """The five-tick decision turn this tick belongs to."""
         return int(tick) - int(tick) % self.decision_ticks

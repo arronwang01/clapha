@@ -377,6 +377,17 @@ class Bot:
         self.note(f'{self.model} loaded (FirstLight V4, FAIR tier, '
                   f'{20.0/runner.decision_ticks:.0f} Hz); '
                   f'{"ARMED - will tap" if self.armed else "dry run - no taps"}')
+        # Pay the model's cold start now, not on the first decision of the match, then take the
+        # model and FirstLight's catalogs out of the garbage collector's scans: a full pass over
+        # them stalled the decision loop past a turn (live: a 638 ms turn late in a match).
+        try:
+            warm_ms = runner.warm_up()
+            import gc
+            gc.collect()
+            gc.freeze()
+            self.note(f'model warmed up in {warm_ms:.0f} ms; long-lived objects frozen out of GC')
+        except Exception as error:  # noqa: BLE001
+            self.note(f'warm-up failed (first decision will be slow): {error}')
         battle = None
         fl_battle = None
         reported: set[int] = set()
@@ -409,7 +420,13 @@ class Bot:
                 time.sleep(0.2)
                 continue
             me = next((p for p in frame['players'] if p['side'] == side), None)
-            if not me or len(me['hand_deck_indices']) != 4 or any(h < 0 for h in me['hand_deck_indices']):
+            # For up to ~0.5 s after a play the played slot reads -1 while the next card is drawn
+            # (the card has already moved to the end of the cycle, so hand + cycle still make the
+            # deck). FirstLight's env keeps deciding through that with the slot simply not
+            # playable; skipping the turn instead left the policy's recurrent state behind the
+            # game on every such draw (the "missed decision turn" lines).
+            if not me or len(me['hand_deck_indices']) != 4 or not any(
+                    h >= 0 for h in me['hand_deck_indices']):
                 time.sleep(0.05)
                 continue
             our_deck = me.get('deck_card_ids') or []
@@ -496,6 +513,7 @@ class Bot:
                 continue
             skipped = (turn - last_turn) // runner.decision_ticks - 1 if last_turn > 0 else 0
             last_turn = turn
+            turn_began = time.time()
             # Ticks this frame is past the start of its decision turn: time the policy could
             # have acted but the five-tick grid it was trained on made it wait.
             turn_wait_ms = (frame['game_tick'] - turn) * 50.0
@@ -555,13 +573,24 @@ class Bot:
                 started = time.time()
                 moves = runner.decide(observation)
                 decided = time.time()
+                timing_now = {'prep_ms': (started - turn_began) * 1000.0,
+                              'decide_ms': (decided - started) * 1000.0,
+                              'frame_age_ms': (turn_began - frame_time) * 1000.0}
             except Exception as error:  # noqa: BLE001
                 self.note(f'decide failed: {error}')
                 self.status = f'{self.model}: DECIDE FAILING - {str(error)[:80]}'
                 continue
             if skipped > 0:
-                self.note(f'missed {skipped} decision turn(s) at tick {turn} - '
-                          f'the policy state is behind the game')
+                # Where the time went, so the cause is in the log rather than guessed at: the
+                # previous turn's own cost, how long the loop was away between turns, and how
+                # old the frame was when this turn began.
+                prev = getattr(self, '_prev_turn_timing', {}) or {}
+                self.note(f'missed {skipped} decision turn(s) at tick {turn} - the policy state '
+                          f'is behind the game. previous turn: prep '
+                          f'{prev.get("prep_ms", 0):.0f} ms, decide {prev.get("decide_ms", 0):.0f} '
+                          f'ms, after {prev.get("after_ms", 0):.0f} ms; away '
+                          f'{(turn_began - prev.get("ended", turn_began)) * 1000:.0f} ms; '
+                          f'this frame {timing_now["frame_age_ms"]:.0f} ms old')
             self.status = (f'{self.model} playing - {me["elixir_raw"]/10000:.1f} elixir - '
                            f'{self.plays} plays - opponent deck {len(runner.opponent_seen)}/8 '
                            f'seen ({runner.opponent_source})')
@@ -598,6 +627,9 @@ class Bot:
                                       frame):
                     deferred = [d for d in deferred if d['card'] != move['card']] + [move]
                 reserved = sum(f['cost'] for f in in_flight)
+            ended = time.time()
+            self._prev_turn_timing = {**timing_now, 'after_ms': (ended - decided) * 1000.0,
+                                      'ended': ended}
         runner.end_battle()
         self.status = 'off'
 

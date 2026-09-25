@@ -940,7 +940,8 @@ def build(frame: dict, health: dict, episode_id: str, deduced: dict | None = Non
         deck = p.get('deck_card_ids') or []
         # Only the actor's own hand is private state it may see. After settlement this
         # client exposes both hands; the opponent's must still go in as public-only.
-        readable = p['side'] == side and p['hand_deck_indices'][0] != -1
+        # Our hand is ours to read even mid-draw, when one slot (possibly slot 0) is -1.
+        readable = p['side'] == side and any(i >= 0 for i in p['hand_deck_indices'])
         hand_slots = p['hand_deck_indices'] if readable else (
             (deduced or {}).get(p['side'], ([], None))[0])
         hand = tuple(deck[i] for i in hand_slots if deck and 0 <= i < len(deck))
@@ -957,9 +958,9 @@ def build(frame: dict, health: dict, episode_id: str, deduced: dict | None = Non
             # (FORM_NORMAL = 0; evolutions would carry their own code, which we do not read).
             slot_by_card = {str(deck[i]): pos for pos, i in enumerate(hand_slots)
                             if deck and 0 <= i < len(deck)}
-            runtime_by_slot = {str(pos): {'form_code': int((hand_forms or {}).get(
-                                   deck[i] if deck and 0 <= i < len(deck) else -1, 0))}
-                               for pos, i in enumerate(hand_slots)}
+            runtime_by_slot = {str(pos): {'form_code': int((hand_forms or {}).get(deck[i], 0))}
+                               for pos, i in enumerate(hand_slots)
+                               if deck and 0 <= i < len(deck)}
             abilities, evolutions = own_runtime_states(p, entities, side, tick, battle)
             players.append(PlayerStateV1(
                 elixir_exact=own_elixir,

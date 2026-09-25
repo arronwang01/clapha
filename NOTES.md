@@ -1021,3 +1021,43 @@ Next, in order:
    and evolution state), oracle-tier critic.
 Reader already has attack wind-up (atk_stage / atk_timeline / atk_load) and movement charge
 progress (+0x1e0, Prince / Dark Prince charge) -- Sparky's charge is its attack load.
+
+## Overnight session, 2026-09-25 (local): hero/evo into the model, every turn reaches the policy
+
+**Hero abilities + evolution progress (read from memory).** Reader: per player, controllers at
++0x3a0/+0x3a8 (back-pointer checked; +0x78 cooldown, +0x7c configured, +0x80 charges, +0x98
+button, +0x90->+0x40 selected character) and the +0x2e8 progress vector. From the saved device
+run (build/runtime_probe.jsonl): controllers present for both players in 513/513 samples; the
+controller's action data id (1171272209) is identical for EVERY controller, so the selected
+character is what identifies the hero (130283371 Hero Musketeer, 2979504115 Hero Ice Golem =
+FirstLight's archetype ids). Button enum = FirstLight's ABILITY_BUTTON_STATE_LABELS exactly
+(1 ChampionAbsent, 2 Ready, 6 AllChargesConsumed, 9 NotEnoughElixir seen); the full lifecycle
+absent -> Ready -> used -> absent -> Ready (replayed) is in the run. Evolution vector index =
+our deck order (Cannon slot 2 read 2; Skeletons slot 0 counted 1 -> 2 -> 0). Ability joined
+character -> hero form -> base card -> the card's single FirstLight ability (Musketeer_hero_
+Ability 3 elixir, IceGolemiteHero_Ability 2). Offered under BattleEnv's legality rule.
+FirstLight's V4 contract: <= 2 heroes, <= 2 evolutions, <= 3 special cards per deck -- every
+recorded deck fits (the game allows 3 special slots). Hog specialists' training deck: Hero
+Musketeer, Evo Cannon, Evo Skeletons, plain Ice Golem (user's deck, per user, is that one;
+the Hero Ice Golem was a temporary test). Training Camp gives a preset deck with no heroes or
+evolutions, so these reads are verified offline (test_hero_evo) and against the device run,
+not yet live -- first friendly with the hero deck is the live check.
+
+**Missed decision turns: two causes, both fixed, verified live.** The log now breaks a missed
+turn down (previous turn prep/decide/after, time away, frame age). Findings:
+1. After every play the played slot reads -1 for 50-550 ms while the next card is drawn (the
+   card is already at the end of the cycle, so hand + cycle still partition the deck). The
+   console skipped the turn; the two longest draw gaps were exactly the two missed turns.
+   FirstLight's env keeps deciding with the slot unplayable -- now so do we; the builder also
+   treats our hand as ours when slot 0 is the empty one.
+2. First decision of a match: 461 ms (torch cold start) -> `FirstLightRunner.warm_up()` at load.
+   Late-match 638 ms observation build that never reproduces offline (<= 18 ms) -> Python
+   full-GC pass over the model + catalogs -> `gc.freeze()` after load.
+Live Training Camp (fl:hog2, side 1), after both fixes: 0 missed turns, 0 errors, 35/35
+placements exact (0.0 tiles), inference 72-93 ms. `mac012/replay_decide.py` replays any
+recording through build -> decide: 4 recorded matches, 2,587 decisions, 0 errors, draw-gap
+turns included.
+
+Also: input coverage on a live match with the new reader -- unit target 83%, attack cooldown
+25%, windup 10%, deploy 12%, tower target 87% (all 0% before). Remaining zeros for units and
+towers are projectile-only slots, shields, visibility, abilities-on-entity: the known gaps.
