@@ -9,6 +9,7 @@ prior project's note that owner-0 games come out mirrored otherwise).
 from __future__ import annotations
 
 import json
+import os
 import sys
 import subprocess
 import threading
@@ -35,6 +36,13 @@ SESSION = CLAPHA / 'artifacts' / 'viewer-sessions' / time.strftime('%Y%m%dT%H%M%
 # In Training Camp the trainer's commands carry account_lo -1 / seq -1, so a non-negative
 # account is ours. In a friendly battle against another account this no longer holds --
 # read the local side's avatar account id before relying on it there.
+# Poll intervals. The game ticks every 50 ms, so 50 means every tick is seen; at 100 a frame
+# can already be two ticks old when it arrives. Raise them if the device cannot keep up (the
+# console shows the reader's lag).
+READER_MS = int(os.environ.get('CR_READER_MS', '50'))
+QUEUE_MS = int(os.environ.get('CR_QUEUE_MS', '50'))
+
+
 def mine(entry: dict) -> bool:
     return entry.get('account_lo', -1) >= 0
 
@@ -97,7 +105,8 @@ def pump() -> None:
             # that is merely between battles. install_reader is the repo's own installer: it
             # checks the SHA and refuses to overwrite a reader another observer is using.
             install_reader(ADB, SERIAL, READER)
-            process = start_reader(ADB, SERIAL, runtime['pid'], interval_ms=100, max_frames=0)
+            process = start_reader(ADB, SERIAL, runtime['pid'], interval_ms=READER_MS,
+                                   max_frames=0)
             for line in process.stdout:
                 if '"mumu_live_frame"' not in line:
                     continue
@@ -139,26 +148,6 @@ def entry_side(entry: dict, accounts) -> int | None:
         real = [s for lo, s in sides.items() if lo is not None and lo > 0]
         side = 1 - real[0] if len(real) == 1 else None
     return side
-
-
-def queued_plays(entries: list, accounts, up_to_tick: int) -> list[dict]:
-    """Commands still in the queue that will have executed by up_to_tick, shaped like
-    executed_plays. The game consumes a command exactly 21 ticks after issue, so a queued
-    command is a play whose execution tick is already known."""
-    plays = []
-    for entry in entries or ():
-        card_id = int(entry.get('card_id') or 0)
-        issue = entry.get('issue_tick')
-        if card_id <= 0 or not isinstance(issue, int) or issue + 21 > up_to_tick:
-            continue
-        side = entry_side(entry, accounts)
-        if side is None:
-            continue
-        plays.append({'tick': issue + 21, 'side': int(side), 'card_id': card_id,
-                      'kind': 'card' if 25000000 <= card_id < 30000000 else 'ability',
-                      'x': entry.get('x'), 'y': entry.get('y'), 'seq': entry.get('seq'),
-                      'issue_tick': issue})
-    return plays
 
 
 def executed_plays(row: dict, entries: list, pending: dict) -> list[dict]:
@@ -239,7 +228,7 @@ def pump_queue() -> None:
         try:
             runtime = verify_runtime(ADB, SERIAL)
             command = (f'/data/local/tmp/queue_probe {runtime["pid"]} '
-                       f'{hex(MANAGER_RVA)} {hex(ROOT_CONTEXT_OFFSET)} 0 100')
+                       f'{hex(MANAGER_RVA)} {hex(ROOT_CONTEXT_OFFSET)} 0 {QUEUE_MS}')
             process = subprocess.Popen([str(ADB), '-s', SERIAL, 'shell', command],
                                        stdout=subprocess.PIPE, text=True, bufsize=1)
             pending: dict = {}

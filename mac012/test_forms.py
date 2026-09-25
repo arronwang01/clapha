@@ -1,17 +1,16 @@
-"""Offline check of the latency lead, in-flight hand cycling and evolution/hero forms.
+"""Offline check of evolution/hero forms and in-flight elixir accounting.
 
 A synthetic three-minute match with the Hog 2.6 deck the specialists trained on (Evo Cannon,
 Evo Skeletons, Hero Musketeer), driven the way the console drives it: a tap is issued at the
 decision, reaches the queue RTT ticks later, and executes COMMAND_AGE ticks after that; the
 reader's hand and elixir only change on execution. Checks, per checkpoint and side:
 
-  * no decide() errors with the lead on and off;
-  * the hand the policy sees never contains a card that is already in flight;
+  * no decide() errors;
   * an evolution card is offered evolved exactly when FirstLight's own tracker says so,
     and the hero card is always offered as its hero form;
   * elixir is spent in the right amount (utilisation, like the NOTES table).
 
-    FIRSTLIGHT_ROOT=... python3 mac012/test_lead_forms.py [model ...]
+    FIRSTLIGHT_ROOT=... python3 mac012/test_forms.py [model ...]
 """
 from __future__ import annotations
 
@@ -36,7 +35,7 @@ def regen(tick: int) -> float:
     return 1.0 / (56 if tick < 2400 else 28)     # 2.8 s per elixir at 1x, 1.4 s at 2x
 
 
-def run(model: str, side: int, lead: int, seed: int) -> dict:
+def run(model: str, side: int, seed: int) -> dict:
     rng = random.Random(seed)
     runner = FLB.FirstLightRunner(model)
     costs = {c: float(FLO.CARDS[c]['elixir']) for c in HOG}
@@ -47,7 +46,7 @@ def run(model: str, side: int, lead: int, seed: int) -> dict:
     in_flight: list[dict] = []
     units: dict[str, dict] = {}
     seq = 0
-    stats = {'errors': [], 'plays': 0, 'spent': 0.0, 'in_flight_in_hand': 0,
+    stats = {'errors': [], 'plays': 0, 'spent': 0.0,
              'evolved_offers': 0, 'evolved_plays': 0, 'hero_offers': 0, 'form_mismatch': 0}
 
     def frame(tick):
@@ -65,7 +64,7 @@ def run(model: str, side: int, lead: int, seed: int) -> dict:
                 'entities': ents, 'chain': {'battle': 1}}
 
     health = {'local_side': side}
-    observation, battle = FLO.build(frame(0), health, '1', lead_ticks=lead)
+    observation, battle = FLO.build(frame(0), health, '1')
     runner.start_battle(HOG, HOG, side, observation, {0: 5.0, 1: 5.0},
                         our_forms=FORMS, opponent_forms=FORMS)
     tracker = runner.session.tensorizer.tracker
@@ -110,20 +109,11 @@ def run(model: str, side: int, lead: int, seed: int) -> dict:
                               'x': rng.randint(2000, 16000), 'y': 20000 if side == 0 else 12000})
 
         plays = list(executed)
-        if lead:
-            plays += [{'tick': c['issue_tick'] + COMMAND_AGE, 'side': c['side'],
-                       'card_id': c['card_id'], 'kind': 'card', 'x': c['x'], 'y': c['y'],
-                       'seq': c['seq'], 'issue_tick': c['issue_tick']}
-                      for c in queue if c['issue_tick'] + COMMAND_AGE <= tick + lead]
         reserved = sum(costs[f['card']] for f in in_flight)
         forms = runner.hand_forms(HOG, FORMS)
         observation, battle = FLO.build(
             frame(tick), health, '1', battle=battle, reserved=reserved, plays=plays,
-            decks={0: tuple(HOG), 1: tuple(HOG)}, lead_ticks=lead,
-            in_flight=[HOG.index(f['card']) for f in in_flight], hand_forms=forms)
-        me = next(p for p in observation.players if p.owner == side)
-        if any(f['card'] in me.hand for f in in_flight) and lead:
-            stats['in_flight_in_hand'] += 1
+            decks={0: tuple(HOG), 1: tuple(HOG)}, hand_forms=forms)
         for position, entry in observation.action_mask.placement_masks.items():
             card = int(entry['visible_card_id'])
             if card in (27000000, 26000010) and entry['form_code'] == 1:
@@ -164,18 +154,15 @@ def main(models) -> int:
     failed = False
     for model in models:
         for side in (0, 1):
-            for lead in (0, 24):
-                s = run(model, side, lead, 11 + side)
-                bad = s['errors'] or s['in_flight_in_hand'] or s['form_mismatch'] \
-                    or not s['hero_offers']
-                failed |= bool(bad)
-                print(f'{model:12} side {side} lead {lead:2}: {s["plays"]:3} plays, '
-                      f'{s["spent"]:5.1f} elixir ({s["spent"] / 91 * 100:3.0f}%), '
-                      f'evolved offers {s["evolved_offers"]:3} plays {s["evolved_plays"]:2}, '
-                      f'hero offers {s["hero_offers"]:3}, in-flight-in-hand '
-                      f'{s["in_flight_in_hand"]}, form mismatch {s["form_mismatch"]}, '
-                      f'errors {len(s["errors"])}'
-                      + (f'  first: {s["errors"][0][:120]}' if s['errors'] else ''))
+            s = run(model, side, 11 + side)
+            bad = s['errors'] or s['form_mismatch'] or not s['hero_offers']
+            failed |= bool(bad)
+            print(f'{model:12} side {side}: {s["plays"]:3} plays, '
+                  f'{s["spent"]:5.1f} elixir ({s["spent"] / 91 * 100:3.0f}%), '
+                  f'evolved offers {s["evolved_offers"]:3} plays {s["evolved_plays"]:2}, '
+                  f'hero offers {s["hero_offers"]:3}, form mismatch {s["form_mismatch"]}, '
+                  f'errors {len(s["errors"])}'
+                  + (f'  first: {s["errors"][0][:120]}' if s['errors'] else ''))
     print('FAIL' if failed else 'OK')
     return 1 if failed else 0
 

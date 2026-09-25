@@ -9,7 +9,10 @@
 //
 // Commands on stdin, one per line:
 //   tap X Y                      single tap
-//   place X0 Y0 X1 Y1 GAP_MS     card tap, gap, then placement tap
+//   place X0 Y0 X1 Y1 GAP_MS     card tap, gap, then placement tap (34 ms holds)
+//   placeh X0 Y0 X1 Y1 GAP_MS HOLD_MS   same, with the hold per tap given
+//   drag X0 Y0 X1 Y1 STEPS STEP_MS      one gesture: down on the card, move, up on the tile
+//   version                      -> {"version":2} (placeh/drag supported)
 //   quit
 // Prints one line per command with the elapsed microseconds, so latency is measurable.
 //
@@ -62,6 +65,13 @@ static void touch_up(void) {
   sync_report();
 }
 
+static void touch_move(int x, int y) {
+  emit(EV_ABS, ABS_MT_SLOT, 0);
+  emit(EV_ABS, ABS_MT_POSITION_X, x);
+  emit(EV_ABS, ABS_MT_POSITION_Y, y);
+  sync_report();
+}
+
 /* A touch that goes down and up inside one frame can be dropped, so hold briefly. */
 static void tap(int x, int y, int hold_ms) {
   touch_down(x, y);
@@ -79,8 +89,26 @@ int main(int argc, char **argv) {
   char line[256];
   while (fgets(line, sizeof(line), stdin)) {
     uint64_t started = now_us();
-    int x0, y0, x1, y1, gap;
-    if (sscanf(line, "place %d %d %d %d %d", &x0, &y0, &x1, &y1, &gap) == 5) {
+    int x0, y0, x1, y1, gap, hold;
+    if (sscanf(line, "placeh %d %d %d %d %d %d", &x0, &y0, &x1, &y1, &gap, &hold) == 6) {
+      tap(x0, y0, hold);
+      usleep((useconds_t)gap * 1000);
+      tap(x1, y1, hold);
+      printf("{\"placeh\":[%d,%d,%d,%d],\"gap\":%d,\"hold\":%d,\"us\":%llu}\n", x0, y0, x1,
+             y1, gap, hold, (unsigned long long)(now_us() - started));
+    } else if (sscanf(line, "drag %d %d %d %d %d %d", &x0, &y0, &x1, &y1, &gap, &hold) == 6) {
+      /* gap = number of move steps, hold = ms per step */
+      int steps = gap < 1 ? 1 : gap;
+      touch_down(x0, y0);
+      for (int i = 1; i <= steps; ++i) {
+        usleep((useconds_t)hold * 1000);
+        touch_move(x0 + (x1 - x0) * i / steps, y0 + (y1 - y0) * i / steps);
+      }
+      usleep((useconds_t)hold * 1000);
+      touch_up();
+      printf("{\"drag\":[%d,%d,%d,%d],\"steps\":%d,\"step_ms\":%d,\"us\":%llu}\n", x0, y0,
+             x1, y1, steps, hold, (unsigned long long)(now_us() - started));
+    } else if (sscanf(line, "place %d %d %d %d %d", &x0, &y0, &x1, &y1, &gap) == 5) {
       tap(x0, y0, 34);
       usleep((useconds_t)gap * 1000);
       tap(x1, y1, 34);
@@ -90,6 +118,8 @@ int main(int argc, char **argv) {
       tap(x0, y0, 34);
       printf("{\"tap\":[%d,%d],\"us\":%llu}\n", x0, y0,
              (unsigned long long)(now_us() - started));
+    } else if (!strncmp(line, "version", 7)) {
+      printf("{\"version\":2}\n");
     } else if (!strncmp(line, "quit", 4)) {
       break;
     } else {

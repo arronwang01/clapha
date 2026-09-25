@@ -34,7 +34,18 @@ for port in $DEV0_PORT $DEV1_PORT; do
 done
 "$ADB" devices | sed -n '2,$p' | sed '/^$/d' | sed 's/^/  /'
 
-# 3. make sure each device has the native tools
+# 3. rebuild fast_tap when its source is newer than the binary, then make sure each device
+#    has the native tools
+NDK_CC="$(ls -d "$HOME"/Library/Android/sdk/ndk/*/toolchains/llvm/prebuilt/*/bin/aarch64-linux-android31-clang 2>/dev/null | tail -1)"
+if [ "$CLAPHA/src/fast_tap.c" -nt "$CLAPHA/build/fast_tap" ]; then
+  if [ -n "$NDK_CC" ]; then
+    mkdir -p "$CLAPHA/build"
+    "$NDK_CC" -O2 -o "$CLAPHA/build/fast_tap" "$CLAPHA/src/fast_tap.c" &&
+      say "rebuilt fast_tap" || say "fast_tap build FAILED"
+  else
+    say "fast_tap source changed but no NDK clang found - taps fall back to adb input tap"
+  fi
+fi
 for port in $DEV0_PORT $DEV1_PORT; do
   serial="127.0.0.1:$port"
   "$ADB" -s "$serial" shell 'id' >/dev/null 2>&1 || continue
