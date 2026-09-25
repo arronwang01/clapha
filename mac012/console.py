@@ -24,6 +24,7 @@ import scope_gate  # noqa: E402
 import firstlight_bot as FLB  # noqa: E402
 import firstlight_obs as FLO  # noqa: E402
 import tapper as TAP  # noqa: E402
+import opponent_intel as INTEL  # noqa: E402
 from cycle_tracker import Tracker, opponent_deck  # noqa: E402
 from mac_profile import ADB, SERIAL  # type: ignore  # noqa: E402
 from native_core.mumu_live_actions import ScreenLayout, send_card_taps  # noqa: E402
@@ -161,6 +162,7 @@ class Bot:
         self.deduced = ''
         self.rtt: list[int] = []   # our taps: game ticks from tap to the command's issue tick
         self.tapper = None
+        self.opponent_intel = None
 
     def note(self, line: str) -> None:
         """Log a line on the page and to a file.
@@ -347,6 +349,28 @@ class Bot:
         self.note(f'placement {name}: asked native ({target[0]}, {target[1]}), game got '
                   f'({entry["x"]}, {entry["y"]}), off {off:.1f} tiles'
                   + ('  <-- MISPLACED' if off > 1.5 else ''))
+
+    def _lookup_opponent(self, accounts, side: int) -> None:
+        """Opponent's tag and currently equipped deck from the official API, in the
+        background (never delays a decision). A prior, not ground truth: logged and saved to
+        build/opponent_decks/, while the tracker still learns their real deck card by card.
+        Skipped for Training Camp (the trainer has no account) and without an API token."""
+        opponent = next((a for a in (accounts or []) if a and a.get('side') == 1 - side), None)
+        if not opponent or int(opponent.get('lo') or 0) <= 0 or INTEL.token() is None:
+            return
+
+        def work():
+            info = INTEL.lookup(int(opponent.get('hi') or 0), int(opponent['lo']))
+            if info['error']:
+                self.note(f'opponent {info["tag"]}: deck lookup failed - {info["error"][:120]}')
+                return
+            cards = ', '.join(f'{c["name"]}{" (evo)" if c["evolution_level"] else ""}'
+                              for c in info['deck'])
+            self.note(f'opponent {info["tag"]} {info["name"]} ({info["trophies"]} trophies), '
+                      f'equipped deck per API: {cards}')
+            self.opponent_intel = info
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _report_queue_oddities(self, executed: list, handled: set) -> None:
         """Say, once per play, about queue entries that cannot become a card play."""
@@ -672,6 +696,7 @@ class Bot:
                     deck_note = ('opponent deck not published - learning it from their plays '
                                  '(Training Camp, or the other console is not running)')
                 self.note(deck_note)
+                self._lookup_opponent(accounts, side)
                 observation, fl_battle = FLO.build(
                     frame, health, episode_id=str(frame['chain']['battle']))
                 try:
