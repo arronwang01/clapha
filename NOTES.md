@@ -1251,18 +1251,3 @@ installed), then deleted; the game devices were not touched.
   vtables), writes build/rederive_<version>.json, and with --apply updates mac_profile.py and the
   reader's #defines. Checks tested on recordings; not yet run live (`--force` on the current build
   must re-find 0x1A57E88 / 0x28 / 0x193ad50 / 0x193aeb8).
-
-## Opponent hero abilities charged to their elixir (2026-09-25, cloud session)
-
-The queue shows an opponent activation only as card id 65535; it was logged and dropped, so
-FirstLight's tracker believed the opponent kept that elixir. Now
-`FirstLightRunner.attribute_opponent_abilities` joins each one to the hero that cast it, using
-the opponent's controllers the reader already emits (selected character -> hero card): the only
-hero, or with two heroes the one whose charges are spent and not yet attributed. The hero card
-gets FirstLight's ability contract in the tracker (cost, charges, cooldown), and play_events
-sends a public `ability_activation` with `fair_ability_activation_exact`, so the tracker takes
-the exact cost off the opponent's elixir ceiling. Unjoinable activations are logged, never
-guessed. `mac012/test_opponent_ability.py`: one hero and two heroes, both sides: ceiling falls
-by the ability's 3 elixir (2.82 after 10 ticks of regen), 0 decide errors. Suites re-run:
-opponent_registry, hero_evo, effects -- OK. Not yet seen live: needs a friendly where the
-opponent account uses a hero ability (log line "opponent used <hero> hero ability").
