@@ -705,6 +705,7 @@ class Bot:
                     deck_note = ('opponent deck not published - learning it from their plays '
                                  '(Training Camp, or the other console is not running)')
                 self.note(deck_note)
+                self.opponent_intel = None
                 self._lookup_opponent(accounts, side, frame['chain']['battle'])
                 observation, fl_battle = FLO.build(
                     frame, health, episode_id=str(frame['chain']['battle']))
@@ -775,6 +776,11 @@ class Bot:
                     index: [V.card_identity(c)[0] for c in cards
                             if V.card_identity(c)[2] == 'card']
                     for index, cards in enumerate(revealed or [[], []])}
+                intel = self.opponent_intel
+                if intel and runner.api_deck_state == 'none' and intel.get('deck'):
+                    note = runner.adopt_api_deck([c['card_id'] for c in intel['deck']])
+                    if note:
+                        self.note(note)
                 for owner, card_id, reason in runner.register_plays(executed, revealed_cards):
                     who = 'opponent' if owner != side else 'own'
                     self.note(f'{who} {V.CARDS.get(card_id, {}).get("name", card_id)} NOT '
@@ -783,6 +789,9 @@ class Bot:
                                         if p.get('side') == 1 - side), None)
                 for line in runner.attribute_opponent_abilities(executed, opponent_player):
                     self.note(line)
+                for line in runner.messages:
+                    self.note(line)
+                runner.messages.clear()
                 self._report_queue_oddities(executed, handled_queue)
                 seen = {side: revealed_cards.get(side, []),
                         1 - side: [c for c in revealed_cards.get(1 - side, [])

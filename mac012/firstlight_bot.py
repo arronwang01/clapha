@@ -98,6 +98,9 @@ class FirstLightRunner:
         self.session = None
         self.actor_owner = None
         self.opponent_source = 'unknown'
+        self.api_deck: set[int] = set()
+        self.api_deck_state = 'none'          # none / trusted / discarded, for the record
+        self.messages: list[str] = []         # drained by the console into its log
         self.opponent_seen: list[int] = []      # distinct opponent cards, first-seen order
         self.refused: list[tuple[int, int, str]] = []   # (side, card, reason), for the console
         self._processed: set = set()            # plays / reveals already registered
@@ -139,6 +142,7 @@ class FirstLightRunner:
         self.opponent_seen, self.refused, self._processed = [], [], set()
         self._attributed_abilities: set[int] = set()
         self.opponent_source = 'published' if known else 'learned'
+        self.api_deck, self.api_deck_state, self.messages = set(), 'none', []
         if not known:
             self._forget_opponent_deck()
 
@@ -188,8 +192,47 @@ class FirstLightRunner:
             evolution_cycle_remaining=0, evolution_ready=False)
         return None
 
+    def adopt_api_deck(self, cards) -> str:
+        """Take the opponent's API deck (equipped deck by player tag) as their deck.
+
+        The user's rule: trusted from the moment it arrives; the first card that does not fit
+        discards it for the rest of the battle (see _see), leaving only what was learned in
+        play. Only used when no exact deck was published by the other console."""
+        opponent = 1 - self.actor_owner
+        cards = [int(c) for c in cards or ()]
+        if self.session is None or self.opponent_source != 'learned' or len(set(cards)) != 8:
+            return ''
+        outside = [c for c in self.opponent_seen if c not in cards]
+        if outside:
+            self.api_deck_state = 'discarded'
+            return (f'API deck not used: opponent already played {outside}, '
+                    f'which is not in it')
+        for card in cards:
+            self._register(opponent, card)
+        self.api_deck = set(cards)
+        self.opponent_source = 'api'
+        self.api_deck_state = 'trusted'
+        return 'API deck taken as the opponent\'s deck until a card contradicts it'
+
+    def _discard_api_deck(self, card_id: int) -> None:
+        """A card outside the API deck: drop its unplayed cards from the tracker."""
+        tracker, opponent = self._tracker(), 1 - self.actor_owner
+        keep = set(self.opponent_seen)
+        for card in list(tracker._card_states[opponent]):
+            if card not in keep and card != card_id:
+                del tracker._card_states[opponent][card]
+        tracker.decks[opponent] = tuple(c for c in tracker.decks[opponent] if c in keep)
+        self.opponent_source = 'learned'
+        self.api_deck_state = 'discarded'
+        self.api_deck = set()
+        self.messages.append(f'opponent played {card_id}, not in their API deck - API deck '
+                             f'discarded, learning from play only')
+
     def _see(self, owner: int, card_id: int) -> str | None:
         """Register one card the opponent has shown; remember it in first-seen order."""
+        if (owner != self.actor_owner and self.opponent_source == 'api'
+                and card_id not in self.api_deck):
+            self._discard_api_deck(card_id)
         reason = self._register(owner, card_id)
         if reason is None and owner != self.actor_owner and card_id not in self.opponent_seen:
             self.opponent_seen.append(card_id)
