@@ -858,3 +858,22 @@ readiness, hero always offered, 88-99% of the match's elixir spent.
      initial state is wrong and the fix is to seed it;
   3. whether the hand in memory changes at tap or at execution (both are handled; the
      answer tells which path runs);
+
+## Side-1 placements were point-mirrored (found 2026-09-25)
+
+`ScreenLayout.deployment_point` takes a CANONICAL cell (local player's view, row 0 = own back
+line; the Training Camp tap test above is the proof: canonical 170 -> native (9500, 22500) as
+side 1). FirstLight decodes to NATIVE tiles. The console passed the native cell straight
+through, so as side 1 every play went to (17 - col, 31 - row): troops aimed into the enemy half
+and snapped by the client to the nearest legal tile, spells on the mirrored lane. As side 0
+native == canonical and placements were right. This is the "madman" play the user saw; it
+predates every change in this session. Fix: `console.screen_cell`. The console now also logs
+`placement <card>: asked native (x, y), game got (x, y), off N tiles` from the queue entry,
+so a mapping error can never again go unseen.
+
+Tap benchmark (Training Camp, 4 trials each): old adb path 3/4 accepted, 148 ms gesture;
+fast_tap place gap 50/hold 34 119 ms; 30/20 71 ms; 16/16 49 ms; 8/16 41 ms; 0/16 33 ms (all 4/4);
+drag 3x10 41 ms 4/4, 2x5 16 ms 3/4, 1x17 34 ms 4/4. Default now place gap 8 hold 16.
+First live latency lines (gap 30/hold 20): frame age 5-30 ms, inference 88-134 ms, tap sent
+<=1 ms after the decision, gesture 71 ms, decision frame -> issued 4-6 ticks; then the game's
+21. Inference is now the largest part we own.

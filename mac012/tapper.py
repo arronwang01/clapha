@@ -11,8 +11,8 @@ device -- the ordinary Android input path, nothing in the game process is touche
 Gesture shape is configurable because what the client accepts has to be measured
 (mac012/tap_bench.py), not assumed:
     CR_TAP_MODE   place (tap card, tap tile) | drag (one gesture)      default place
-    CR_TAP_GAP_MS gap between the two taps / steps of a drag            default 30 / 3
-    CR_TAP_HOLD_MS hold per tap / ms per drag step                      default 20 / 10
+    CR_TAP_GAP_MS gap between the two taps / steps of a drag            default 8 / 3
+    CR_TAP_HOLD_MS hold per tap / ms per drag step                      default 16 / 10
 """
 from __future__ import annotations
 
@@ -44,8 +44,10 @@ class Tapper:
     def __init__(self, adb, serial, width: int, height: int):
         self.mode = os.environ.get('CR_TAP_MODE', 'place')
         drag = self.mode == 'drag'
-        self.gap = int(os.environ.get('CR_TAP_GAP_MS', '3' if drag else '30'))
-        self.hold = int(os.environ.get('CR_TAP_HOLD_MS', '10' if drag else '20'))
+        # place gap 8 hold 16: 4/4 accepted, 41 ms (tap_bench, 2026-09-25). gap 0 was also
+        # 4/4 at 33 ms; the 8 ms is margin for a slow frame, until more trials say otherwise.
+        self.gap = int(os.environ.get('CR_TAP_GAP_MS', '3' if drag else '8'))
+        self.hold = int(os.environ.get('CR_TAP_HOLD_MS', '10' if drag else '16'))
         path, max_x, max_y = touch_device(adb, serial)
         # MuMu reports the panel in screen pixels; scale in case another device does not.
         self.scale = ((max_x + 1) / width if max_x else 1.0,

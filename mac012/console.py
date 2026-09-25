@@ -52,6 +52,21 @@ HOG26_DECK = {26000021: 0,   # Hog Rider
               26000030: 0}   # Ice Spirit
 
 
+def screen_cell(column: int, row: int, side: int) -> int:
+    """FirstLight's native tile -> the cell ScreenLayout.deployment_point expects.
+
+    deployment_point takes a CANONICAL cell: the local player's own view, row 0 at their own
+    back line (verified in Training Camp as side 1: canonical (8500, 9500) landed native
+    (9500, 22500)). FirstLight decodes to NATIVE tiles, which for side 1 is that view rotated
+    180 degrees. Passing the native cell straight through sent every side-1 play to the
+    point-mirrored tile: own-half troops were aimed into the enemy half (the client snaps them
+    to the nearest legal tile) and spells landed on the wrong lane.
+    """
+    if side == 1:
+        column, row = X_TILES - 1 - column, Y_TILES - 1 - row
+    return row * X_TILES + column
+
+
 def opponent_deck_file(account, *, fresh_after: float):
     """(deck, forms, note) published by the other console for this account, or (None, None, '')."""
     if account is None:
@@ -157,12 +172,26 @@ class Bot:
                 self.rtt.append(max(0, entry['issue_tick'] - flight['tap_tick']))
                 del self.rtt[:-50]
                 self._report_latency(flight)
+                self._report_placement(flight, entry)
                 break
         now = time.time()
         return [f for f in in_flight
                 if (f.get('issue_tick') is None and now - f['tap_time'] <= IN_FLIGHT_SECONDS)
                 or (f.get('issue_tick') is not None
                     and tick < f['issue_tick'] + COMMAND_AGE_TICKS)]
+
+    def _report_placement(self, flight: dict, entry: dict) -> None:
+        """Where the game put the command, against where the policy asked, both native.
+        A building or troop lands on the tile; anything over a tile off is a mapping bug."""
+        target = flight.get('target')
+        if not target or entry.get('x') is None or entry.get('y') is None:
+            return
+        dx, dy = (entry['x'] - target[0]) / 1000.0, (entry['y'] - target[1]) / 1000.0
+        off = (dx * dx + dy * dy) ** 0.5
+        name = V.CARDS.get(flight['card'], {}).get('name', flight['card'])
+        self.note(f'placement {name}: asked native ({target[0]}, {target[1]}), game got '
+                  f'({entry["x"]}, {entry["y"]}), off {off:.1f} tiles'
+                  + ('  <-- MISPLACED' if off > 1.5 else ''))
 
     def _report_latency(self, flight: dict) -> None:
         """One line per play: where the time went between the frame the policy saw and the
@@ -201,7 +230,7 @@ class Bot:
         cost = float(V.CARDS.get(card, {}).get('elixir') or 0)
         if me['elixir_raw'] / 10000.0 - reserved < cost - 1e-6:
             return False       # the client cannot place it yet
-        cell = move['row'] * X_TILES + move['column']
+        cell = screen_cell(move['column'], move['row'], side)
         allowed, reason = scope_gate.check(accounts, side)
         if reason != self.gate:
             self.gate, self.gate_ok = reason, allowed
@@ -226,7 +255,8 @@ class Bot:
             timing['send_ms'] = (sent - timing['decided']) * 1000.0
         in_flight.append({'slot': me['hand_deck_indices'][position], 'card': card,
                           'cost': cost, 'tap_tick': int(frame['game_tick']),
-                          'tap_time': sent, 'timing': timing})
+                          'tap_time': sent, 'timing': timing,
+                          'target': (move['column'] * 1000 + 500, move['row'] * 1000 + 500)})
         self.plays += 1
         self.last_play = f'{name} at row {move["row"]} col {move["column"]}'
         waited = time.time() - move['since']
