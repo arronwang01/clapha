@@ -357,6 +357,21 @@ struct BoardView: View {
                 context.fill(Path(ellipseIn: CGRect(x: p.x - r, y: p.y - r, width: 2 * r, height: 2 * r)),
                              with: .color(.yellow))
             }
+            // Played but not landed yet: a dashed ghost ring with the card and the seconds
+            // until it lands. Opponent ones show ~0.7 s ahead; a real unit is a filled circle.
+            for pending in state.pendingCommands ?? [] where pending.kind == "card" {
+                guard let x = pending.x, let y = pending.y else { continue }
+                let p = point(x, y)
+                let r = tile * 0.55
+                let ring = Path(ellipseIn: CGRect(x: p.x - r, y: p.y - r, width: 2 * r, height: 2 * r))
+                let color: Color = pending.side == local ? Color(red: 0.35, green: 0.62, blue: 1)
+                                                         : Color(red: 1, green: 0.38, blue: 0.35)
+                context.stroke(ring, with: .color(color), style: StrokeStyle(lineWidth: 1.6, dash: [3, 2]))
+                let seconds = String(format: "%.1fs", Double(max(0, pending.remainingTicks)) / 20.0)
+                context.draw(Text("\(String(pending.name.prefix(5))) \(seconds)")
+                                .font(.system(size: 7, weight: .semibold)).foregroundStyle(color),
+                             at: CGPoint(x: p.x, y: p.y + r + 5))
+            }
             for e in entities where !e.tower && e.effect != true && e.hp > 0 {
                 let p = point(e.x, e.y)
                 let r = tile * 0.45

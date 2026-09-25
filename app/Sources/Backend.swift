@@ -30,6 +30,18 @@ struct EntityInfo: Decodable, Identifiable {
     let effect: Bool?
 }
 
+/// A command in the game's queue: played, not yet on the board (it lands `remainingTicks`
+/// later -- 21 ticks after it was issued). Drawn apart from real units.
+struct PendingInfo: Decodable {
+    let x: Int?
+    let y: Int?
+    let side: Int
+    let cardId: Int
+    let kind: String
+    let name: String
+    let remainingTicks: Int
+}
+
 struct BotInfo: Decodable {
     let running: Bool
     let armed: Bool
@@ -56,6 +68,7 @@ struct DeviceState: Decodable {
     let tick: Int?
     let players: [PlayerInfo]?
     let entities: [EntityInfo]?
+    let pendingCommands: [PendingInfo]?
     let localSide: Int?
 }
 

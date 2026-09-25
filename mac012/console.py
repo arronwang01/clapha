@@ -52,6 +52,31 @@ HOG26_DECK = {26000021: 0,   # Hog Rider
               26000030: 0}   # Ice Spirit
 
 
+def pending_commands(queue: list, accounts, tick: int) -> list[dict]:
+    """Every command in the queue, both sides, for the board's ghost markers.
+
+    A command executes COMMAND_AGE_TICKS after its issue tick; until then it is only a
+    promise -- which is why the app draws it apart from real units (dashed, with a countdown).
+    Opponent commands reach us ~7 ticks after issue, so they show ~0.7 s before landing.
+    """
+    out = []
+    for entry in queue or ():
+        issue = entry.get('issue_tick')
+        if not isinstance(issue, int) or int(entry.get('card_id') or 0) <= 0:
+            continue
+        card_id, form, kind = V.card_identity(entry['card_id'])
+        side = V.entry_side(entry, accounts)
+        remaining = issue + COMMAND_AGE_TICKS - int(tick)
+        if side is None or remaining < 0:
+            continue
+        out.append({'x': entry.get('x'), 'y': entry.get('y'), 'side': int(side),
+                    'card_id': card_id, 'form': form, 'kind': kind,
+                    'name': ('ability' if kind == 'ability' else
+                             V.CARDS.get(card_id, {}).get('name', str(card_id))),
+                    'remaining_ticks': remaining})
+    return out
+
+
 def screen_cell(column: int, row: int, side: int) -> int:
     """FirstLight's native tile -> the cell ScreenLayout.deployment_point expects.
 
@@ -1060,6 +1085,7 @@ class Handler(BaseHTTPRequestHandler):
                 reader_error = V.STATE['error']
                 age = time.time() - V.STATE['updated'] if V.STATE['updated'] else None
                 queue, gap = list(V.STATE['queue']), V.STATE['gap']
+                accounts = V.STATE['accounts']
             bot = {'running': BOT.running, 'armed': BOT.armed, 'model': BOT.model,
                    'status': BOT.status, 'plays': BOT.plays, 'last_play': BOT.last_play,
                    'log': BOT.log[-int((parse_qs(route.query).get('log') or ['14'])[0]):],
@@ -1078,6 +1104,8 @@ class Handler(BaseHTTPRequestHandler):
                 for player in frame['players']:
                     revealed[player['side']] = []
                 body = {'ok': True, 'age': age, 'pending': pending, 'lag_ticks': gap,
+                        'pending_commands': pending_commands(queue, accounts,
+                                                             frame.get('game_tick') or 0),
                         'session': V.SESSION.name, 'bot': bot, 'revealed': revealed,
                         **V.to_state(frame, health)}
             else:
