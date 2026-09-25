@@ -19,3 +19,9 @@ __pycache__/
 
 # the native app is built from app/ (app/build.sh)
 Clapha.app/
+
+# game files pulled from the user's own install (never committed)
+runtime/
+
+# upstream FirstLight_CR clone (models + code), kept current by update_check
+ref-firstlight/

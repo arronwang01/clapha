@@ -117,13 +117,15 @@ def to_state(frame: dict, health: dict) -> dict:
     entities = []
     for entity in frame.get('entities', []):
         info = CARDS.get(entity['card_id'], {})
-        tower = entity['card_id'] == -1
+        # card -1 is a tower only for tower objects; a tower's shots are card -1 too (kind 0)
+        effect = entity.get('kind') == 0
+        tower = entity['card_id'] == -1 and not effect
         entities.append({'x': entity['x'], 'y': entity['y'], 'side': entity['side'],
                          'hp': entity['hp'], 'max_hp': entity['max_hp'],
                          'card_id': entity['card_id'], 'level': entity['level'],
                          'name': 'King' if tower and entity['kind'] == 12 else
                                  ('Tower' if tower else info.get('name', str(entity['card_id']))),
-                         'tower': tower})
+                         'tower': tower, 'effect': effect})
     return {'tick': frame.get('game_tick'), 'players': players, 'entities': entities,
             'local_side': local_side, 'status': health.get('status'),
             'coherent': frame.get('coherent'), 'read_us': frame.get('read_us'),
@@ -161,8 +163,20 @@ def pump() -> None:
                     log.write(json.dumps({'frame': frame, 'health': health}) + '\n')
                     log.flush()
         except Exception as error:  # keep serving; the game may be in a menu or restarting
+            message = f'{type(error).__name__}: {error}'
+            try:
+                # 'ADB failed' is what verify_runtime reports when pidof finds nothing: say so.
+                running = subprocess.run([str(ADB), '-s', SERIAL, 'shell', 'pidof',
+                                          'com.supercell.clashroyale'], capture_output=True,
+                                         text=True, timeout=10).stdout.strip()
+                if not running and 'device' in subprocess.run(
+                        [str(ADB), '-s', SERIAL, 'get-state'], capture_output=True, text=True,
+                        timeout=10).stdout:
+                    message = 'Clash Royale is not running on this device - open the game'
+            except Exception:  # noqa: BLE001
+                pass
             with LOCK:
-                STATE['error'] = f'{type(error).__name__}: {error}'
+                STATE['error'] = message
             # A TCP adb device drops out on its own (sleep, emulator restart) and nothing else
             # brings it back, so the console would sit on "no battle" until relaunched.
             if ':' in SERIAL:

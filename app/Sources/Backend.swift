@@ -27,6 +27,7 @@ struct EntityInfo: Decodable, Identifiable {
     let cardId: Int
     let name: String
     let tower: Bool
+    let effect: Bool?
 }
 
 struct BotInfo: Decodable {
@@ -43,6 +44,8 @@ struct BotInfo: Decodable {
     let readerError: String?
     let gate: String?
     let gateOk: Bool?
+    let decoding: String?
+    let decodingUsed: String?
 }
 
 struct DeviceState: Decodable {
@@ -86,6 +89,8 @@ struct DeviceSummary: Equatable {
     var gate: String?
     var gateOk: Bool?
     var botStatus = "engine not running"
+    var decoding = "auto"
+    var decodingUsed: String?
 }
 
 @MainActor
@@ -178,6 +183,8 @@ final class DeviceModel: ObservableObject, Identifiable {
             next.gate = s.bot.gate
             next.gateOk = s.bot.gateOk
             next.botStatus = s.bot.status
+            next.decoding = s.bot.decoding ?? "auto"
+            next.decodingUsed = s.bot.decodingUsed
         }
         if next != summary { summary = next }
     }
@@ -196,6 +203,14 @@ final class DeviceModel: ObservableObject, Identifiable {
     }
 
     var mode: String { summary.mode }
+
+    func setDecoding(_ value: String) async {
+        guard let url = URL(string: "http://127.0.0.1:\(port)/api/decoding?value=\(value)") else { return }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 3.0
+        _ = try? await URLSession.shared.data(for: request)
+        await poll()
+    }
 }
 
 // MARK: - Shell tasks (backends, checks, reports), run from the repo root

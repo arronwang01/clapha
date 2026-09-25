@@ -44,8 +44,12 @@ import os
 import sys
 from pathlib import Path
 
+# The up-to-date upstream clone kept in the project (update_check reports when it falls behind),
+# else the user's own download.
+_CLONE = Path(__file__).resolve().parents[1] / 'ref-firstlight'
 FIRSTLIGHT = Path(os.environ.get('FIRSTLIGHT_ROOT')
-                  or Path.home() / 'Documents/GitHub/FirstLight_CR')
+                  or (_CLONE if (_CLONE / 'native_runner').is_dir()
+                      else Path.home() / 'Documents/GitHub/FirstLight_CR'))
 if str(FIRSTLIGHT) not in sys.path:
     sys.path.insert(0, str(FIRSTLIGHT))
 HERE = Path(__file__).resolve().parent
@@ -229,7 +233,8 @@ class FirstLightRunner:
             return {}
         return {owner: tuple(tracker._card_states[owner]) for owner in (0, 1)}
 
-    def hand_forms(self, deck, form_flags, evo_progress=None) -> dict[int, int]:
+    def hand_forms(self, deck, form_flags, evo_progress=None,
+                   evo_required: dict | None = None) -> dict[int, int]:
         """card id -> the form our hand holds it in: 0 normal, 1 evolution, 2 hero.
 
         FirstLight's probe reads this per hand card (card_parameter & 0xF). We cannot call the
@@ -259,6 +264,9 @@ class FirstLightRunner:
                 spec = specs.get(int(card_id))
                 evolution = getattr(spec, 'evolution', None) if spec is not None else None
                 required = int(evolution.cycle_required) if evolution is not None else None
+                # A requirement measured from this game (the counter dropping to 0 on the
+                # evolved play) beats FirstLight's 15.535 number, which differs for many cards.
+                required = int((evo_required or {}).get(int(card_id), required or 0)) or None
                 forms[int(card_id)] = 1 if required and int(memory[slot]) >= required else 0
             elif flag & 0x1 and tracker is not None:
                 try:

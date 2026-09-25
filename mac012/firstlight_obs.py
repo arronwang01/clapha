@@ -24,8 +24,12 @@ import os
 import sys
 from pathlib import Path
 
+# The up-to-date upstream clone kept in the project (update_check reports when it falls behind),
+# else the user's own download.
+_CLONE = Path(__file__).resolve().parents[1] / 'ref-firstlight'
 FIRSTLIGHT = Path(os.environ.get('FIRSTLIGHT_ROOT')
-                  or Path.home() / 'Documents/GitHub/FirstLight_CR')
+                  or (_CLONE if (_CLONE / 'native_runner').is_dir()
+                      else Path.home() / 'Documents/GitHub/FirstLight_CR'))
 if str(FIRSTLIGHT) not in sys.path:
     sys.path.insert(0, str(FIRSTLIGHT))
 
@@ -369,7 +373,7 @@ def placement_context(tower_states, frame: dict, owner: int):
     occupied: dict = {}
     unknown: set[int] = set()
     for e in frame['entities']:
-        if e['card_id'] == -1 or (e.get('hp') or 0) <= 0:
+        if e['card_id'] == -1 or is_effect(e) or (e.get('hp') or 0) <= 0:
             continue
         spec = specs.get(e['card_id'])
         if spec is None or spec.kind.value != 'building':
@@ -448,7 +452,8 @@ def _state_provenance(fields, filled: dict, tick: int, notes: tuple[str, ...]):
                                 observed_tick=tick, notes=notes)
 
 
-def own_runtime_states(player: dict, entities, side: int, tick: int, battle):
+def own_runtime_states(player: dict, entities, side: int, tick: int, battle,
+                       evo_required: dict | None = None):
     """(ability_runtime_states, evolution_runtime_states) for the actor, from memory.
 
     Abilities: one per bound hero controller, joined controller -> selected hero character ->
@@ -523,7 +528,7 @@ def own_runtime_states(player: dict, entities, side: int, tick: int, battle):
             evolution = getattr(spec, 'evolution', None) if spec is not None else None
             if not int(flag or 0) & 0x1 or evolution is None or not evolution.cycle_required:
                 continue
-            required = int(evolution.cycle_required)
+            required = int((evo_required or {}).get(int(card), evolution.cycle_required))
             value = max(0, int(value))
             ready = value >= required
             phase = (EvolutionPhase.READY if ready else
@@ -623,6 +628,60 @@ def action_mask(frame: dict, side: int, elixir: float, reserved: float = 0.0,
 
 
 _UNTAG = 0x00FFFFFFFFFFFFFF
+_ARCHETYPE_BY_DATA: dict[int, tuple[int, str] | None] = {}
+
+
+def _addr(value) -> int | None:
+    """A heap address as an untagged int; None for anything that is not one."""
+    try:
+        return int(str(value), 16) & _UNTAG
+    except (TypeError, ValueError):
+        return None
+
+
+_CARD_BY_ARCHETYPE: dict[int, int] | None = None
+
+
+def card_of_unit(global_id: int, fallback: int) -> int:
+    """The card whose unit this archetype is (Barbarian -> Barbarians), for its stats; the
+    object's own card id otherwise."""
+    global _CARD_BY_ARCHETYPE
+    if _CARD_BY_ARCHETYPE is None:
+        _CARD_BY_ARCHETYPE = {}
+        for card, (gid, _kind) in sorted(archetype_by_card().items()):
+            _CARD_BY_ARCHETYPE.setdefault(int(gid), int(card))
+    return _CARD_BY_ARCHETYPE.get(int(global_id), int(fallback))
+
+
+def is_tower(e: dict) -> bool:
+    """Towers are card -1 AND a tower object (kind 12/13). A tower's own shots are card -1 too,
+    spawned at the tower's position; they are projectiles (kind 0), not towers."""
+    return e.get('card_id') == -1 and e.get('kind', 12) != 0
+
+
+def is_effect(e: dict) -> bool:
+    """A projectile or area effect: kind 0, identified only by its own data record."""
+    return e.get('kind') == 0
+
+
+def archetype_by_data(data_id: int) -> tuple[int, str] | None:
+    """An object's own data record -> (archetype global id, entity kind), from FirstLight's
+    catalog. This is the key their environment uses (native_data_global_id): it names the unit a
+    spawner produced (Battle Ram -> Barbarians, Tombstone -> Skeletons) and the ProjectileData /
+    AreaEffectData of a spell or shot in flight, which the card id cannot."""
+    data_id = int(data_id) & 0xFFFFFFFF
+    if data_id not in _ARCHETYPE_BY_DATA:
+        from native_runner.training.v4.factory import production_semantic_bundle
+        catalog = production_semantic_bundle().entity_archetype_catalog
+        result = None
+        vocab = catalog.runtime_global_vocab_id(data_id) if data_id else 1
+        if vocab > 1:
+            metadata = catalog.metadata_for_vocab_id(vocab)
+            kind = _ENTITY_KIND.get(str(metadata.child_kind))
+            if metadata.child_kind_known and kind is not None:
+                result = (data_id, kind)
+        _ARCHETYPE_BY_DATA[data_id] = result
+    return _ARCHETYPE_BY_DATA[data_id]
 _BASE_CARD: dict[int, int] | None = None
 
 
@@ -706,7 +765,30 @@ def troop_runtime(e: dict, entity_id: int, tick: int, target_id: int | None,
     return attack, movement, deployment
 
 
-def runtime_provenance(fields, attack, movement, deployment, tick: int):
+def projectile_state(e: dict, global_id: int, entity_id: int, velocity, tick: int):
+    """FirstLight's ProjectileStateV1 for a shot or spell in flight, as their adapter builds it:
+    in flight while the object exists, its velocity, its source card, its projectile data id.
+    Damage and radius stay unset -- the tensorizer then takes the projectile archetype's catalog
+    values, as it does for their probe. The destination is not read yet, so it stays unset too."""
+    from native_runner.contracts import (PROJECTILE_STATE_FIELDS, ProjectilePhase,
+                                         ProjectileStateV1, SemanticEvidenceLevel)
+    derived = SemanticEvidenceLevel.NATIVE_DERIVED
+    card = e['card_id'] if e.get('card_id', -1) > 0 else None
+    filled = {'phase': (derived, ('object present in the battle entity list',))}
+    if velocity is not None:
+        filled['velocity'] = (derived, ('position delta / tick delta',))
+    if card is not None:
+        filled['source_card_id'] = (derived, ('object +0xac',))
+    return ProjectileStateV1(
+        projectile_id=f'projectile:{entity_id}:{global_id}', phase=ProjectilePhase.IN_FLIGHT,
+        source_card_id=card, velocity=velocity,
+        attributes={'native_projectile_data_global_id': int(global_id),
+                    'terminal_reason': 'unknown'},
+        provenance=_state_provenance(PROJECTILE_STATE_FIELDS, filled, tick,
+                                     ('external read-only reader; destination not read',)))
+
+
+def runtime_provenance(fields, attack, movement, deployment, tick: int, projectile=None):
     """Per-domain evidence for a troop or tower: which runtime domains were really observed.
 
     Their contract refuses a domain carrying data without positive provenance, and just as
@@ -721,7 +803,8 @@ def runtime_provenance(fields, attack, movement, deployment, tick: int):
     for name, value, origin in (
             ('attack_state', attack, ('attack component +0x10/+0x20/+0x24/+0x28',)),
             ('movement_runtime', movement, ('movement component +0x1e0',)),
-            ('deployment_runtime', deployment, ('object +0x15c',))):
+            ('deployment_runtime', deployment, ('object +0x15c',)),
+            ('projectile_state', projectile, ('object +0x48 ProjectileData, frame deltas',))):
         if value is not None and name in evidence:
             evidence[name] = SemanticEvidenceLevel.NATIVE_AUTHORITATIVE
             sources[name] = origin
@@ -795,7 +878,8 @@ def play_events(plays, tick: int, decks: dict | None, battle):
 def build(frame: dict, health: dict, episode_id: str, deduced: dict | None = None,
           revealed: dict | None = None, battle: Battle | None = None,
           reserved: float = 0.0, plays=None, decks: dict | None = None,
-          hand_forms: dict | None = None, pending_ability_sources=()):
+          hand_forms: dict | None = None, pending_ability_sources=(),
+          evo_required: dict | None = None):
     """One ObservationV1 for the local actor, FAIR tier.
 
     Pass the same Battle for every frame of a battle: velocity, entity identity, age, the
@@ -816,7 +900,7 @@ def build(frame: dict, health: dict, episode_id: str, deduced: dict | None = Non
     if battle is None or battle.episode_id != episode_id:
         battle = Battle(episode_id)
     tick = battle.tick(frame['game_tick'])
-    live = {(e['x'], e['y']): e for e in frame['entities'] if e['card_id'] == -1}
+    live = {(e['x'], e['y']): e for e in frame['entities'] if is_tower(e)}
 
     phase, multiplier = timeline().phase(tick)
     remaining = max(0, gameplay_end_tick() - tick) * TICK_MS
@@ -847,15 +931,24 @@ def build(frame: dict, health: dict, episode_id: str, deduced: dict | None = Non
             position=(float(x), float(y)),
             tower_troop_id=None if kind == 'king' else TOWER_PRINCESS,
             hitpoints=hitpoints, max_hitpoints=maximum, active=active)))
-        if found and found.get('address'):
-            id_by_address[int(found['address'], 16) & _UNTAG] = entity_id
+        if found and _addr(found.get('address')) is not None:
+            id_by_address[_addr(found['address'])] = entity_id
 
     archetypes = archetype_by_card()
     entities = []
     addresses: set[str] = set()
-    def resolve(card_id: int):
-        """Archetype for a board object; a form FirstLight never had (an evolution released
-        after 15.535) is shown as its base unit rather than dropped, and noted once."""
+    def resolve(e: dict):
+        """Archetype for a board object. Its own data id first (what the object IS -- the unit
+        a spawner made, the projectile of a spell); the card mapping only as the fallback for
+        recordings made before the reader carried data ids. A form FirstLight never had (an
+        evolution released after 15.535) is shown as its base unit rather than dropped."""
+        if e.get('data_id'):
+            found = archetype_by_data(e['data_id'])
+            if found is not None:
+                return found
+        if is_effect(e) or e.get('card_id', -1) == -1:
+            return None
+        card_id = e['card_id']
         found = archetypes.get(card_id)
         if found is None and base_card(card_id) != card_id:
             found = archetypes.get(base_card(card_id))
@@ -864,37 +957,58 @@ def build(frame: dict, health: dict, episode_id: str, deduced: dict | None = Non
         return found
 
     for e in frame['entities']:
-        if e['card_id'] != -1 and resolve(e['card_id']) is not None and e.get('address'):
-            address = str(e['address'])
-            known_id, _age, _birth = battle.identify(address, tick)
-            id_by_address[int(address, 16) & _UNTAG] = known_id
+        if not is_tower(e) and resolve(e) is not None and _addr(e.get('address')) is not None:
+            known_id, _age, _birth = battle.identify(str(e['address']), tick)
+            id_by_address[_addr(e['address'])] = known_id
 
     def target_of(e: dict) -> tuple[int | None, bool]:
-        raw_target = int(str(e.get('target') or '0x0'), 16) & _UNTAG
+        raw_target = _addr(e.get('target') or '0x0') or 0
         if raw_target == 0:
             return None, True
         found_id = id_by_address.get(raw_target)
         return found_id, found_id is not None
 
     for e in frame['entities']:
-        if e['card_id'] == -1:
+        if is_tower(e):
             continue
-        resolved = resolve(e['card_id'])
+        resolved = resolve(e)
         if resolved is None:
             # Spell area effects are the usual case: our reader reports the spell's card id,
             # which has no entity archetype, and a strict tensorizer raises on it. Leaving the
             # entity out loses a short-lived effect; sending it in loses every decision while
             # it is on the board.
-            battle.unresolved[e['card_id']] = battle.unresolved.get(e['card_id'], 0) + 1
+            key = e['card_id'] if e['card_id'] != -1 else -int(e.get('data_id') or 0)
+            battle.unresolved[key] = battle.unresolved.get(key, 0) + 1
             continue
         global_id, kind = resolved
         address = str(e.get('address') or f"{e['x']}:{e['y']}:{e['card_id']}")
         addresses.add(address)
         entity_id, age_ms, birth = battle.identify(address, tick)
-        id_by_address[int(address, 16) & _UNTAG if address.startswith('0x') else -1] = entity_id
+        if _addr(address) is not None:
+            id_by_address[_addr(address)] = entity_id
+        if is_effect(e):
+            # A shot or spell in flight: position, velocity and what it is. It has no
+            # hitpoints, attack, movement or deploy state of its own.
+            card = e['card_id'] if e['card_id'] != -1 else None
+            velocity = battle.velocity(address, tick, e['x'], e['y'])
+            projectile = (projectile_state(e, global_id, entity_id, velocity, tick)
+                          if kind == 'projectile' else None)
+            entities.append(EntityStateV1(
+                native_data_global_id=global_id, entity_id=entity_id, owner=e['side'],
+                card_id=card, entity_kind=kind,
+                position=(float(e['x']), float(e['y'])),
+                velocity=velocity, projectile_state=projectile,
+                age_ms=age_ms, visible=True,
+                causal_group=CausalGroupRefV1(
+                    kind=(CausalGroupKind.VOLLEY if kind == 'projectile'
+                          else CausalGroupKind.PERSISTENT_EFFECT),
+                    handle=f"{e['side']}:{global_id}:{birth}", source_card_id=card),
+                runtime_provenance=runtime_provenance(ENTITY_RUNTIME_SEMANTIC_FIELDS, None,
+                                                      None, None, tick, projectile)))
+            continue
         target_id, target_known = target_of(e)
         attack, movement, deployment = troop_runtime(e, entity_id, tick, target_id,
-                                                     target_known, _hit_speed(e['card_id']))
+                                                     target_known, _hit_speed(card_of_unit(global_id, e['card_id'])))
         # One deployment is one causal group. Without this every unit is a singleton
         # (grouping.causal_group_key falls back to "singleton:<id>"), so a Skeletons or
         # Minions play reads as three or four unrelated individuals rather than the swarm the
@@ -961,7 +1075,8 @@ def build(frame: dict, health: dict, episode_id: str, deduced: dict | None = Non
             runtime_by_slot = {str(pos): {'form_code': int((hand_forms or {}).get(deck[i], 0))}
                                for pos, i in enumerate(hand_slots)
                                if deck and 0 <= i < len(deck)}
-            abilities, evolutions = own_runtime_states(p, entities, side, tick, battle)
+            abilities, evolutions = own_runtime_states(p, entities, side, tick, battle,
+                                                       evo_required)
             players.append(PlayerStateV1(
                 elixir_exact=own_elixir,
                 hand=hand, next_card=nxt, deck=tuple(deck), cycle=cycle,

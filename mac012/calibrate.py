@@ -79,7 +79,7 @@ def main() -> int:
     rows = []
     for entity in frame['entities']:
         sx, sy = native_to_screen(layout, entity['x'], entity['y'], local_side)
-        stationary = entity['card_id'] == -1
+        stationary = entity['card_id'] == -1 and entity.get('kind') != 0
         colour = (255, 0, 0) if stationary else (255, 255, 0)
         radius = 26 if stationary else 16
         draw.ellipse([sx - radius, sy - radius, sx + radius, sy + radius], outline=colour, width=6)

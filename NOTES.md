@@ -1088,3 +1088,84 @@ Verification without a display: `app/snapshot.sh` renders the window off-screen 
 engine states (app/fixture_*.json) to build/app_snapshot.png; `build/app.log` records startup
 and polling. Native AppKit controls cannot be drawn off-screen, which is one reason the mode
 switch and model list are plain SwiftUI (the other: they are clearer).
+
+## Objects resolved by their own data id: spawned units fixed, projectiles visible (2026-09-25)
+
+`src/ent_probe.c` listed every object in a live battle, unfiltered, with object+0x48 -> +0x40 (the
+object's own data record, FirstLight's kObjectDataOffset). Findings:
+- For every unit, that data id IS FirstLight's archetype global id (Knight 34000000 = form:Knight,
+  Goblins 3565953160 = form:Goblin_Stab, ...).
+- **Spawned units were mislabelled by our card-based mapping.** A Battle Ram's Barbarians carry
+  the Battle Ram's card (+0xAC 26000036) but data 34000009 (Barbarian); a Tombstone's Skeletons
+  carry the Tombstone's card (27000009, a building archetype) but data 34000008 (Skeleton). Every
+  spawner card (Tombstone, Witch, Battle Ram, Goblin Hut, Furnace, Graveyard...) was affected.
+- **Projectiles were in the entity list all along, dropped by our reader's kind filter**: kind 0,
+  category 4xxxxxx, data = ProjectileData (Fireball 10000000, Archer arrow 10000002, Musketeer
+  10000014, Bomber 10000010, tower shots 10000003 with card -1).
+- Tower shots are card -1 like towers and spawn on the tower's tile -- anything recognising towers
+  by card -1 must also require a tower object kind (12/13). Fixed in firstlight_obs, viewer,
+  model_adapter, calibrate.
+Reader now emits `data_id` and keeps kind-0 objects whose data is ProjectileData (10xxxxxx) or
+AreaEffectData (22xxxxxx). Builder resolves every object by data id first (card mapping only as the
+fallback for older recordings); projectiles get FirstLight's ProjectileStateV1 (in flight,
+velocity, source card, data id; damage/radius from their archetype as their probe leaves them).
+Spawned units use their own unit's hit speed. `mac012/test_effects.py` covers it. Live Training
+Camp: 39 plays, 0 errors, 0 missed turns, 37/37 placements exact; over 729 decisions 13.9% of
+unit rows were projectiles in flight; unit features filled 17 -> 22 of 72; slots empty for lack
+of data 47 -> 44. Still missing for projectiles: destination and homing.
+
+## Staying current (2026-09-25)
+
+- `mac012/update_check.py`: installed build per device vs the reader's certified build (version +
+  libg SHA from the device's own install), card catalog stamp, and whether FirstLight /
+  cr-native-sandbox upstream moved. `--pull` copies a new build from the device into
+  runtime/<version>/ (git-ignored; nothing downloaded), decodes its tables and diffs cards; the
+  report lists every pinned value that must be re-derived and the probe that does it.
+- `mac012/game_data.py`: reads the build's LZMA tables (Supercell's short header) from the pulled
+  APK. `mac012/update_catalog.py` brought live_card_catalog.json from 15.535.29 to 160402012:
+  152/152 ids and names unchanged, no elixir changes, one new card (MinionGiant 26000107, 4).
+  `PrestigeCount` is where the old catalog's evolution cycles came from; it is NOT the play count
+  (Skeletons 3, measured 2) and no single rule maps it (PrestigeCount-1 fits 19/42 of FirstLight's
+  numbers) -- so the console measures the requirement from the game instead: a deck slot's
+  progress counter falling from k to 0 means the card needs k (build/evo_cycles.json).
+- FirstLight: the user's download predates the whole Sept 23-24 series. **Models identical**
+  (SHA-256 = upstream manifest); code behind in 14 files incl. policy_session.py and
+  offline_agent.py. Upstream now clones into ref-firstlight/ (git-ignored) and is the default
+  root; every test passes on it. Upstream changes that matter: their human-vs-AI loop still
+  samples; their new AI-vs-AI duel decodes greedily (force_act is only a manual GUI button); their
+  offline engine executes plays on the next tick (backdated command age) -- the policies trained
+  with ~1 tick, the live game has 21. Console decoding is now Auto (sampled vs a human/bot,
+  greedy when the other device runs a model against us), Sampled or Greedy.
+- GPU (MPS) inference is slower than CPU for this batch-1 recurrent model (137 vs 106 ms).
+
+## Sandbox from the latest libg: assessment (2026-09-25)
+
+What it takes (cr-native-sandbox docs/SANDBOX_RUNTIME_TECHNICAL #27): freeze hashes; relocate
+JNI_OnLoad, key functions and struct offsets; re-verify DataTables/map resources; regenerate card
+and form catalogs; re-verify Replay, six towers, tower HP, RNG, public hashes; deploy, abilities,
+grid, tick; reset/time/elixir/terminal certificates. Their engine host (android_probe: Java JniHost
++ 7,859-line jni_bridge.cpp) loads the game's own libg into its own process and drives battles by
+calling internal functions -- every address pinned to the x86_64 15.535.29 build.
+- Their route runs x86_64 libg in an x86_64 AVD (Windows/Hyper-V) or x86_64 Linux. Not on this Mac.
+- Their ARM64 bring-up (IMAX9D/cr-native-linux-bionic, branch port/arm64-160402002-bringup,
+  2026-09-08, 160402002): ARM64 Bionic entry, real ART, FMOD, Sentry load; **libscid_sdk
+  SIGSEGVs during init** (indirect call at RVA 0x17b170 jumps to unmapped 0x681780 right after
+  reading /proc/self/maps); libg JNI_OnLoad fails the same way. Tested only under QEMU (user and
+  system emulation); they could not tell emulation artefact from a real environment requirement.
+  No battle ever created.
+- FirstLight's engine patches a Null's (private server) APK with their probe. Doing that to the
+  official current client is modifying the official app -- not done.
+- This Mac is native ARM64 and MuMu is a real ARM64 Android, the one environment their research
+  never had. Tools present: build-tools 36 (d8, aapt2, apksigner), platform 37, JDK 21/25, NDK 28.
+  The current build's APK splits are in runtime/160402012/ (SHA256SUMS), libg SHA = profile.
+Plan, in order, each a go/no-go gate:
+  1. Load gate: a minimal ARM64 host APK in a fresh, separate MuMu instance (not a game device)
+     loads libc++_shared, FMOD, libscid_sdk, then libg with JNI_OnLoad -- does SCID init pass on
+     real ARM64 Android? (Their blocker; decides whether the rest is possible.)
+  2. Relocate the host's entry points on 160402012 ARM64: resource/DataTables init, GameMain,
+     Replay/Scene creation, tick, card command, ability command, reset -- from exported JNI
+     symbols, the JNI registration table and string xrefs. No reuse of x86_64 RVAs.
+  3. Certify against the live client: same deck, same commands -> same towers/HP/elixir, using the
+     reader's live frames as the reference (we can read both).
+  4. Throughput and multi-battle stability; then training with the real 21-tick command age.
+Realistically weeks, not a night; gate 1 is a day and tells whether it is feasible at all.

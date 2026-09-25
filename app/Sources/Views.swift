@@ -166,6 +166,9 @@ struct DevicePanel: View {
             }
             Text(modeHelp).font(.caption).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+            DecodingSwitch(value: sum.decoding, used: sum.decodingUsed, enabled: sum.reachable) { value in
+                Task { await device.setDecoding(value) }
+            }
             ModelList(models: orderedModels, chosen: $chosenModel, running: sum.running ? sum.model : nil)
             if sum.running, let m = sum.model, m != chosenModel {
                 Button("Switch the running model to \(modelLabel(chosenModel))") {
@@ -232,6 +235,38 @@ struct ModeSwitch: View {
         .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.3)))
         .frame(maxWidth: 330)
         .opacity(enabled ? 1 : 0.6)
+    }
+}
+
+/// How the policy picks among its options, matched to how FirstLight runs each setup.
+struct DecodingSwitch: View {
+    let value: String
+    let used: String?
+    let enabled: Bool
+    let choose: (String) -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text("Decoding").font(.caption).foregroundStyle(.secondary)
+            HStack(spacing: 0) {
+                ForEach([("auto", "Auto"), ("sampled", "Sampled"), ("greedy", "Greedy")], id: \.0) { option in
+                    let selected = value == option.0
+                    Button { if !selected { choose(option.0) } } label: {
+                        Text(option.1).font(.caption.weight(selected ? .semibold : .regular))
+                            .padding(.horizontal, 10).padding(.vertical, 3)
+                            .foregroundStyle(selected ? Color.white : Color.primary)
+                            .background(selected ? Color.accentColor : Color.secondary.opacity(0.10))
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(!enabled)
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+            if let used {
+                Text("this battle: \(used)").font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+        .help("Auto: sampled against you or a bot (FirstLight's human-vs-AI), greedy when both devices run models against each other (FirstLight's AI duel).")
     }
 }
 
@@ -315,7 +350,14 @@ struct BoardView: View {
                 context.fill(Path(CGRect(x: rect.minX, y: rect.minY - 5, width: rect.width, height: 3)), with: .color(.black.opacity(0.5)))
                 context.fill(Path(CGRect(x: rect.minX, y: rect.minY - 5, width: rect.width * frac, height: 3)), with: .color(.green))
             }
-            for e in entities where !e.tower && e.hp > 0 {
+            for e in entities where e.effect == true {
+                // a shot or spell in flight
+                let p = point(e.x, e.y)
+                let r = tile * 0.22
+                context.fill(Path(ellipseIn: CGRect(x: p.x - r, y: p.y - r, width: 2 * r, height: 2 * r)),
+                             with: .color(.yellow))
+            }
+            for e in entities where !e.tower && e.effect != true && e.hp > 0 {
                 let p = point(e.x, e.y)
                 let r = tile * 0.45
                 let circle = Path(ellipseIn: CGRect(x: p.x - r, y: p.y - r, width: 2 * r, height: 2 * r))

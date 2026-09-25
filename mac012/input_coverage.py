@@ -120,15 +120,24 @@ def main() -> int:
          and (d / 'frames.jsonl').stat().st_size > 0), key=lambda d: d.name)
     frames, revealed_by_tick = load_session(directory)
     battle_rows = [json.loads(l) for l in (directory / 'queue.jsonl').open() if l.strip()]
-    side = next((h.get('local_side') for _, h in frames if h.get('local_side') in (0, 1)), 0)
+    side = 0
     # A session can hold several battles; replay only the first (the chosen one), since each
     # battle needs its own episode and deck.
-    first = next(f for f, h in frames if f.get('battle_active'))
-    battle_id = (first.get('chain') or {}).get('battle')
+    # The battle with the most frames: a recording can open on the previous match's last frames.
+    counts: dict = {}
+    for f, _h in frames:
+        if f.get('battle_active'):
+            key = (f.get('chain') or {}).get('battle')
+            counts[key] = counts.get(key, 0) + 1
+    battle_id = max(counts, key=counts.get)
+    first = next(f for f, h in frames if (f.get('chain') or {}).get('battle') == battle_id)
     frames = [(f, h) for f, h in frames if (f.get('chain') or {}).get('battle') == battle_id]
     cut = next((i for i in range(1, len(frames))
                 if frames[i][0]['game_tick'] < frames[i - 1][0]['game_tick']), len(frames))
     frames = frames[:cut]
+    side = next((h.get('local_side') for f, h in frames
+                 if (f.get('chain') or {}).get('battle') == battle_id
+                 and h.get('local_side') in (0, 1)), 0)
     me = next(p for p in first['players'] if p['side'] == side)
     deck = me['deck_card_ids']
     # the queue rows of this battle only: a session can hold several

@@ -70,6 +70,10 @@ typedef struct {
      component vtables located on this build by src/comp_probe.c. -1 / 0 = component absent. */
   int32_t deploy_remaining, has_attack, atk_stage, atk_timeline, atk_load, has_move, charge;
   uint64_t target;
+  /* The object's own data record (+0x48 -> +0x40, FirstLight's kObjectDataOffset): the unit a
+     spawner produced (a Battle Ram's Barbarians, a Tombstone's Skeletons) or the ProjectileData
+     / AreaEffectData of a spell in flight -- the id FirstLight's archetype catalog is keyed by. */
+  uint32_t data_id;
 } EntityFrame;
 
 /* Component vtables as offsets into libg for build 160402012 (libg sha256 aec6cc5e...),
@@ -378,14 +382,34 @@ static int read_entities(int fd, ChainFrame *frame) {
     memcpy(&item.card_id, raw + 0xAC, 4);
     memcpy(&item.level, raw + 0x120, 4);
     memcpy(&item.behavior, raw + 0x11C, 4);
-    if (item.category < 5000000 || item.category >= 6000000 ||
-        item.kind < 10 || item.kind > 20 || item.side < 0 || item.side > 1 ||
+    uint64_t data_record = 0;
+    memcpy(&data_record, raw + 0x48, 8);
+    if (data_record) read_exact(fd, data_record + 0x40, &item.data_id, 4);
+    /* Projectiles and area effects (kind 0, category 4xxxxxx) carry a ProjectileData (10xxxxxx)
+       or AreaEffectData (22xxxxxx) record; keep exactly those, as FirstLight's catalog names
+       them. Everything else keeps the original unit filter. */
+    int effect = item.kind == 0 && item.category >= 4000000 && item.category < 5000000 &&
+                 ((item.data_id >= 10000000 && item.data_id < 11000000) ||
+                  (item.data_id >= 22000000 && item.data_id < 23000000));
+    if (!effect && (item.category < 5000000 || item.category >= 6000000 ||
+        item.kind < 10 || item.kind > 20) ) {
+      frame->filtered_count++;
+      continue;
+    }
+    if (item.side < 0 || item.side > 1 ||
         item.x < 0 || item.x > 18000 || item.y < 0 || item.y > 32000 ||
-        item.level < 0 || item.level > 16 ||
+        (!effect && (item.level < 0 || item.level > 16)) ||
         (item.card_id != -1 && (item.card_id < 20000000 || item.card_id >= 1000000000) &&
          /* evolution unit forms carry 13xxxxxx, below the card-id range */
          (item.card_id < 13000000 || item.card_id >= 14000000))) {
       frame->filtered_count++;
+      continue;
+    }
+    if (effect) {
+      /* a projectile or area effect: no level, hitpoints, deploy timer or components of a unit */
+      item.level = 0;
+      item.deploy_remaining = 0;
+      frame->entities[frame->entity_count++] = item;
       continue;
     }
     item.level++;
@@ -614,11 +638,11 @@ int main(int argc, char **argv) {
                "\"x\":%d,\"y\":%d,\"card_id\":%d,\"level\":%d,\"hp\":%d,\"max_hp\":%d,"
                "\"behavior_state_raw\":%d,\"deploy_remaining\":%d,\"has_attack\":%d,"
                "\"target\":\"0x%" PRIx64 "\",\"atk_stage\":%d,\"atk_timeline\":%d,"
-               "\"atk_load\":%d,\"has_move\":%d,\"charge\":%d}",
+               "\"atk_load\":%d,\"has_move\":%d,\"charge\":%d,\"data_id\":%u}",
                e->address, e->category, e->kind, e->side,
                e->x, e->y, e->card_id, e->level, e->hp, e->max_hp, e->behavior,
                e->deploy_remaining, e->has_attack, e->target, e->atk_stage, e->atk_timeline,
-               e->atk_load, e->has_move, e->charge);
+               e->atk_load, e->has_move, e->charge, e->data_id);
       }
       putchar(']');
     }

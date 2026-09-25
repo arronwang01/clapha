@@ -100,6 +100,8 @@ class Bot:
         self.layout = None
         self.gate = 'unchecked'
         self.gate_ok = False
+        self.decoding = 'auto'          # auto | sampled | greedy
+        self.decoding_used = None
         self.tracker = None
         self.opp_deck = None
         self.seen_plays = 0
@@ -148,6 +150,78 @@ class Bot:
         if thread is not None and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=3.0)     # the loop checks `running` at least every 0.3 s
         return 'stopped'
+
+    EVO_FILE = Path(__file__).resolve().parents[1] / 'build' / 'evo_cycles.json'
+
+    @property
+    def evo_required(self) -> dict:
+        if not hasattr(self, '_evo_required'):
+            try:
+                self._evo_required = {int(k): int(v) for k, v in
+                                      json.loads(self.EVO_FILE.read_text()).items()}
+            except (OSError, ValueError):
+                self._evo_required = {}
+        return self._evo_required
+
+    def _measure_evolutions(self, deck: list, me: dict) -> None:
+        """The game's own evolution requirement per card: a deck slot's progress counter rises
+        by one per normal play and falls to 0 on the evolved play (device: Skeletons
+        0 -> 1 -> 2 -> 0), so a fall from k to 0 means the card needs k. Remembered across
+        runs; used instead of FirstLight's 15.535 cycle counts, which differ for many cards."""
+        progress = me.get('evo_progress') or []
+        previous = getattr(self, '_last_progress', None)
+        self._last_progress = (list(deck), list(progress))
+        if not previous or previous[0] != list(deck) or len(progress) != len(deck):
+            return
+        for slot, (before, now) in enumerate(zip(previous[1], progress)):
+            if before > 0 and now == 0:
+                card = int(deck[slot])
+                known = self.evo_required.get(card)
+                if known != before:
+                    self.evo_required[card] = int(before)
+                    self.EVO_FILE.parent.mkdir(parents=True, exist_ok=True)
+                    self.EVO_FILE.write_text(json.dumps({str(k): v for k, v in
+                                                         sorted(self.evo_required.items())}))
+                    self.note(f'evolution requirement measured: '
+                              f'{V.CARDS.get(card, {}).get("name", card)} needs {before} plays'
+                              + (f' (was {known})' if known else ''))
+
+    OTHER_CONSOLES = (8777, 8778)
+
+    def _decide_sampling(self, accounts, side) -> bool:
+        """Sampled or greedy decoding for this battle, the way FirstLight runs each setup:
+        against a human or a bot their run_offline_match samples; a model against a model is
+        their offline_duel, which decodes greedily. 'auto' tells them apart by asking the other
+        console whether it is running a model against this one's account."""
+        if self.decoding in ('sampled', 'greedy'):
+            choice = self.decoding
+            why = 'set by hand'
+        else:
+            opponent = next((a['lo'] for a in (accounts or []) if a and a.get('side') == 1 - side), None)
+            duel = False
+            for port in self.OTHER_CONSOLES:
+                if port == PORT or opponent is None:
+                    continue
+                try:
+                    import urllib.request
+                    with urllib.request.urlopen(f'http://127.0.0.1:{port}/state?log=1', timeout=1.0) as reply:
+                        other = json.loads(reply.read())
+                    theirs = (other.get('bot') or {})
+                    other_account = None
+                    for path in V.DECKS.glob('*.json'):
+                        body = json.loads(path.read_text())
+                        if body.get('account_lo') == opponent:
+                            other_account = opponent
+                    duel = bool(theirs.get('running')) and other_account is not None
+                except Exception:  # noqa: BLE001  - the other console may simply be off
+                    continue
+            choice = 'greedy' if duel else 'sampled'
+            why = ('model against model (your other device is running one): FirstLight\'s '
+                   'offline_duel decodes greedily' if duel else
+                   'against a human or a bot: FirstLight\'s run_offline_match samples')
+        self.decoding_used = choice
+        self.note(f'decoding: {choice.upper()} - {why}')
+        return choice == 'sampled'
 
     def set_mode(self, mode: str, model: str | None) -> str:
         """One control instead of start/stop + an 'armed' box: off, watch (decides, never
@@ -456,6 +530,7 @@ class Bot:
             if len(our_deck) != 8:
                 time.sleep(0.2)
                 continue
+            self._measure_evolutions(our_deck, me)
 
             if frame['chain']['battle'] != battle:
                 # The episode config needs both decks, and FirstLight's tracker needs the
@@ -490,6 +565,7 @@ class Bot:
                     # is what BattleEnv passes and what the tensorizer demands of a
                     # tracker-backed episode. Read, not assumed: a battle joined late does not
                     # start at five.
+                    runner.sample = self._decide_sampling(accounts, side)
                     runner.start_battle(our_deck, opponent, side, observation,
                                         {p['side']: p['elixir_raw'] / 10000.0
                                          for p in frame['players']},
@@ -561,8 +637,9 @@ class Bot:
                     reserved=reserved + sum(a['cost'] for a in abilities_in_flight),
                     plays=executed, decks=runner.tracked_decks(),
                     hand_forms=runner.hand_forms(deck, me.get('deck_form_flags'),
-                                                 me.get('evo_progress')),
-                    pending_ability_sources=tuple(a['source'] for a in abilities_in_flight))
+                                                 me.get('evo_progress'), self.evo_required),
+                    pending_ability_sources=tuple(a['source'] for a in abilities_in_flight),
+                    evo_required=self.evo_required)
                 for character in sorted(fl_battle.unresolved_abilities - reported_abilities):
                     reported_abilities.add(character)
                     self.note(f'hero controller character {character} has no single FirstLight '
@@ -844,6 +921,16 @@ class Handler(BaseHTTPRequestHandler):
                 result = 'unknown action'
             self._send(json.dumps({'result': result}).encode(), 'application/json')
             return
+        if route.path == '/api/decoding':
+            value = (parse_qs(route.query).get('value') or [''])[0]
+            if value in ('auto', 'sampled', 'greedy'):
+                BOT.decoding = value
+                BOT.note(f'decoding preference -> {value} (applies from the next battle)')
+                result = 'ok'
+            else:
+                result = f'unknown decoding {value}'
+            self._send(json.dumps({'result': result}).encode(), 'application/json')
+            return
         if route.path == '/api/mode':
             query = parse_qs(route.query)
             result = BOT.set_mode((query.get('mode') or [''])[0],
@@ -862,6 +949,7 @@ class Handler(BaseHTTPRequestHandler):
                    'models': list(MA.MODELS) + FLB.available(),
                    'mode': ('off' if not BOT.running else 'play' if BOT.armed else 'watch'),
                    'serial': SERIAL, 'port': PORT,
+                   'decoding': BOT.decoding, 'decoding_used': BOT.decoding_used,
                    'gate': BOT.gate, 'gate_ok': BOT.gate_ok, 'deduced': BOT.deduced,
                    'reader_error': reader_error}
             if frame and health and frame.get('battle_active'):
