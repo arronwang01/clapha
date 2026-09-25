@@ -70,6 +70,13 @@ def available() -> list[str]:
     return [name for name, path in CHECKPOINTS.items() if path.is_file()]
 
 
+class Move(tuple):
+    """(kind, hand_slot, card_id, target_grid, offset_ticks), plus source_entity / ability_id
+    for an ability activation -- the hero unit whose controller's button must be tapped."""
+    source_entity = None
+    ability_id = None
+
+
 class FirstLightRunner:
     """One policy bound to one battle. Rebuild it when the battle changes."""
 
@@ -222,7 +229,7 @@ class FirstLightRunner:
             return {}
         return {owner: tuple(tracker._card_states[owner]) for owner in (0, 1)}
 
-    def hand_forms(self, deck, form_flags) -> dict[int, int]:
+    def hand_forms(self, deck, form_flags, evo_progress=None) -> dict[int, int]:
         """card id -> the form our hand holds it in: 0 normal, 1 evolution, 2 hero.
 
         FirstLight's probe reads this per hand card (card_parameter & 0xF). We cannot call the
@@ -237,10 +244,22 @@ class FirstLightRunner:
         if not deck or not form_flags or len(form_flags) != len(deck):
             return forms
         tracker = getattr(getattr(self.session, 'tensorizer', None), 'tracker', None)
-        for card_id, flag in zip(deck, form_flags):
+        # The game's own per-deck-slot evolution progress (player+0x2e8), when the reader has it:
+        # a slot is evolved exactly when progress has reached FirstLight's cycles required --
+        # their probe's definition. The tracker count below is only the fallback.
+        memory = list(evo_progress) if evo_progress and len(evo_progress) == len(deck) else None
+        if memory is not None:
+            from native_runner.training.v4.factory import production_semantic_bundle
+            specs = production_semantic_bundle().card_specs
+        for slot, (card_id, flag) in enumerate(zip(deck, form_flags)):
             flag = int(flag or 0)
             if flag & 0x2:
                 forms[int(card_id)] = 2
+            elif flag & 0x1 and memory is not None:
+                spec = specs.get(int(card_id))
+                evolution = getattr(spec, 'evolution', None) if spec is not None else None
+                required = int(evolution.cycle_required) if evolution is not None else None
+                forms[int(card_id)] = 1 if required and int(memory[slot]) >= required else 0
             elif flag & 0x1 and tracker is not None:
                 try:
                     ready = tracker.card_state(self.actor_owner, int(card_id)).evolution_ready
@@ -268,8 +287,13 @@ class FirstLightRunner:
             return []
         decision = self.session.decide(observation)
         actions = getattr(getattr(decision, 'decoded', None), 'actions', ()) or ()
-        moves = [(a.kind, a.hand_slot, a.card_id, a.target_grid,
-                  int(getattr(a, 'execute_offset_ticks', 0) or 0)) for a in actions]
+        moves = []
+        for a in actions:
+            move = Move((a.kind, a.hand_slot, a.card_id, a.target_grid,
+                         int(getattr(a, 'execute_offset_ticks', 0) or 0)))
+            move.source_entity = getattr(a, 'source_entity', None)
+            move.ability_id = getattr(a, 'ability_id', None)
+            moves.append(move)
         moves.sort(key=lambda move: move[4])
         return moves
 

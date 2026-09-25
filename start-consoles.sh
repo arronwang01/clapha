@@ -37,7 +37,7 @@ done
 # 3. rebuild the native tools whose source is newer than their binary, then make sure each
 #    device has them
 NDK_CC="$(ls -d "$HOME"/Library/Android/sdk/ndk/*/toolchains/llvm/prebuilt/*/bin/aarch64-linux-android31-clang 2>/dev/null | tail -1)"
-for tool in fast_tap runtime_probe; do
+for tool in live_sampler_tbi queue_probe fast_tap runtime_probe comp_probe; do
   if [ "$CLAPHA/src/$tool.c" -nt "$CLAPHA/build/$tool" ]; then
     if [ -n "$NDK_CC" ]; then
       mkdir -p "$CLAPHA/build"

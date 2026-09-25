@@ -285,6 +285,55 @@ class Bot:
                                                if waited > 0.15 else ''))
         return True
 
+    # Hero ability buttons, measured on the 1440x2560 device (screenshot, 2026-09-25): one hero
+    # -> the button is on the LEFT; two heroes -> left for controller slot 1, right for slot 2.
+    ABILITY_BUTTONS = {'left': (140, 1955), 'right': (1300, 1955)}
+
+    def _ability_point(self, controller_slot: int, me: dict) -> tuple[int, int]:
+        bound = [a for a in me.get('abilities') or () if int(a.get('character_id') or 0)]
+        side_name = 'left' if len(bound) < 2 or controller_slot == 1 else 'right'
+        x, y = self.ABILITY_BUTTONS[side_name]
+        return (round(x * self.layout.width / 1440), round(y * self.layout.height / 2560))
+
+    def _try_ability(self, move, observation, me: dict, in_flight: list[dict], accounts,
+                     side: int, frame: dict) -> None:
+        """Tap the hero ability the policy chose: its source unit -> the controller that owns it
+        -> that controller's button. Gated exactly like card plays (arming, scope gate)."""
+        source = getattr(move, 'source_entity', None)
+        player = next((p for p in observation.players if p.owner == side), None)
+        state = next((a for a in (player.ability_runtime_states if player else ())
+                      if a.source_entity == source), None)
+        if state is None:
+            self.note(f'ability for unit {source} has no controller in this frame - not tapped')
+            return
+        slot = int(state.attributes.get('controller_slot', 1))
+        if any(a['slot'] == slot for a in in_flight):
+            return
+        name = state.ability_id
+        allowed, reason = scope_gate.check(accounts, side)
+        if reason != self.gate:
+            self.gate, self.gate_ok = reason, allowed
+            self.note(('scope: ' if allowed else 'SCOPE BLOCK: ') + reason)
+        if not self.armed or not allowed:
+            why = ' [dry run]' if not self.armed else ' [BLOCKED by scope gate]'
+            self.note(f't={frame["game_tick"]/20:5.1f}s  would use {name}{why}')
+            return
+        point = self._ability_point(slot, me)
+        try:
+            if self.tapper is not None and self.tapper.alive():
+                self.tapper.tap(point)
+            else:
+                adb_run(ADB, SERIAL, 'shell', 'input', 'tap', str(point[0]), str(point[1]))
+        except Exception as error:  # noqa: BLE001
+            self.note(f'ability tap failed: {error}')
+            return
+        in_flight.append({'slot': slot, 'source': source, 'cost': float(state.elixir_cost or 0),
+                          'time': time.time()})
+        self.plays += 1
+        self.last_play = name
+        self.note(f't={frame["game_tick"]/20:5.1f}s  ABILITY {name} (controller {slot}, '
+                  f'button at {point[0]},{point[1]})')
+
     def _check_deck_fit(self, deck, forms) -> None:
         """The Hog specialists were trained on one deck with fixed forms. Say so when the
         deck differs: out of that deck they are a different, weaker model."""
@@ -337,6 +386,8 @@ class Bot:
         last_turn = -10 ** 9
         in_flight: list[dict] = []
         deferred: list[dict] = []
+        reported_abilities: set[int] = set()
+        abilities_in_flight: list[dict] = []
         while self.running:
             with V.LOCK:
                 frame, health = V.STATE['frame'], V.STATE['health']
@@ -411,6 +462,7 @@ class Bot:
                 battle = frame['chain']['battle']
                 handled_queue: set = set()
                 last_turn, in_flight, deferred = -10 ** 9, [], []
+                abilities_in_flight.clear()
                 self.plays = 0
                 self.note(f'new battle, you are side {side}; '
                           f'warm-up until tick {runner.first_decision_tick}')
@@ -465,8 +517,15 @@ class Bot:
                                    if c in runner.opponent_seen]}
                 observation, fl_battle = FLO.build(
                     frame, health, episode_id=str(battle), battle=fl_battle, revealed=seen,
-                    reserved=reserved, plays=executed, decks=runner.tracked_decks(),
-                    hand_forms=runner.hand_forms(deck, me.get('deck_form_flags')))
+                    reserved=reserved + sum(a['cost'] for a in abilities_in_flight),
+                    plays=executed, decks=runner.tracked_decks(),
+                    hand_forms=runner.hand_forms(deck, me.get('deck_form_flags'),
+                                                 me.get('evo_progress')),
+                    pending_ability_sources=tuple(a['source'] for a in abilities_in_flight))
+                for character in sorted(fl_battle.unresolved_abilities - reported_abilities):
+                    reported_abilities.add(character)
+                    self.note(f'hero controller character {character} has no single FirstLight '
+                              f'ability - not offered to the policy')
                 for card_id in sorted(set(fl_battle.unresolved) - reported):
                     reported.add(card_id)
                     base = FLO.base_card(card_id)
@@ -509,6 +568,17 @@ class Bot:
 
             # A turn can carry two plays. Take them in the order the policy asked for; the
             # second is a real play (Hog + Ice Spirit is one decision), not a duplicate.
+            # An ability stays "in flight" until its button leaves Ready (the command, like a
+            # card, takes ~21 ticks to execute) or 2.5 s pass; until then it is not re-offered.
+            live_buttons = {int(a.get('controller_slot', 0)): int(a.get('button', 0))
+                            for a in me.get('abilities') or ()}
+            abilities_in_flight[:] = [
+                a for a in abilities_in_flight
+                if time.time() - a['time'] < 2.5 and live_buttons.get(a['slot']) in (2, 4)]
+            for move in moves:
+                if str(getattr(move[0], 'value', move[0])) == 'activate_ability':
+                    self._try_ability(move, observation, me, abilities_in_flight, accounts,
+                                      side, frame)
             for kind, _hand_slot, card_id, target_grid, _offset in moves:
                 if str(getattr(kind, 'value', kind)) != 'play_card' or target_grid is None:
                     continue

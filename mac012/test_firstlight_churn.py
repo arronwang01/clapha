@@ -26,6 +26,7 @@ def run(model, side, seed):
     alive = {}
     battle = None
     plays, errors, wrong, spell_plays = 0, [], 0, 0
+    wrong_tiles = []
 
     def frame(tick, elixir, dead_lane):
         ents = [dict(t) for t in TOW]
@@ -77,11 +78,18 @@ def run(model, side, seed):
             if str(getattr(kind, 'value', kind)) != 'play_card' or grid is None:
                 continue
             plays += 1
-            row = int(grid[1])
+            col, row = int(grid[0]), int(grid[1])
             if C.get(card, {}).get('type') == 'spell':
                 spell_plays += 1
-            elif not ((row < 16) if side == 0 else (row >= 16)):
+            # Legal means legal in the placement mask the policy was given -- FirstLight's own
+            # card_placement_mask, which includes the bridge row and destroyed-lane pockets. A
+            # fixed half-board rule (row < 16 / row >= 16) called bridge plays wrong.
+            entry = obs.action_mask.placement_masks.get(str(slot))
+            if not entry or not entry['row_major'][row][col]:
                 wrong += 1
+                wrong_tiles.append((C.get(card, {}).get('display_name'), col, row))
+    if wrong_tiles:
+        print('   illegal:', wrong_tiles[:5])
     return plays, spell_plays, wrong, errors, dict(battle.unresolved)
 
 
@@ -90,4 +98,4 @@ for model in ('fl:general', 'fl:hog1', 'fl:hog2', 'fl:il', 'fl:active-il'):
         plays, spell_plays, wrong, errors, unresolved = run(model, side, 7 + side)
         flag = f'  ERRORS {len(errors)}: {errors[0][:100]}' if errors else ''
         print(f'{model:14} side {side}: {plays:3} plays ({spell_plays} spells) / 120'
-              f', wrong-half {wrong}, skipped {sum(unresolved.values())}{flag}')
+              f', illegal tiles {wrong}, skipped {sum(unresolved.values())}{flag}')

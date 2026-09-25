@@ -106,6 +106,18 @@ class Tapper:
         self.process.stdin.flush()
         return written
 
+    def tap(self, point) -> float:
+        """One tap (a hero ability button); returns the time the command was written."""
+        x, y = point
+        sx, sy = self.scale
+        line = f'tap {round(x * sx)} {round(y * sy)}\n'
+        written = time.time()
+        with self.lock:
+            self.sent.append(written)
+        self.process.stdin.write(line)
+        self.process.stdin.flush()
+        return written
+
     def close(self) -> None:
         try:
             self.process.stdin.write('quit\n')

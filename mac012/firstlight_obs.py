@@ -245,6 +245,7 @@ class Battle:
         self.unresolved: dict[int, int] = {}
         self.form_fallbacks: set[int] = set()   # forms shown as their base unit
         self.untracked_plays: set[tuple[int, int]] = set()
+        self.unresolved_abilities: set[int] = set()
 
     def tick(self, raw_tick: int) -> int:
         """The battle clock, already on FirstLight's own 0..6000 timeline.
@@ -388,8 +389,179 @@ def placement_context(tower_states, frame: dict, owner: int):
     return lanes, towers, tuple(occupied[k] for k in sorted(occupied)), tuple(sorted(unknown))
 
 
+# FirstLight's exact ability button enum (rich_telemetry_adapter.ABILITY_BUTTON_STATE_LABELS and
+# _ability_phase). Every value the device showed fits it: 0 no match, 1 ChampionAbsent, 2 Ready,
+# 6 AllChargesConsumed, 9 NotEnoughElixir. Only Ready and LimitedAvailability are queueable.
+ABILITY_QUEUEABLE_BUTTON_STATES = frozenset((2, 4))
+_ABILITY_PHASE_BY_BUTTON = {1: 'unavailable', 2: 'ready', 4: 'ready', 6: 'exhausted',
+                            8: 'cooldown', 9: 'unavailable', 10: 'casting', 11: 'unavailable',
+                            12: 'unavailable', 13: 'unavailable'}
+_HERO_CARD_BY_CHARACTER: dict[int, int] | None = None
+_ABILITY_BY_CARD: dict[int, tuple[str, object]] | None = None
+
+
+def hero_card_by_character() -> dict[int, int]:
+    """hero character data global id -> base card id.
+
+    A controller names its hero by the character data it selected (+0x90 -> +0x40); the device
+    showed 130283371 for Hero Musketeer and 2979504115 for Hero Ice Golem, which are exactly the
+    archetype ids FirstLight's catalog gives those hero forms. Hero form -> base card is
+    FirstLight's own HERO_FORM_TO_BASE_CARD.
+    """
+    global _HERO_CARD_BY_CHARACTER
+    if _HERO_CARD_BY_CHARACTER is None:
+        from native_runner.training.v4.native_actions import HERO_FORM_TO_BASE_CARD
+        table: dict[int, int] = {}
+        for form_id, (global_id, _kind) in archetype_by_card().items():
+            base = HERO_FORM_TO_BASE_CARD.get(int(form_id))
+            if base is None and 203000000 <= int(form_id) < 204000000:
+                base = base_card(int(form_id))
+            if base is not None:
+                table[int(global_id) & 0xFFFFFFFF] = int(base)
+        _HERO_CARD_BY_CHARACTER = table
+    return _HERO_CARD_BY_CHARACTER
+
+
+def ability_by_card() -> dict[int, tuple[str, object]]:
+    """base card -> (ability id, AbilitySpec), only where the card has exactly one ability --
+    the same unique catalog join their adapter requires before it emits an ability state."""
+    global _ABILITY_BY_CARD
+    if _ABILITY_BY_CARD is None:
+        from native_runner.training.v4.factory import production_semantic_bundle
+        seen: dict[int, list] = {}
+        for ability_id, spec in production_semantic_bundle().ability_specs.items():
+            card = getattr(spec, 'source_card_id', None)
+            if card is not None:
+                seen.setdefault(int(card), []).append((str(ability_id), spec))
+        _ABILITY_BY_CARD = {card: rows[0] for card, rows in seen.items() if len(rows) == 1}
+    return _ABILITY_BY_CARD
+
+
+def _state_provenance(fields, filled: dict, tick: int, notes: tuple[str, ...]):
+    from native_runner.contracts import SemanticEvidenceLevel, SemanticProvenanceV1
+    evidence = dict(SemanticProvenanceV1.unknown_all(fields).field_evidence)
+    sources = {}
+    for name, (level, origin) in filled.items():
+        evidence[name] = level
+        sources[name] = origin
+    return SemanticProvenanceV1(field_evidence=evidence, source_fields=sources,
+                                observed_tick=tick, notes=notes)
+
+
+def own_runtime_states(player: dict, entities, side: int, tick: int, battle):
+    """(ability_runtime_states, evolution_runtime_states) for the actor, from memory.
+
+    Abilities: one per bound hero controller, joined controller -> selected hero character ->
+    base card -> the card's single ability spec (id, elixir cost). The source entity is our
+    live unit with that character's archetype. Phase and `available` follow their button enum.
+    Evolutions: the player's per-deck-slot progress vector, for slots whose form flag has the
+    evolution bit; ready = progress >= FirstLight's cycles required, exactly as their probe.
+    """
+    from native_runner.contracts import (ABILITY_RUNTIME_STATE_FIELDS,
+                                         EVOLUTION_RUNTIME_STATE_FIELDS, AbilityPhase,
+                                         AbilityRuntimeStateV1, EvolutionPhase,
+                                         EvolutionRuntimeStateV1, SemanticEvidenceLevel)
+    from native_runner.training.v4.factory import production_semantic_bundle
+
+    native = SemanticEvidenceLevel.NATIVE_DERIVED
+    static = SemanticEvidenceLevel.STATIC_DECLARED
+    abilities = []
+    heroes = hero_card_by_character()
+    by_card = ability_by_card()
+    for raw in player.get('abilities') or ():
+        character = int(raw.get('character_id') or 0) & 0xFFFFFFFF
+        if not character:
+            continue
+        card = heroes.get(character)
+        joined = by_card.get(card) if card is not None else None
+        if joined is None:
+            battle.unresolved_abilities.add(character)
+            continue
+        ability_id, spec = joined
+        sources = [e.entity_id for e in entities
+                   if e.owner == side and (int(e.native_data_global_id or 0) & 0xFFFFFFFF) == character]
+        source_entity = sources[0] if len(sources) == 1 else None
+        button = int(raw.get('button', 0))
+        phase = AbilityPhase(_ABILITY_PHASE_BY_BUTTON.get(button, 'unknown'))
+        charges_raw = int(raw.get('charges', -1))
+        cost = getattr(spec, 'elixir_cost', None)
+        filled = {
+            'phase': (native if phase != AbilityPhase.UNKNOWN else SemanticEvidenceLevel.UNKNOWN,
+                      ('controller+0x98 button state',)),
+            'available': (native, ('controller+0x98 button state',)),
+            'cooldown_ms': (native, ('controller+0x7c',)),
+            'remaining_cooldown_ms': (native, ('controller+0x78',)),
+            'charges': (native, ('controller+0x80',)),
+        }
+        if cost is not None:
+            filled['elixir_cost'] = (static, ('AbilitySpecV1.elixir_cost',))
+        if source_entity is not None:
+            filled['source_entity'] = (native, ('live unit with the controller character',))
+        abilities.append(AbilityRuntimeStateV1(
+            ability_id=ability_id, source_entity=source_entity, phase=phase,
+            elixir_cost=float(cost) if cost is not None else None,
+            cooldown_ms=int(raw.get('configured_ms', 0)),
+            remaining_cooldown_ms=max(0, int(raw.get('cooldown_ms', 0))),
+            charges=None if charges_raw == -1 else charges_raw,
+            available=button in ABILITY_QUEUEABLE_BUTTON_STATES,
+            attributes={'controller_slot': int(raw['controller_slot']),
+                        'source_card_id': int(card), 'button_state': button,
+                        'selected_character_data_global_id': character,
+                        'remaining_charges_raw': charges_raw,
+                        'classification': 'exact_catalog_runtime_join'},
+            provenance=_state_provenance(ABILITY_RUNTIME_STATE_FIELDS, filled, tick,
+                                         (f'raw ability enum={button}',))))
+
+    evolutions = []
+    deck = player.get('deck_card_ids') or []
+    flags = player.get('deck_form_flags') or []
+    progress = player.get('evo_progress') or []
+    specs = production_semantic_bundle().card_specs
+    if len(progress) == len(deck) == len(flags) == 8:
+        for slot, (card, flag, value) in enumerate(zip(deck, flags, progress)):
+            spec = specs.get(int(card))
+            evolution = getattr(spec, 'evolution', None) if spec is not None else None
+            if not int(flag or 0) & 0x1 or evolution is None or not evolution.cycle_required:
+                continue
+            required = int(evolution.cycle_required)
+            value = max(0, int(value))
+            ready = value >= required
+            phase = (EvolutionPhase.READY if ready else
+                     EvolutionPhase.BASE if value == 0 else EvolutionPhase.CYCLING)
+            filled = {name: (native, ('player+0x2e8 progress vector',)) for name in
+                      ('deck_slot', 'phase', 'cycle_required', 'cycle_remaining', 'ready',
+                       'deployments_in_cycle')}
+            filled['base_form_id'] = (static, ('CardSpecV1.evolution.base_form_id',))
+            filled['next_form_id'] = (static, ('CardSpecV1.evolution.evolution_form_id',))
+            evolutions.append(EvolutionRuntimeStateV1(
+                card_id=int(card), deck_slot=slot, phase=phase,
+                base_form_id=evolution.base_form_id, next_form_id=evolution.evolution_form_id,
+                cycle_required=required, cycle_remaining=max(0, required - value),
+                ready=ready, deployments_in_cycle=value,
+                attributes={'raw_progress': value, 'classification': 'exact_catalog_runtime_join'},
+                provenance=_state_provenance(EVOLUTION_RUNTIME_STATE_FIELDS, filled, tick, ())))
+    return tuple(abilities), tuple(evolutions)
+
+
+def legal_ability_sources(abilities, elixir: float, pending=()) -> tuple[int, ...]:
+    """BattleEnvV1._ability_action_candidates' rule, verbatim in effect: Ready and available,
+    no cooldown, charges left (or unlimited), an exact cost we can pay, a live source unit, and
+    not already requested (a tap in flight)."""
+    legal = []
+    for state in abilities:
+        if (state.source_entity is None or state.source_entity in pending
+                or state.phase.value != 'ready' or state.available is not True
+                or (state.remaining_cooldown_ms or 0) != 0
+                or (state.charges is not None and state.charges <= 0)
+                or state.elixir_cost is None or state.elixir_cost > elixir):
+            continue
+        legal.append(int(state.source_entity))
+    return tuple(sorted(set(legal)))
+
+
 def action_mask(frame: dict, side: int, elixir: float, reserved: float = 0.0,
-                tower_states=(), hand_forms: dict | None = None):
+                tower_states=(), hand_forms: dict | None = None, abilities=(),
+                pending_ability_sources=()):
     """Which hand slots are playable, and where -- built the way BattleEnvV1.action_mask does.
 
     reserved is elixir already committed to a play the server has not acknowledged yet. The
@@ -441,8 +613,11 @@ def action_mask(frame: dict, side: int, elixir: float, reserved: float = 0.0,
             else:
                 reasons[str(position)] = 'legal'
                 slots[position] = True
-    kinds = {ActionKind.WAIT.value: True, ActionKind.PLAY_CARD.value: any(slots)}
+    ability_sources = legal_ability_sources(abilities, available, pending_ability_sources)
+    kinds = {ActionKind.WAIT.value: True, ActionKind.PLAY_CARD.value: any(slots),
+             ActionKind.ACTIVATE_ABILITY.value: bool(ability_sources)}
     return ActionMaskV1(kinds=kinds, hand_slots=tuple(slots), placement_masks=masks,
+                        ability_sources=ability_sources,
                         reasons={**reasons, 'effective_elixir': available,
                                  'reserved_elixir': max(0.0, reserved)})
 
@@ -620,7 +795,7 @@ def play_events(plays, tick: int, decks: dict | None, battle):
 def build(frame: dict, health: dict, episode_id: str, deduced: dict | None = None,
           revealed: dict | None = None, battle: Battle | None = None,
           reserved: float = 0.0, plays=None, decks: dict | None = None,
-          hand_forms: dict | None = None):
+          hand_forms: dict | None = None, pending_ability_sources=()):
     """One ObservationV1 for the local actor, FAIR tier.
 
     Pass the same Battle for every frame of a battle: velocity, entity identity, age, the
@@ -629,7 +804,8 @@ def build(frame: dict, health: dict, episode_id: str, deduced: dict | None = Non
 
     hand_forms: card id -> form for our hand (see action_mask).
     """
-    from native_runner.contracts import (ENTITY_RUNTIME_SEMANTIC_FIELDS,
+    from native_runner.contracts import (PLAYER_RUNTIME_SEMANTIC_FIELDS, SemanticEvidenceLevel,
+                                         ENTITY_RUNTIME_SEMANTIC_FIELDS,
                                          TOWER_RUNTIME_SEMANTIC_FIELDS,
                                          CausalGroupKind, CausalGroupRefV1, EntityStateV1,
                                          ObservationTier, ObservationV1, PlayerStateV1,
@@ -759,6 +935,7 @@ def build(frame: dict, health: dict, episode_id: str, deduced: dict | None = Non
     own_elixir = next((p['elixir_raw'] / 10000.0 for p in frame['players']
                        if p['side'] == side), 0.0)
     players = []
+    own_abilities: tuple = ()
     for p in frame['players']:
         deck = p.get('deck_card_ids') or []
         # Only the actor's own hand is private state it may see. After settlement this
@@ -783,13 +960,24 @@ def build(frame: dict, health: dict, episode_id: str, deduced: dict | None = Non
             runtime_by_slot = {str(pos): {'form_code': int((hand_forms or {}).get(
                                    deck[i] if deck and 0 <= i < len(deck) else -1, 0))}
                                for pos, i in enumerate(hand_slots)}
+            abilities, evolutions = own_runtime_states(p, entities, side, tick, battle)
             players.append(PlayerStateV1(
                 elixir_exact=own_elixir,
                 hand=hand, next_card=nxt, deck=tuple(deck), cycle=cycle,
                 private_state_visible=True,
                 metadata={'hand_slot_by_card': slot_by_card,
                           'hand_runtime_by_slot': runtime_by_slot},
+                ability_runtime_states=abilities, evolution_runtime_states=evolutions,
+                runtime_provenance=_state_provenance(
+                    PLAYER_RUNTIME_SEMANTIC_FIELDS,
+                    {**({'ability_runtime_states': (SemanticEvidenceLevel.NATIVE_DERIVED,
+                                                    ('player+0x3a0/+0x3a8 controllers',))}
+                        if abilities else {}),
+                     **({'evolution_runtime_states': (SemanticEvidenceLevel.NATIVE_DERIVED,
+                                                      ('player+0x2e8 progress vector',))}
+                        if evolutions else {})}, tick, ()),
                 **common))
+            own_abilities = abilities
         else:
             # FAIR forbids handing the actor the opponent's exact private state, even though
             # this client's memory does expose their exact elixir. Only public facts go in:
@@ -804,7 +992,8 @@ def build(frame: dict, health: dict, episode_id: str, deduced: dict | None = Non
         phase=phase,
         players=tuple(players), towers=tuple(towers), entities=tuple(entities),
         events=play_events(plays, tick, decks, battle),
-        action_mask=action_mask(frame, side, own_elixir, reserved, towers, hand_forms),
+        action_mask=action_mask(frame, side, own_elixir, reserved, towers, hand_forms,
+                                own_abilities, pending_ability_sources),
         episode_id=episode_id,
         ruleset_id=ruleset_id())
     return observation, battle
