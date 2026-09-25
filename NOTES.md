@@ -1319,3 +1319,34 @@ Facts the new model must be built around:
 - The Sep 10 backup /data/local/tmp/gamedata.tgz holds the same 15.535.86 content (same
   fingerprint) if the update directory is ever damaged again.
 
+## Replay conversion: from 126-256 s to ~8 s per replay (2026-09-25 evening)
+
+- **FirstLight's cache builder was the bottleneck, not the engine.** Profile of one replay: 245 of
+  256 s waiting on the engine, ~0.6 s per five-tick step, and the run died at ~256 s. The engine
+  itself simulates ~38,000 ticks/s (step(1000) = 0.03 s); a plain observe is ~4-7 ms. The cost was
+  its rich/atomic snapshot: **7.8 MB and ~0.3-0.7 s per call on a 12-unit board**, almost all event
+  histories (combat, phase, movement, state, visibility rings) appended to every snapshot.
+- **`observe-lean`** (probe command, `il/probe_observe_lean.patch` against FirstLight_CR's
+  probe, deployed to CR_4k): the rich snapshot's per-unit runtime state and players without event
+  histories or component inventories. 4.6 ms / 42 KB; every per-unit field and both players
+  identical to observe-rich. Training inputs are limited to what a snapshot shows, as live.
+  Deployed library md5 05247d1a...; the original (0883d753..., byte-identical to a clean build of
+  the unpatched source) is saved on CR_4k at /data/local/tmp/libcrprobe.installed-2026-09-25.so
+  and the source backup in runs/probe_backup_2026-09-25/ (git-ignored).
+- **`il/engine_convert.py`**: prepare + calibrate (0.1 s), create the match headless, queue every
+  recorded card play at its exact execute tick (queue_hand_action_at, FirstLight's tile +
+  sub-cell conversion), hero abilities by FirstLight's rule (newest ready unit of the named card),
+  a lean snapshot every decision tick, then the end state against the recording (winner, crowns,
+  all six towers' final HP). 9 test replays: 4.8-13.5 s each (~8 s), 8/9 winner and crowns right,
+  4 exact to the tower HP; the one failure had two abilities no unit accepted.
+- **CR_4k boot snapshot.** Every boot restored a snapshot saved 2026-09-24 17:14, an hour after an
+  interrupted content update, with a full disk: that is why Null's stayed broken and why fixes
+  vanished after a restart (the console boots with -no-snapshot-save). Redone (recordings
+  md5-verified against the Mac copy and removed; official CR, APKPure and their downloads removed;
+  content re-downloaded, 15.535.86 / 986 files) and saved as the new default_boot at the Null's
+  menu with network, 7 GB free and the lean probe installed.
+- **Why FirstLight looks stronger in its video:** in its sandbox the AI's plays are queued with
+  execute_in_ticks = max(1, offset 0-4) and the engine backdates the command 20 ticks
+  (battle_env.py, cr_native_env.queue_hand_action_at): the AI's card lands 1-4 ticks after it
+  decides, while a human's tap takes the normal ~21. No bot can do that in the live game.
+

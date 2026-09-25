@@ -1,0 +1,243 @@
+--- a/native_runner/probe/cr_replay_probe.cpp	2026-09-25 18:49:42
++++ b/native_runner/probe/cr_replay_probe.cpp	2026-09-25 18:50:50
+@@ -4705,7 +4705,7 @@
+ }
+ 
+ bool build_rich_observation_json(void *manager, std::uint64_t generation, char *response, std::size_t response_size,
+-                                 bool *complete_out = nullptr) {
++                                 bool *complete_out = nullptr, bool lean = false) {
+   if (complete_out != nullptr) {
+     *complete_out = false;
+   }
+@@ -5235,46 +5235,54 @@
+       } else if (!item_json.append("null,")) {
+         item_failed = true;
+       }
+-      if (!item_failed && !item_json.append("\"components\":{\"valid\":%s,\"count\":%d,\"capacity\":%d,\"slots\":[",
+-                                            inventory.valid ? "true" : "false", inventory.count, inventory.capacity)) {
+-        item_failed = true;
+-      }
++      if (lean) {
++        // observe-lean: the component inventory is debug data (vtable offsets per slot).
++        if (item_failed || !item_json.append("\"components\":null}")) {
++          truncated = true;
++          break;
++        }
++      } else {
++        if (!item_failed && !item_json.append("\"components\":{\"valid\":%s,\"count\":%d,\"capacity\":%d,\"slots\":[",
++                                              inventory.valid ? "true" : "false", inventory.count, inventory.capacity)) {
++          item_failed = true;
++        }
+ 
+-      if (!item_failed && inventory.valid) {
+-        for (std::int32_t slot = 0; slot < inventory.count; ++slot) {
+-          const NativeComponentSlotView &component = inventory.slots[slot];
+-          char type_json[16] = "null";
+-          char vtable_offset_json[32] = "null";
+-          char type_getter_offset_json[32] = "null";
+-          if (component.type_valid) {
+-            std::snprintf(type_json, sizeof(type_json), "%d", component.engine_type);
+-          }
+-          if (component.vtable_offset_valid) {
+-            std::snprintf(vtable_offset_json, sizeof(vtable_offset_json), "%llu",
+-                          static_cast<unsigned long long>(component.vtable_libg_offset));
+-          }
+-          if (component.type_getter_offset_valid) {
+-            std::snprintf(type_getter_offset_json, sizeof(type_getter_offset_json), "%llu",
+-                          static_cast<unsigned long long>(component.type_getter_libg_offset));
+-          }
+-          const char *owner_backlink_json =
+-              component.present ? (component.owner_backlink_valid ? "true" : "false") : "null";
+-          const char *slot_matches_type_json =
+-              component.type_valid ? (component.engine_type == slot ? "true" : "false") : "null";
+-          if (!item_json.append("%s{\"slot\":%d,\"present\":%s,\"ownerBacklinkValid\":%s,"
+-                                "\"vtableLibgOffset\":%s,\"typeGetterLibgOffset\":%s,"
+-                                "\"engineType\":%s,\"typeValid\":%s,\"slotMatchesType\":%s}",
+-                                slot == 0 ? "" : ",", slot, component.present ? "true" : "false", owner_backlink_json,
+-                                vtable_offset_json, type_getter_offset_json, type_json,
+-                                component.type_valid ? "true" : "false", slot_matches_type_json)) {
+-            item_failed = true;
+-            break;
++        if (!item_failed && inventory.valid) {
++          for (std::int32_t slot = 0; slot < inventory.count; ++slot) {
++            const NativeComponentSlotView &component = inventory.slots[slot];
++            char type_json[16] = "null";
++            char vtable_offset_json[32] = "null";
++            char type_getter_offset_json[32] = "null";
++            if (component.type_valid) {
++              std::snprintf(type_json, sizeof(type_json), "%d", component.engine_type);
++            }
++            if (component.vtable_offset_valid) {
++              std::snprintf(vtable_offset_json, sizeof(vtable_offset_json), "%llu",
++                            static_cast<unsigned long long>(component.vtable_libg_offset));
++            }
++            if (component.type_getter_offset_valid) {
++              std::snprintf(type_getter_offset_json, sizeof(type_getter_offset_json), "%llu",
++                            static_cast<unsigned long long>(component.type_getter_libg_offset));
++            }
++            const char *owner_backlink_json =
++                component.present ? (component.owner_backlink_valid ? "true" : "false") : "null";
++            const char *slot_matches_type_json =
++                component.type_valid ? (component.engine_type == slot ? "true" : "false") : "null";
++            if (!item_json.append("%s{\"slot\":%d,\"present\":%s,\"ownerBacklinkValid\":%s,"
++                                  "\"vtableLibgOffset\":%s,\"typeGetterLibgOffset\":%s,"
++                                  "\"engineType\":%s,\"typeValid\":%s,\"slotMatchesType\":%s}",
++                                  slot == 0 ? "" : ",", slot, component.present ? "true" : "false", owner_backlink_json,
++                                  vtable_offset_json, type_getter_offset_json, type_json,
++                                  component.type_valid ? "true" : "false", slot_matches_type_json)) {
++              item_failed = true;
++              break;
++            }
+           }
+         }
+-      }
+-      if (item_failed || !item_json.append("]}}")) {
+-        truncated = true;
+-        break;
++        if (item_failed || !item_json.append("]}}")) {
++          truncated = true;
++          break;
++        }
+       }
+     }
+     if (used + item_used + 96 >= response_size) {
+@@ -5298,68 +5306,74 @@
+       encoded = false;
+     }
+   }
+-  if (encoded) {
++  if (encoded && lean) {
++    // observe-lean ends here: the event histories below are what made a rich snapshot ~7.8 MB
++    // and ~0.7 s on a 12-unit board. Per-unit runtime state above is identical to observe-rich.
++    encode_stage = "lean-close";
++    encoded = json.append("],\"lean\":true");
++  }
++  if (encoded && !lean) {
+     encode_stage = "combat-events-label";
+     encoded = json.append("],\"combatEvents\":");
+   }
+-  if (encoded) {
++  if (encoded && !lean) {
+     encode_stage = "combat-events";
+     encoded = append_combat_events_json(manager, generation, state_epoch, tick, response, response_size, &used);
+   }
+-  if (encoded) {
++  if (encoded && !lean) {
+     encode_stage = "phase-runtime-label";
+     encoded = json.append(",\"phaseRuntime\":");
+   }
+-  if (encoded) {
++  if (encoded && !lean) {
+     encode_stage = "phase-runtime";
+     encoded = append_phase_runtime_events_json(generation, state_epoch, tick, response, response_size, &used);
+   }
+-  if (encoded) {
++  if (encoded && !lean) {
+     encode_stage = "special-movement-runtime-label";
+     encoded = json.append(",\"specialMovementRuntime\":");
+   }
+-  if (encoded) {
++  if (encoded && !lean) {
+     encode_stage = "special-movement-runtime";
+     encoded =
+         append_special_movement_runtime_events_json(generation, state_epoch, tick, response, response_size, &used);
+   }
+-  if (encoded) {
++  if (encoded && !lean) {
+     encode_stage = "action-movement-runtime-label";
+     encoded = json.append(",\"actionMovementRuntime\":");
+   }
+-  if (encoded) {
++  if (encoded && !lean) {
+     encode_stage = "action-movement-runtime";
+     encoded = append_action_movement_runtime_events_json(generation, state_epoch, tick, response, response_size, &used);
+   }
+-  if (encoded) {
++  if (encoded && !lean) {
+     encode_stage = "character-state-runtime-label";
+     encoded = json.append(",\"characterStateRuntime\":");
+   }
+-  if (encoded) {
++  if (encoded && !lean) {
+     encode_stage = "character-state-runtime";
+     encoded = append_character_state_runtime_events_json(generation, state_epoch, tick, response, response_size, &used);
+   }
+-  if (encoded) {
++  if (encoded && !lean) {
+     encode_stage = "visibility-runtime-label";
+     encoded = json.append(",\"visibilityRuntime\":");
+   }
+-  if (encoded) {
++  if (encoded && !lean) {
+     encode_stage = "visibility-runtime";
+     encoded = append_visibility_runtime_events_json(generation, state_epoch, tick, response, response_size, &used);
+   }
+-  if (encoded) {
++  if (encoded && !lean) {
+     encode_stage = "remaining-runtime-label";
+     encoded = json.append(",\"remainingRuntime\":");
+   }
+-  if (encoded) {
++  if (encoded && !lean) {
+     encode_stage = "remaining-runtime";
+     encoded = append_remaining_runtime_events_json(generation, state_epoch, tick, response, response_size, &used);
+   }
+-  if (encoded) {
++  if (encoded && !lean) {
+     encode_stage = "tower-troop-runtime-label";
+     encoded = json.append(",\"towerTroopRuntime\":");
+   }
+-  if (encoded) {
++  if (encoded && !lean) {
+     encode_stage = "tower-troop-runtime";
+     encoded = append_tower_troop_runtime_envelope_json(generation, state_epoch, tick, response, response_size, &used);
+   }
+@@ -6532,6 +6546,7 @@
+        std::strncmp(command, "step ", 5) == 0 || std::strncmp(command, "play ", 5) == 0 ||
+        std::strncmp(command, "transition ", 11) == 0 || std::strncmp(command, "inject ", 7) == 0 ||
+        std::strcmp(command, "observe") == 0 || std::strcmp(command, "observe-rich") == 0 ||
++       std::strcmp(command, "observe-lean") == 0 ||
+        std::strcmp(command, "observe-atomic") == 0 || is_replay_schedule_command(command))) {
+     send_control_error(socket_fd, "resident mode requires env ID command prefixes");
+     return;
+@@ -6936,6 +6951,40 @@
+     return;
+   }
+ 
++  if (std::strcmp(command, "observe-lean") == 0) {
++    // Rich per-unit runtime state without event histories or component inventories. Used for
++    // imitation data (clapha il/engine_convert.py): a snapshot every decision tick at plain speed.
++    constexpr std::size_t kLeanObservationBytes = 2 * 1024 * 1024;
++    static std::unique_ptr<char[]> lean_response(new (std::nothrow) char[kLeanObservationBytes]);
++    if (lean_response == nullptr) {
++      send_control_error(socket_fd, "could not allocate lean observation response");
++      return;
++    }
++    lean_response[0] = '\0';
++    pthread_mutex_lock(&g_control_mutex);
++    void *observed_manager =
++        g_runner_mode.load(std::memory_order_acquire) == static_cast<std::int32_t>(RunnerMode::NativeRender)
++            ? g_native_render_manager.load(std::memory_order_acquire)
++            : g_controlled_manager;
++    if (observed_manager == nullptr) {
++      observed_manager = g_live_stepped_manager.load(std::memory_order_acquire);
++    }
++    const bool succeeded = build_rich_observation_json(
++        observed_manager,
++        g_runner_mode.load(std::memory_order_relaxed) == static_cast<std::int32_t>(RunnerMode::NativeRender)
++            ? g_native_render_request_sequence
++            : g_control_generation,
++        lean_response.get(), kLeanObservationBytes, nullptr, true);
++    pthread_mutex_unlock(&g_control_mutex);
++    if (!succeeded && lean_response[0] == '\0') {
++      std::snprintf(lean_response.get(), kLeanObservationBytes,
++                    "{\"ok\":false,\"schema\":\"native-rich-telemetry.v3\","
++                    "\"error\":\"failed to encode lean observation\"}");
++    }
++    send_control_response(socket_fd, lean_response.get());
++    return;
++  }
++
+   if (std::strcmp(command, "observe-rich") == 0) {
+     std::unique_ptr<char[]> rich_response(new (std::nothrow) char[kFullObservationResponseBytes]());
+     if (rich_response == nullptr) {
