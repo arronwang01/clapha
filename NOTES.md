@@ -877,3 +877,86 @@ drag 3x10 41 ms 4/4, 2x5 16 ms 3/4, 1x17 34 ms 4/4. Default now place gap 8 hold
 First live latency lines (gap 30/hold 20): frame age 5-30 ms, inference 88-134 ms, tap sent
 <=1 ms after the decision, gesture 71 ms, decision frame -> issued 4-6 ticks; then the game's
 21. Inference is now the largest part we own.
+
+## Opponent plays silently lost -- fixed (2026-09-25)
+
+Three independent ways an opponent play never reached FirstLight's tracker:
+1. **Unknown opponent deck** (Training Camp always; a friendly whose other console is not
+   running). The episode used our deck as a stand-in and filtered opponent plays by
+   `decks[opp] = ()` -> *every* opponent play was dropped, reported once per card, so after
+   the first few it looked silent. The tracker then believed the opponent never spent elixir.
+   A stale published file (fallback to any old publication) did the same for most cards.
+2. **Form ids** (evo 13xxxxxx, hero 203xxxxxx): `executed_plays` filed anything outside
+   25M..30M as an ability, and `play_events` skips abilities without a word.
+3. A queue entry whose side could not be resolved was dropped silently.
+
+Now: `viewer.card_identity` normalises any command id to (base card, form code, kind) and marks
+ids outside this build's catalog `unknown`; `FirstLightRunner` keeps the opponent's side of the
+tracker as a *registry that grows*: empty when the deck is unknown (published deck when fresh),
+every card registered the first time it is played or revealed, only a ninth distinct card
+refused. The stale-file fallback is gone. Every refused play, unknown id, unattributed play and
+ability activation is logged, once per play. Status line: `opponent deck N/8 seen (learned|
+published)`. `mac012/test_opponent_registry.py`: unknown / stale / exact deck, both sides, an
+evolved play arriving as a form id, a ninth card: 8/8 recorded, ninth refused loudly, tracker's
+opponent elixir ceiling falls on every spend, 0 decide errors (fl:hog2, fl:il, fl:general).
+
+Also: **evolution units were invisible when unit and card names differ.** Our catalog names the
+evolution *card* form (Skeletons_EV1); FirstLight's archetypes are keyed by the *unit* form
+(Skeleton_EV1), which its own card spec names (evolution Transform `summoned_form`). Evo
+Skeletons, Barbarians, Bats, Recruits, Royal Hogs, Wall Breakers now resolve; forms FirstLight
+never had are shown as the base unit and logged (`mac012/drift_check.py` lists them: Goblin
+Barrel, Zap, Snowball evolutions).
+
+## Delay: what FirstLight trained with (verified in source, 2026-09-25)
+
+* PPO self-play: a play executes `base_latency_ticks (1) + policy delay offset (0..4)` ticks
+  after the decision (`decoding._timing_metadata`, `resident_batch_vector.queue_hand_action_at`).
+  No 20-tick command age.
+* Imitation: each human play is keyed by its source command tick (the execution boundary, +1 for
+  the observable state) and paired with the decision turn 0..4 ticks before it
+  (`expert.decision_tick_for_action`). The human committed ~20 ticks earlier; the model learned
+  to act on a board it could only have seen at execution.
+* Pending commands: `ObservationV1.pending_actions` is own-side only, empty in policy
+  observations (`policy_features_only`), and never read by the tensorizer. The model has no
+  input for a queued command of either side.
+* Live: decision frame -> issued 4-6 ticks (ours) + 21 (game) = the play lands ~1.3 s after the
+  board it was chosen on. Opponent commands are in our queue before they land;
+  `mac012/queue_lead.py` measures how early from any recorded session.
+
+So for a model that fits the real game: train with the 21-tick command age (plus measured
+round trip) and give it pending commands of both sides as an input, with their execute ticks.
+Neither fits inside the current checkpoints.
+
+## Real-game inputs vs cr-native-sandbox vs FirstLight (2026-09-25)
+
+cr-native-sandbox's live path (`mumu_live_private_sampler.c` + `mumu_live_controller.py`):
+entities (category, side, x, y, card id, level, hp, max hp, behaviour), players (elixir, hand,
+cycle, next, deck ids, form flags, refill timer). Enemy cards learned from board units only (no
+spells). No command queue, no reveal list, no attack state; its controller has fields for
+per-unit ability state but its reader never fills them. **Our reader is a strict superset**
+(+ attack stage/timers, charge, deploy remaining, target; + queue_probe: both sides' commands,
+accounts, reveal lists, received-tick gap).
+
+Still not supplied to the model (FirstLight fields left empty), in order of likely value:
+1. **Hero / champion ability runtime** (player `ability_runtime_states`, mask `ability_sources`)
+   -> the bot *cannot* use an ability: the mask never offers it and the console dropped
+   non-card actions. Training covered it (the Hog specialist's deck has Hero Musketeer).
+   Source on 15.535: controllers at player+0x3a0 (+0x78 cooldown, +0x80 charges, +0x98 button,
+   back-pointer +0x20). `src/runtime_probe.c` finds them on this build.
+2. **Evolution progress** (player `evolution_runtime_states`): derived from their tracker today;
+   our catalog and FirstLight disagree on cycles for 29 cards (Skeletons 3 vs 2, Ice Spirits
+   1 vs 2, Cannon 3 vs 2). 15.535 source: player+0x2e8 progress vector; the probe finds it.
+3. Pending commands (both sides) -- needs a new model input (see Delay).
+4. Combat events, spell/projectile objects, shields, statuses, tower troop identity.
+Deliberately not supplied (FAIR tier): opponent exact elixir, although the client holds it.
+
+## Maintenance after a game update
+
+What breaks, and where it shows:
+* libg SHA / offsets (manager RVA, component vtables, player struct, queue entry): the reader
+  refuses the build ("reader not attached - unverified build"); re-run the scans.
+* New cards / forms: live_card_catalog.json must be regenerated from the build; until then the
+  console logs `queue: card id N is not in this build's catalog`.
+* FirstLight's catalog is frozen at 15.535: `drift_check.py` lists cards/forms it cannot
+  represent; the console logs refusals and unit fallbacks per match.
+* Balance changes: invisible to the frozen checkpoints; only retraining fixes them.

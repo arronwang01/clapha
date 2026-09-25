@@ -33,9 +33,6 @@ DECKS = CLAPHA / 'build' / 'decks'
 LOCK = threading.Lock()
 SESSION = CLAPHA / 'artifacts' / 'viewer-sessions' / time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
 
-# In Training Camp the trainer's commands carry account_lo -1 / seq -1, so a non-negative
-# account is ours. In a friendly battle against another account this no longer holds --
-# read the local side's avatar account id before relying on it there.
 # Poll intervals. The game ticks every 50 ms, so 50 means every tick is seen; at 100 a frame
 # can already be two ticks old when it arrives. Raise them if the device cannot keep up (the
 # console shows the reader's lag).
@@ -43,6 +40,9 @@ READER_MS = int(os.environ.get('CR_READER_MS', '50'))
 QUEUE_MS = int(os.environ.get('CR_QUEUE_MS', '50'))
 
 
+# In Training Camp the trainer's commands carry account_lo -1 / seq -1, so a non-negative
+# account is ours. In a friendly battle against another account this no longer holds --
+# read the local side's avatar account id before relying on it there.
 def mine(entry: dict) -> bool:
     return entry.get('account_lo', -1) >= 0
 
@@ -56,6 +56,44 @@ def catalog() -> dict[int, dict]:
 
 
 CARDS = catalog()
+
+# A champion or hero ability activation passes through the command queue with this id.
+ABILITY_COMMAND_ID = 65535
+
+
+def _forms() -> dict[int, tuple[int, int]]:
+    """form id -> (base card id, form code): evolution 13xxxxxx -> 1, hero 203xxxxxx -> 2."""
+    if not CATALOG.is_file():
+        return {}
+    table = {}
+    for row in json.loads(CATALOG.read_text()).get('cards', []):
+        if row.get('evolution_form_id'):
+            table[int(row['evolution_form_id'])] = (int(row['card_id']), 1)
+        if row.get('hero_form_id'):
+            table[int(row['hero_form_id'])] = (int(row['card_id']), 2)
+    return table
+
+
+FORMS = _forms()
+
+
+def card_identity(raw_id: int) -> tuple[int, int, str]:
+    """A command's card id -> (base card id, form code, kind).
+
+    kind is 'card', 'ability' (the 65535 activation id) or 'unknown': an id that is neither a
+    card nor a form in this build's catalog -- after a game update, a new card. Unknown ids
+    must be reported, never guessed: the old test ("not in 25M..30M -> ability") filed every
+    evolution or hero form id as an ability, and the play vanished without a word.
+    """
+    raw_id = int(raw_id)
+    if raw_id in CARDS:
+        return raw_id, 0, 'card'
+    if raw_id in FORMS:
+        base, form = FORMS[raw_id]
+        return base, form, 'card'
+    if raw_id == ABILITY_COMMAND_ID:
+        return raw_id, 0, 'ability'
+    return raw_id, 0, 'unknown'
 
 
 def to_state(frame: dict, health: dict) -> dict:
@@ -171,12 +209,14 @@ def executed_plays(row: dict, entries: list, pending: dict) -> list[dict]:
             continue
         del pending[key]
         side = entry_side(entry, row.get('accounts'))
-        if side is None:
-            continue
-        card_id = int(entry['card_id'])
+        raw_id = int(entry['card_id'])
         # A champion's ability activation also passes through the command queue, with no
         # card behind it (id 65535). It is not a card play and must not move the card cycle.
-        kind = 'card' if 25000000 <= card_id < 30000000 else 'ability'
+        # Evolution / hero form ids are the same play as their base card.
+        card_id, form_code, kind = card_identity(raw_id)
+        if side is None:
+            # Kept, not dropped: the console reports plays it could not attribute.
+            kind = 'unattributed'
         # The game consumes a command a fixed 21 ticks after issue (measured: queued -> unit
         # 22 ticks on every play; FirstLight's COMMAND_CONSUMPTION_STEPS = 21). Dating the play
         # from its issue tick is exact; dating it from when we noticed the entry gone depends
@@ -184,7 +224,9 @@ def executed_plays(row: dict, entries: list, pending: dict) -> list[dict]:
         issue = entry.get('issue_tick')
         executed = int(issue) + 21 if isinstance(issue, int) and issue + 21 <= int(tick) \
             else int(tick)
-        played.append({'tick': executed, 'side': int(side), 'card_id': card_id, 'kind': kind,
+        played.append({'tick': executed, 'side': -1 if side is None else int(side),
+                       'card_id': card_id, 'raw_card_id': raw_id, 'form_code': form_code,
+                       'kind': kind,
                        'x': entry.get('x'), 'y': entry.get('y'), 'seq': entry.get('seq'),
                        'issue_tick': entry.get('issue_tick')})
     for key, entry in current.items():

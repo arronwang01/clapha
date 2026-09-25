@@ -166,19 +166,37 @@ def archetype_by_card() -> dict[int, tuple[int, str]]:
         by_vocab: dict[int, int] = {}
         for global_id, vocab in catalog._runtime_vocab_by_global_id.items():
             by_vocab.setdefault(int(vocab), int(global_id))
+        # The unit an evolution summons is named by FirstLight's own card spec
+        # (evolution Transform effect 'summoned_form', e.g. Skeleton_EV1). Our catalog's
+        # 'evolution_form' is the CARD-level name (Skeletons_EV1), which matches only where
+        # card and unit share a name -- Evo Skeletons, Barbarians, Bats, Recruits, Royal Hogs
+        # and Wall Breakers were all invisible to the model.
+        specs = production_semantic_bundle().card_specs
+        unit_form: dict[int, str] = {}
+        for card_id, spec in specs.items():
+            for effect in (spec.evolution.effects if spec.evolution is not None else ()):
+                name = effect.parameters.get('summoned_form') if effect.parameters else None
+                if name:
+                    unit_form[int(card_id)] = str(name)
         for info in CARDS.values():
-            for form_id_key, form_name_key in (('hero_form_id', 'hero_character'),
-                                               ('evolution_form_id', 'evolution_form')):
-                form_id, form_name = info.get(form_id_key), info.get(form_name_key)
-                if not form_id or not form_name or int(form_id) in table:
+            for form_id_key, names in (
+                    ('hero_form_id', (info.get('hero_character'),)),
+                    ('evolution_form_id', (unit_form.get(int(info['card_id'])),
+                                           info.get('evolution_form')))):
+                form_id = info.get(form_id_key)
+                if not form_id or int(form_id) in table:
                     continue
-                vocab = catalog.form_vocab_id(form_name)
-                if vocab <= 1 or vocab not in by_vocab:
-                    continue
-                metadata = catalog.metadata_for_vocab_id(vocab)
-                kind = _ENTITY_KIND.get(str(metadata.child_kind))
-                if metadata.child_kind_known and kind is not None:
-                    table[int(form_id)] = (by_vocab[vocab], kind)
+                for form_name in names:
+                    if not form_name:
+                        continue
+                    vocab = catalog.form_vocab_id(form_name)
+                    if vocab <= 1 or vocab not in by_vocab:
+                        continue
+                    metadata = catalog.metadata_for_vocab_id(vocab)
+                    kind = _ENTITY_KIND.get(str(metadata.child_kind))
+                    if metadata.child_kind_known and kind is not None:
+                        table[int(form_id)] = (by_vocab[vocab], kind)
+                        break
         _ARCHETYPE = table
     return _ARCHETYPE
 
@@ -225,6 +243,7 @@ class Battle:
         self.tower_max: dict[int, float] = {}
         self.tower_seen: set[int] = set()
         self.unresolved: dict[int, int] = {}
+        self.form_fallbacks: set[int] = set()   # forms shown as their base unit
         self.untracked_plays: set[tuple[int, int]] = set()
 
     def tick(self, raw_tick: int) -> int:
@@ -550,8 +569,10 @@ def play_events(plays, tick: int, decks: dict | None, battle):
     (card, owner, position, and the tick it was consumed), shaped like battle_env's.
 
     The tracker refuses a play of a card outside that player's episode deck, so a play is
-    only emitted when its card is in `decks[side]`; anything else is counted on the battle
-    as unplaceable rather than raising and losing the decision.
+    only emitted when its card is in `decks[side]`. The console registers every card a player
+    shows before calling this (FirstLightRunner.register_plays), so `decks` holds what the
+    tracker can take, and a play left out here is one the registry refused -- recorded on the
+    battle with its reason, which the console reports every time.
     """
     from native_runner.contracts import EventV1
     from native_runner.training.v4.factory import production_semantic_bundle
@@ -572,13 +593,14 @@ def play_events(plays, tick: int, decks: dict | None, battle):
         if play.get('kind', 'card') != 'card':
             continue   # champion ability activations: not a card play (see viewer)
         card_id, side = int(play['card_id']), int(play['side'])
-        if card_id == MIRROR_CARD_ID or (decks and card_id not in decks.get(side, ())):
+        if card_id == MIRROR_CARD_ID or (decks is not None and card_id not in decks.get(side, ())):
             battle.untracked_plays.add((side, card_id))
             continue
         spec = specs.get(card_id)
         if spec is None or spec.elixir_cost is None:
             battle.untracked_plays.add((side, card_id))
             continue
+        form_code = int(play.get('form_code') or 0)
         position = None
         if play.get('x') is not None and play.get('y') is not None:
             position = (float(play['x']), float(play['y']))
@@ -589,8 +611,8 @@ def play_events(plays, tick: int, decks: dict | None, battle):
                   'native_event_id': f"{play.get('issue_tick')}:{play.get('seq')}:{side}",
                   'visible_card_id': card_id, 'effective_card_id': card_id,
                   'native_effective_card_id': card_id,
-                  'effective_cost': float(spec.elixir_cost), 'form_code': 0,
-                  'native_form_code': 0, 'source': 'native_command_queue'}))
+                  'effective_cost': float(spec.elixir_cost), 'form_code': form_code,
+                  'native_form_code': form_code, 'source': 'native_command_queue'}))
     events.sort(key=lambda event: (event.tick, event.owner or 0))
     return tuple(events)
 
@@ -655,8 +677,18 @@ def build(frame: dict, health: dict, episode_id: str, deduced: dict | None = Non
     archetypes = archetype_by_card()
     entities = []
     addresses: set[str] = set()
+    def resolve(card_id: int):
+        """Archetype for a board object; a form FirstLight never had (an evolution released
+        after 15.535) is shown as its base unit rather than dropped, and noted once."""
+        found = archetypes.get(card_id)
+        if found is None and base_card(card_id) != card_id:
+            found = archetypes.get(base_card(card_id))
+            if found is not None:
+                battle.form_fallbacks.add(card_id)
+        return found
+
     for e in frame['entities']:
-        if e['card_id'] != -1 and archetypes.get(e['card_id']) is not None and e.get('address'):
+        if e['card_id'] != -1 and resolve(e['card_id']) is not None and e.get('address'):
             address = str(e['address'])
             known_id, _age, _birth = battle.identify(address, tick)
             id_by_address[int(address, 16) & _UNTAG] = known_id
@@ -671,7 +703,7 @@ def build(frame: dict, health: dict, episode_id: str, deduced: dict | None = Non
     for e in frame['entities']:
         if e['card_id'] == -1:
             continue
-        resolved = archetypes.get(e['card_id'])
+        resolved = resolve(e['card_id'])
         if resolved is None:
             # Spell area effects are the usual case: our reader reports the spell's card id,
             # which has no entity archetype, and a strict tensorizer raises on it. Leaving the

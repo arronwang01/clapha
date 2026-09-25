@@ -193,6 +193,26 @@ class Bot:
                   f'({entry["x"]}, {entry["y"]}), off {off:.1f} tiles'
                   + ('  <-- MISPLACED' if off > 1.5 else ''))
 
+    def _report_queue_oddities(self, executed: list, handled: set) -> None:
+        """Say, once per play, about queue entries that cannot become a card play."""
+        for play in executed:
+            kind = play.get('kind', 'card')
+            if kind == 'card':
+                continue
+            key = (play.get('issue_tick'), play.get('seq'), play.get('raw_card_id'))
+            if key in handled:
+                continue
+            handled.add(key)
+            raw = play.get('raw_card_id', play.get('card_id'))
+            if kind == 'unknown':
+                self.note(f'queue: card id {raw} is not in this build\'s catalog '
+                          f'(game update?) - play not registered')
+            elif kind == 'unattributed':
+                self.note(f'queue: a play of {V.CARDS.get(play.get("card_id"), {}).get("name", raw)}'
+                          f' could not be attributed to a side - not registered')
+            elif kind == 'ability':
+                self.note(f't={play["tick"]/20:5.1f}s  side {play["side"]} activated an ability')
+
     def _report_latency(self, flight: dict) -> None:
         """One line per play: where the time went between the frame the policy saw and the
         command reaching the game. Everything after that (issue + 21 ticks to execute) is the
@@ -311,9 +331,9 @@ class Bot:
         battle = None
         fl_battle = None
         reported: set[int] = set()
-        reported_plays: set[tuple[int, int]] = set()
+        reported_untracked: set[tuple[int, int]] = set()
         pending_battle, pending_since = None, 0.0
-        episode_decks: dict = {}
+        handled_queue: set = set()
         last_turn = -10 ** 9
         in_flight: list[dict] = []
         deferred: list[dict] = []
@@ -359,25 +379,20 @@ class Bot:
                                          if a and a.get('side') == 1 - side), None)
                 opponent, opponent_forms, deck_note = opponent_deck_file(
                     opponent_account, fresh_after=pending_since - 5)
-                if opponent is None and frame['game_tick'] >= 60:
-                    # nothing fresh: an earlier publication beats a stand-in
-                    opponent, opponent_forms, deck_note = opponent_deck_file(
-                        opponent_account, fresh_after=0)
-                if opponent is None and frame['game_tick'] < 60:
+                if (opponent is None and opponent_account is not None
+                        and frame['game_tick'] < 60):
                     self.status = f'{self.model}: waiting for the opponent deck'
                     time.sleep(0.05)
                     continue
-                opponent_known = opponent is not None
-                if not opponent_known:
-                    opponent, opponent_forms = our_deck, None
-                    deck_note = ('opponent deck unknown - stand-in used; opponent plays will not '
-                                 'reach the tracker (run both consoles for friendlies)')
+                # No fallback to an older publication: a stale file is someone's previous
+                # deck, and its wrong cards were refused by the tracker all match. Unknown is
+                # better -- the runner learns the deck from what the opponent plays.
+                if opponent is None:
+                    deck_note = ('opponent deck not published - learning it from their plays '
+                                 '(Training Camp, or the other console is not running)')
                 self.note(deck_note)
-                seen = {index: list(cards) for index, cards
-                        in enumerate(revealed or [[], []])}
                 observation, fl_battle = FLO.build(
-                    frame, health, episode_id=str(frame['chain']['battle']),
-                    revealed=seen)
+                    frame, health, episode_id=str(frame['chain']['battle']))
                 try:
                     runner.end_battle()
                     # The tracker is seeded with exact initial elixir for BOTH owners, which
@@ -393,9 +408,8 @@ class Bot:
                     self.note(f'episode start failed: {error}')
                     time.sleep(1.0)
                     continue
-                episode_decks = {side: tuple(our_deck),
-                                 1 - side: tuple(opponent) if opponent_known else ()}
                 battle = frame['chain']['battle']
+                handled_queue: set = set()
                 last_turn, in_flight, deferred = -10 ** 9, [], []
                 self.plays = 0
                 self.note(f'new battle, you are side {side}; '
@@ -435,22 +449,45 @@ class Bot:
             turn_wait_ms = (frame['game_tick'] - turn) * 50.0
 
             try:
-                seen = {index: list(cards) for index, cards
-                        in enumerate(revealed or [[], []])}
+                # Every card either side has shown is registered with the tracker first, so
+                # the opponent's deck grows as they play; anything refused is said, per play.
+                revealed_cards = {
+                    index: [V.card_identity(c)[0] for c in cards
+                            if V.card_identity(c)[2] == 'card']
+                    for index, cards in enumerate(revealed or [[], []])}
+                for owner, card_id, reason in runner.register_plays(executed, revealed_cards):
+                    who = 'opponent' if owner != side else 'own'
+                    self.note(f'{who} {V.CARDS.get(card_id, {}).get("name", card_id)} NOT '
+                              f'registered: {reason}')
+                self._report_queue_oddities(executed, handled_queue)
+                seen = {side: revealed_cards.get(side, []),
+                        1 - side: [c for c in revealed_cards.get(1 - side, [])
+                                   if c in runner.opponent_seen]}
                 observation, fl_battle = FLO.build(
                     frame, health, episode_id=str(battle), battle=fl_battle, revealed=seen,
-                    reserved=reserved, plays=executed, decks=episode_decks,
+                    reserved=reserved, plays=executed, decks=runner.tracked_decks(),
                     hand_forms=runner.hand_forms(deck, me.get('deck_form_flags')))
-                for side_card in sorted(fl_battle.untracked_plays - reported_plays):
-                    reported_plays.add(side_card)
-                    who = 'opponent' if side_card[0] != side else 'own'
-                    self.note(f'{who} play of {V.CARDS.get(side_card[1], {}).get("name", side_card[1])}'
-                              f' not in the episode deck - not given to the tracker')
                 for card_id in sorted(set(fl_battle.unresolved) - reported):
                     reported.add(card_id)
-                    name = V.CARDS.get(card_id, {}).get('name', card_id)
-                    self.note(f'{name} has no entity archetype - that entity is left out '
-                              f'(spell effects; units are unaffected)')
+                    base = FLO.base_card(card_id)
+                    name = V.CARDS.get(base, {}).get('name', card_id)
+                    if V.CARDS.get(base, {}).get('type') == 'spell':
+                        self.note(f'{name}: spell effect on the board is not shown to the '
+                                  f'model (no FirstLight archetype for spell objects yet)')
+                    else:
+                        self.note(f'UNIT {name} ({card_id}) is not shown to the model: '
+                                  f'FirstLight has no archetype for it (newer card?)')
+                for side_card in sorted(fl_battle.untracked_plays - reported_untracked):
+                    reported_untracked.add(side_card)
+                    who = 'opponent' if side_card[0] != side else 'own'
+                    self.note(f'{who} play of '
+                              f'{V.CARDS.get(side_card[1], {}).get("name", side_card[1])} not given '
+                              f'to the tracker (Mirror, or no FirstLight card spec)')
+                for card_id in sorted(fl_battle.form_fallbacks - reported):
+                    reported.add(card_id)
+                    base = FLO.base_card(card_id)
+                    self.note(f'{V.CARDS.get(base, {}).get("name", base)} form {card_id} is '
+                              f'unknown to FirstLight - shown to the model as the base unit')
                 if turn < runner.first_decision_tick:
                     runner.observe(observation)
                     self.status = (f'{self.model}: warm-up '
@@ -467,7 +504,8 @@ class Bot:
                 self.note(f'missed {skipped} decision turn(s) at tick {turn} - '
                           f'the policy state is behind the game')
             self.status = (f'{self.model} playing - {me["elixir_raw"]/10000:.1f} elixir - '
-                           f'{self.plays} plays')
+                           f'{self.plays} plays - opponent deck {len(runner.opponent_seen)}/8 '
+                           f'seen ({runner.opponent_source})')
 
             # A turn can carry two plays. Take them in the order the policy asked for; the
             # second is a real play (Hog + Ice Spirit is one decision), not a duplicate.
