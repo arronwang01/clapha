@@ -62,15 +62,21 @@ def _get(path: str) -> dict:
     key = token()
     if not key:
         raise RuntimeError('no API token: save it as build/cr_api_token.txt')
-    request = urllib.request.Request(API + path, headers={'Authorization': f'Bearer {key}',
-                                                          'Accept': 'application/json'})
+    # The proxy sits behind Cloudflare, which refuses Python's default User-Agent
+    # ("Python-urllib") with error 1010 before the key is even checked.
+    request = urllib.request.Request(API + path, headers={
+        'Authorization': f'Bearer {key}', 'Accept': 'application/json',
+        'User-Agent': 'clapha/1.0 (personal deck lookup)'})
     try:
         with urllib.request.urlopen(request, timeout=8) as response:
             return json.loads(response.read())
     except urllib.error.HTTPError as error:
         body = error.read().decode(errors='replace')[:200]
-        hint = {403: ' (key not valid for this IP: it must allow 45.79.218.79)',
-                404: ' (no such player)'}.get(error.code, '')
+        if 'error-1010' in body or 'Error 1010' in body:
+            hint = ' (Cloudflare refused the client signature, not the key)'
+        else:
+            hint = {403: ' (key refused: it must allow 45.79.218.79)',
+                    404: ' (no such player)'}.get(error.code, '')
         raise RuntimeError(f'API {error.code}{hint}: {body}') from None
 
 
