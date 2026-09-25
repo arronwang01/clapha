@@ -16,3 +16,6 @@ screen*.png
 __pycache__/
 *.pyc
 .DS_Store
+
+# the native app is built from app/ (app/build.sh)
+Clapha.app/

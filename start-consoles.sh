@@ -99,7 +99,7 @@ done
 for p in 8777 8778; do
   if curl -sf "http://127.0.0.1:$p/state" >/dev/null 2>&1; then
     say "  console on http://127.0.0.1:$p  (ready)"
-    open "http://127.0.0.1:$p"
+    [ -z "${CLAPHA_NO_BROWSER:-}" ] && open "http://127.0.0.1:$p"
   else
     say "  console on http://127.0.0.1:$p  FAILED - see build/console_dev*.log"
   fi

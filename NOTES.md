@@ -1061,3 +1061,30 @@ turns included.
 Also: input coverage on a live match with the new reader -- unit target 83%, attack cooldown
 25%, windup 10%, deploy 12%, tower target 87% (all 0% before). Remaining zeros for units and
 towers are projectile-only slots, shields, visibility, abilities-on-entity: the known gaps.
+
+## The console is a native Mac app now (2026-09-25 overnight)
+
+`Clapha.app` (SwiftUI, built by `app/build.sh`, no Xcode project; `Clapha Consoles.command` opens
+it). One window for everything: both devices side by side (live board drawn from our side,
+hand, both elixir bars, battle clock, reader health), one **Off · Watch · Play** switch per
+device (Watch = the model decides every turn and logs what it would play, no taps; Play = it
+taps; the old start/stop + "armed" checkbox is gone), the model as a short list with the
+running one marked, the bot log, and a Tasks panel (input report for the last match, replay
+the last match through the model, hero/evolution checks, all-cards sweep, tap benchmark,
+bot log). Top bar: Start everything (emulators, tool rebuild/push, both engines -- no browser
+tabs), Stop engines, Check devices. A banner says so when the engines are not running.
+
+The Python engines stay as the tested backend (the decision loop is unchanged); the app talks to
+them over localhost. New engine endpoint `/api/mode?mode=off|watch|play&model=...`: watch <-> play
+on the same model only flips taps, so the episode and recurrent state carry on; a different
+model restarts cleanly (joins the old loop first).
+
+Performance: 3-7% of a core while polling at 4 Hz in battle / 1 Hz otherwise. It started at 38%:
+SwiftUI's @Published fires on every assignment, even an unchanged one, so setting
+`reachable = true` each poll re-rendered the whole window 8x a second; plus board / summary /
+log are now separate observable objects so only what changed is redrawn.
+
+Verification without a display: `app/snapshot.sh` renders the window off-screen from recorded
+engine states (app/fixture_*.json) to build/app_snapshot.png; `build/app.log` records startup
+and polling. Native AppKit controls cannot be drawn off-screen, which is one reason the mode
+switch and model list are plain SwiftUI (the other: they are clearer).

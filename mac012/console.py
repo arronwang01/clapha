@@ -144,7 +144,30 @@ class Bot:
     def stop(self) -> str:
         self.running = False
         self.status = 'off'
+        thread = getattr(self, 'thread', None)
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=3.0)     # the loop checks `running` at least every 0.3 s
         return 'stopped'
+
+    def set_mode(self, mode: str, model: str | None) -> str:
+        """One control instead of start/stop + an 'armed' box: off, watch (decides, never
+        taps) or play (taps). Watch <-> play on the same model only flips taps, so the policy's
+        episode and recurrent state carry on; a different model restarts it."""
+        if mode not in ('off', 'watch', 'play'):
+            return f'unknown mode {mode}'
+        if mode == 'off':
+            return self.stop()
+        model = model or self.model
+        if not model:
+            return 'pick a model'
+        if self.running and model == self.model:
+            self.armed = mode == 'play'
+            self.note(f'mode -> {mode.upper()}' + (' (taps on)' if self.armed else
+                                                   ' (decides, no taps)'))
+            return 'ok'
+        if self.running:
+            self.stop()
+        return self.start(model, mode == 'play')
 
     def _settle_in_flight(self, in_flight: list[dict], queue: list, executed: list,
                           local_account, side: int, tick: int) -> list[dict]:
@@ -821,6 +844,12 @@ class Handler(BaseHTTPRequestHandler):
                 result = 'unknown action'
             self._send(json.dumps({'result': result}).encode(), 'application/json')
             return
+        if route.path == '/api/mode':
+            query = parse_qs(route.query)
+            result = BOT.set_mode((query.get('mode') or [''])[0],
+                                  (query.get('model') or [None])[0])
+            self._send(json.dumps({'result': result}).encode(), 'application/json')
+            return
         if route.path == '/state':
             with V.LOCK:
                 frame, health = V.STATE['frame'], V.STATE['health']
@@ -829,7 +858,10 @@ class Handler(BaseHTTPRequestHandler):
                 queue, gap = list(V.STATE['queue']), V.STATE['gap']
             bot = {'running': BOT.running, 'armed': BOT.armed, 'model': BOT.model,
                    'status': BOT.status, 'plays': BOT.plays, 'last_play': BOT.last_play,
-                   'log': BOT.log[-14:], 'models': list(MA.MODELS) + FLB.available(),
+                   'log': BOT.log[-int((parse_qs(route.query).get('log') or ['14'])[0]):],
+                   'models': list(MA.MODELS) + FLB.available(),
+                   'mode': ('off' if not BOT.running else 'play' if BOT.armed else 'watch'),
+                   'serial': SERIAL, 'port': PORT,
                    'gate': BOT.gate, 'gate_ok': BOT.gate_ok, 'deduced': BOT.deduced,
                    'reader_error': reader_error}
             if frame and health and frame.get('battle_active'):

@@ -1,6 +1,6 @@
 #!/bin/bash
-# Double-click me in Finder to open the clapha consoles.
+# Opens the Clapha app (builds it first if needed). Everything else -- emulators, readers,
+# both devices, the bot, checks -- is done from inside the app.
 cd "$(dirname "$0")" || exit 1
-./start-consoles.sh
-echo
-echo "You can close this window."
+[ -d Clapha.app ] || ./app/build.sh
+open Clapha.app
