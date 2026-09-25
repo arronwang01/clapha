@@ -24,6 +24,7 @@ import scope_gate  # noqa: E402
 import firstlight_bot as FLB  # noqa: E402
 import firstlight_obs as FLO  # noqa: E402
 import tapper as TAP  # noqa: E402
+import opponent_intel as INTEL  # noqa: E402
 from cycle_tracker import Tracker, opponent_deck  # noqa: E402
 from mac_profile import ADB, SERIAL  # type: ignore  # noqa: E402
 from native_core.mumu_live_actions import ScreenLayout, send_card_taps  # noqa: E402
@@ -50,6 +51,47 @@ HOG26_DECK = {26000021: 0,   # Hog Rider
               26000010: 1,   # Skeletons (evolution)
               26000038: 0,   # Ice Golem
               26000030: 0}   # Ice Spirit
+
+
+def pending_commands(queue: list, accounts, tick: int, local_side=None,
+                     layout=None) -> list[dict]:
+    """Every command in the queue, both sides, for the board's ghost markers.
+
+    A command executes COMMAND_AGE_TICKS after its issue tick; until then it is only a
+    promise -- which is why the app draws it apart from real units (dashed, with a countdown).
+    Opponent commands reach us ~7 ticks after issue, so they show ~0.7 s before landing.
+    """
+    out = []
+    for entry in queue or ():
+        issue = entry.get('issue_tick')
+        if not isinstance(issue, int) or int(entry.get('card_id') or 0) <= 0:
+            continue
+        card_id, form, kind = V.card_identity(entry['card_id'])
+        side = V.entry_side(entry, accounts)
+        remaining = issue + COMMAND_AGE_TICKS - int(tick)
+        if side is None or remaining < 0:
+            continue
+        screen = None
+        if layout is not None and local_side in (0, 1) and kind == 'card' \
+                and entry.get('x') is not None and entry.get('y') is not None:
+            # Device pixels, through the same verified geometry the taps use, so an overlay
+            # on the emulator window lines up with the game.
+            column = min(X_TILES - 1, max(0, int(entry['x']) // 1000))
+            row = min(Y_TILES - 1, max(0, int(entry['y']) // 1000))
+            try:
+                screen = layout.deployment_point(screen_cell(column, row, local_side), local_side)
+            except (ValueError, TypeError):
+                screen = None
+        out.append({'screen_x': screen[0] if screen else None,
+                    'screen_y': screen[1] if screen else None,
+                    'screen_w': getattr(layout, 'width', None),
+                    'screen_h': getattr(layout, 'height', None),
+                    'x': entry.get('x'), 'y': entry.get('y'), 'side': int(side),
+                    'card_id': card_id, 'form': form, 'kind': kind,
+                    'name': ('ability' if kind == 'ability' else
+                             V.CARDS.get(card_id, {}).get('name', str(card_id))),
+                    'remaining_ticks': remaining})
+    return out
 
 
 def screen_cell(column: int, row: int, side: int) -> int:
@@ -136,6 +178,7 @@ class Bot:
         self.deduced = ''
         self.rtt: list[int] = []   # our taps: game ticks from tap to the command's issue tick
         self.tapper = None
+        self.opponent_intel = None
 
     def note(self, line: str) -> None:
         """Log a line on the page and to a file.
@@ -323,6 +366,37 @@ class Bot:
                   f'({entry["x"]}, {entry["y"]}), off {off:.1f} tiles'
                   + ('  <-- MISPLACED' if off > 1.5 else ''))
 
+    def _lookup_opponent(self, accounts, side: int, battle=None) -> None:
+        """Opponent's tag and currently equipped deck from the official API, in the
+        background (never delays a decision). A prior, not ground truth: logged and saved to
+        build/opponent_decks/, while the tracker still learns their real deck card by card.
+        Skipped for Training Camp (the trainer has no account) and without an API token."""
+        opponent = next((a for a in (accounts or []) if a and a.get('side') == 1 - side), None)
+        if not opponent or int(opponent.get('lo') or 0) <= 0 or INTEL.token() is None:
+            return
+
+        def work():
+            info = INTEL.lookup(int(opponent.get('hi') or 0), int(opponent['lo']))
+            if info['error']:
+                self.note(f'opponent {info["tag"]}: deck lookup failed - {info["error"][:120]}')
+                return
+            cards = ', '.join(f'{c["name"]}{" (evo)" if c["evolution_level"] else ""}'
+                              for c in info['deck'])
+            self.note(f'opponent {info["tag"]} {info["name"]} ({info["trophies"]} trophies), '
+                      f'equipped deck per API: {cards}')
+            self.opponent_intel = info
+            # Kept with the match recording (same session folder as frames.jsonl /
+            # queue.jsonl), so training data carries what the API said about each opponent.
+            try:
+                V.SESSION.mkdir(parents=True, exist_ok=True)
+                with open(V.SESSION / 'opponent_intel.jsonl', 'a', encoding='utf-8') as handle:
+                    handle.write(json.dumps({'battle': battle, 'side': 1 - side,
+                                             'looked_up': time.time(), **info}) + '\n')
+            except OSError:
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
+
     def _report_queue_oddities(self, executed: list, handled: set) -> None:
         """Say, once per play, about queue entries that cannot become a card play."""
         for play in executed:
@@ -340,7 +414,7 @@ class Bot:
             elif kind == 'unattributed':
                 self.note(f'queue: a play of {V.CARDS.get(play.get("card_id"), {}).get("name", raw)}'
                           f' could not be attributed to a side - not registered')
-            elif kind == 'ability':
+            elif kind == 'ability' and play.get('ability_card') is None:
                 self.note(f't={play["tick"]/20:5.1f}s  side {play["side"]} activated an ability')
 
     def _report_latency(self, flight: dict) -> None:
@@ -647,6 +721,8 @@ class Bot:
                     deck_note = ('opponent deck not published - learning it from their plays '
                                  '(Training Camp, or the other console is not running)')
                 self.note(deck_note)
+                self.opponent_intel = None
+                self._lookup_opponent(accounts, side, frame['chain']['battle'])
                 observation, fl_battle = FLO.build(
                     frame, health, episode_id=str(frame['chain']['battle']))
                 try:
@@ -716,10 +792,22 @@ class Bot:
                     index: [V.card_identity(c)[0] for c in cards
                             if V.card_identity(c)[2] == 'card']
                     for index, cards in enumerate(revealed or [[], []])}
+                intel = self.opponent_intel
+                if intel and runner.api_deck_state == 'none' and intel.get('deck'):
+                    note = runner.adopt_api_deck([c['card_id'] for c in intel['deck']])
+                    if note:
+                        self.note(note)
                 for owner, card_id, reason in runner.register_plays(executed, revealed_cards):
                     who = 'opponent' if owner != side else 'own'
                     self.note(f'{who} {V.CARDS.get(card_id, {}).get("name", card_id)} NOT '
                               f'registered: {reason}')
+                opponent_player = next((p for p in frame['players']
+                                        if p.get('side') == 1 - side), None)
+                for line in runner.attribute_opponent_abilities(executed, opponent_player):
+                    self.note(line)
+                for line in runner.messages:
+                    self.note(line)
+                runner.messages.clear()
                 self._report_queue_oddities(executed, handled_queue)
                 seen = {side: revealed_cards.get(side, []),
                         1 - side: [c for c in revealed_cards.get(1 - side, [])
@@ -1056,6 +1144,7 @@ class Handler(BaseHTTPRequestHandler):
                 reader_error = V.STATE['error']
                 age = time.time() - V.STATE['updated'] if V.STATE['updated'] else None
                 queue, gap = list(V.STATE['queue']), V.STATE['gap']
+                accounts = V.STATE['accounts']
             bot = {'running': BOT.running, 'armed': BOT.armed, 'model': BOT.model,
                    'status': BOT.status, 'plays': BOT.plays, 'last_play': BOT.last_play,
                    'log': BOT.log[-int((parse_qs(route.query).get('log') or ['14'])[0]):],
@@ -1074,6 +1163,9 @@ class Handler(BaseHTTPRequestHandler):
                 for player in frame['players']:
                     revealed[player['side']] = []
                 body = {'ok': True, 'age': age, 'pending': pending, 'lag_ticks': gap,
+                        'pending_commands': pending_commands(
+                            queue, accounts, frame.get('game_tick') or 0,
+                            health.get('local_side'), BOT.layout),
                         'session': V.SESSION.name, 'bot': bot, 'revealed': revealed,
                         **V.to_state(frame, health)}
             else:

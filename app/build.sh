@@ -25,5 +25,9 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </dict></plist>
 PLIST
 [ -f "$HERE/AppIcon.icns" ] && cp "$HERE/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+# Landing-warning art (Supercell's own assets, project use only): unpacked outside git.
+if [ -f "$ROOT/landing-hud-kit.zip" ] && [ ! -d "$ROOT/build/hud/landing-hud-kit" ]; then
+  mkdir -p "$ROOT/build/hud" && unzip -q -o "$ROOT/landing-hud-kit.zip" -d "$ROOT/build/hud"
+fi
 codesign --force --sign - "$APP" >/dev/null 2>&1 || true
 echo "built $APP"

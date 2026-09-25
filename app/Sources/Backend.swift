@@ -37,6 +37,7 @@ struct PendingInfo: Decodable {
     let y: Int?
     let side: Int
     let cardId: Int
+    let form: Int?
     let kind: String
     let name: String
     let remainingTicks: Int
@@ -87,7 +88,9 @@ final class LogModel: ObservableObject {
 /// What the board and hand draw: changes several times a second in a battle, cheap to draw.
 @MainActor
 final class BoardModel: ObservableObject {
-    @Published var state: DeviceState?
+    @Published var state: DeviceState? { didSet { receivedAt = Date() } }
+    /// When `state` arrived, so countdowns can run smoothly between polls.
+    var receivedAt = Date()
 }
 
 /// Everything the controls and status show. Only republished when it actually changes, so the

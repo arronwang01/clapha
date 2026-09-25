@@ -77,30 +77,109 @@ final class MuMuOverlay {
     }
 }
 
+/// The landing-warning art (landing-hud-kit, the owner's style): unit models in `figures/`,
+/// card portraits in `card_icons/`. Unpacked by app/build.sh into build/hud (git-ignored:
+/// these are Supercell's own assets, for use inside this project only).
+@MainActor
+enum HudArt {
+    private static var cache: [String: NSImage] = [:]
+    private static var missing: Set<String> = []
+    static let root = claphaRoot().appendingPathComponent("build/hud/landing-hud-kit")
+
+    private static func load(_ relative: String) -> NSImage? {
+        if let image = cache[relative] { return image }
+        if missing.contains(relative) { return nil }
+        guard let image = NSImage(contentsOf: root.appendingPathComponent(relative)) else {
+            missing.insert(relative)
+            return nil
+        }
+        cache[relative] = image
+        return image
+    }
+
+    /// Kit lookup rule: the unit's figure (forms use the base card's); otherwise the card
+    /// icon, the evolution/hero portrait when the card was played in that form.
+    static func figure(_ card: Int) -> NSImage? { load("figures/\(card).png") }
+
+    static func icon(_ card: Int, form: Int) -> NSImage? {
+        let suffix = form == 1 ? "_evo" : form == 2 ? "_hero" : ""
+        return (suffix.isEmpty ? nil : load("card_icons/\(card)\(suffix).png"))
+            ?? load("card_icons/\(card).png")
+    }
+}
+
+/// Landing warning, as LANDING-HUD-DESIGN.md specifies (sizes there are at 1080 px wide and are
+/// scaled to the overlay's width here). Positions come from the engine's tap geometry.
 struct OverlayView: View {
     @ObservedObject var board: BoardModel
 
+    private static let red = Color(red: 235 / 255, green: 70 / 255, blue: 70 / 255)
+    private static let blue = Color(red: 70 / 255, green: 150 / 255, blue: 255 / 255)
+    private static let gold = Color(red: 255 / 255, green: 205 / 255, blue: 60 / 255)
+
     var body: some View {
-        Canvas { context, size in
-            guard let state = board.state, state.ok else { return }
-            let local = state.localSide ?? 0
-            for pending in state.pendingCommands ?? [] where pending.kind == "card" {
-                guard let sx = pending.screenX, let sy = pending.screenY,
-                      let sw = pending.screenW, let sh = pending.screenH, sw > 0, sh > 0 else { continue }
-                let p = CGPoint(x: Double(sx) / Double(sw) * size.width,
-                                y: Double(sy) / Double(sh) * size.height)
-                let r = size.width * 0.045
-                let ring = Path(ellipseIn: CGRect(x: p.x - r, y: p.y - r, width: 2 * r, height: 2 * r))
-                let color: Color = pending.side == local ? Color(red: 0.35, green: 0.62, blue: 1)
-                                                         : Color(red: 1, green: 0.30, blue: 0.28)
-                context.fill(ring, with: .color(color.opacity(0.18)))
-                context.stroke(ring, with: .color(color), style: StrokeStyle(lineWidth: 2.5, dash: [6, 4]))
-                let seconds = String(format: "%.1fs", Double(max(0, pending.remainingTicks)) / 20.0)
-                context.draw(Text("\(pending.name) \(seconds)")
-                                .font(.system(size: 12, weight: .bold)).foregroundStyle(color),
-                             at: CGPoint(x: p.x, y: p.y + r + 10))
+        TimelineView(.animation) { timeline in
+            Canvas { context, size in
+                draw(&context, size: size, now: timeline.date)
             }
         }
         .allowsHitTesting(false)
+    }
+
+    private func draw(_ context: inout GraphicsContext, size: CGSize, now: Date) {
+        guard let state = board.state, state.ok else { return }
+        let local = state.localSide ?? 0
+        let k = size.width / 1080.0                       // spec pixels -> overlay points
+        let t = now.timeIntervalSinceReferenceDate
+        let pulse = 0.5 + 0.5 * sin(t * 9)
+        // Ticks elapsed since this state was read, so the countdown runs between polls.
+        let elapsedTicks = max(0, now.timeIntervalSince(board.receivedAt)) * 20
+        for pending in state.pendingCommands ?? [] where pending.kind == "card" {
+            guard let sx = pending.screenX, let sy = pending.screenY,
+                  let sw = pending.screenW, let sh = pending.screenH, sw > 0, sh > 0 else { continue }
+            let p = CGPoint(x: Double(sx) / Double(sw) * size.width,
+                            y: Double(sy) / Double(sh) * size.height)
+            let seconds = max(0, Double(pending.remainingTicks) - elapsedTicks) / 20
+            let mine = pending.side == local
+            let colour = mine ? Self.blue : Self.red
+
+            // Ring: flat ellipse (the board is foreshortened), pulsing radius and opacity.
+            let r = (95 + 12 * pulse) * k
+            let ring = Path(ellipseIn: CGRect(x: p.x - r, y: p.y - 0.78 * r, width: 2 * r,
+                                              height: 2 * 0.78 * r))
+            context.stroke(ring, with: .color(colour.opacity((150 + 80 * pulse) / 255)),
+                           lineWidth: 7 * k)
+
+            let label = String(format: "%.1fs", seconds)
+            if mine {
+                // Own card: ring and a white countdown only, never an icon.
+                context.draw(Text(label).font(.system(size: 30 * k, weight: .heavy))
+                                .foregroundStyle(.white),
+                             at: CGPoint(x: p.x, y: p.y - 30 * k))
+                continue
+            }
+            var top: Double
+            if let figure = HudArt.figure(pending.cardId) {
+                // Unit: its model standing in the ring, feet 22 px below the centre.
+                let rect = CGRect(x: p.x - 75 * k, y: p.y + 22 * k - 150 * k,
+                                  width: 150 * k, height: 150 * k)
+                context.draw(Image(nsImage: figure), in: rect)
+                top = rect.minY
+            } else if let icon = HudArt.icon(pending.cardId, form: pending.form ?? 0) {
+                // Spell (or a unit without a figure): the card icon on the spot.
+                let rect = CGRect(x: p.x - 36 * k, y: p.y - 36 * k, width: 72 * k, height: 72 * k)
+                context.draw(Image(nsImage: icon), in: rect)
+                top = rect.minY
+            } else {
+                context.draw(Text(pending.name).font(.system(size: 22 * k, weight: .bold))
+                                .foregroundStyle(colour), at: p)
+                top = p.y - 20 * k
+            }
+            // Gold countdown 44 px above the figure, never above the top 215 px.
+            let y = max(215 * k, top - 44 * k)
+            context.draw(Text(label).font(.system(size: 34 * k, weight: .heavy))
+                            .foregroundStyle(Self.gold),
+                         at: CGPoint(x: p.x, y: y))
+        }
     }
 }
