@@ -770,3 +770,83 @@ ability runtime (14 slots: champion / hero abilities, own and opponent), tower-t
 irrelevant for Tower Princess), projectiles in flight (5), evolution counters (4), visibility (4),
 relocation (6), capture (2), shields (2), resource (1), periodic modifier (1), and every
 combat event other than card plays. Plus ~300 ms of our own latency per play.
+
+## Comparison against FirstLight's own play loop (2026-09-25)
+
+FirstLight is public (github.com/Jaasssoooonnnnn/FirstLight_CR, commit 9f622d5), so this was
+read against their source rather than inferred. How "the one in Null's" plays
+(`native_runner/training/v4/offline_agent.py`, `evaluate.py`):
+
+  * **Lockstep.** `environment.step(commands)` advances exactly five ticks per decision; the
+    game waits for the model. Rendered play backdates the command age so a play executes on
+    the **next tick** (`_rendered_action`: `execute_offset_ticks=1`), and `PolicySessionV4`
+    hard-codes `base_latency_ticks = 1`. The model has no latency input: every checkpoint
+    was trained, evaluated and hand-tested with ~50 ms from decision to execution.
+  * Their probe supplies per-card forms (`card_parameter & 0xF`), the full combat event
+    ring (`public_card_play_events_from_combat_ring`), spell/area entities, abilities.
+  * Engine: Null's Royale 15.535.13 with content 15.535.86. This client is 160402012, a
+    later balance.
+
+What that means here, and what changed:
+
+1. **~1.2 s of latency the policy never saw (fixed as far as it can be: compensated).**
+   Live, a tap reaches the queue after a round trip and executes 21 ticks later; every play
+   landed on a board ~24 ticks (≈5 decision turns) older than the one it was chosen for, and
+   for those turns the policy saw its card still in hand and the unit absent. Now
+   `FLO.build(lead_ticks=L)` shows the policy the board *as it will be when its play lands*:
+   clock and elixir advanced (their `_generated_elixir`), moving units extrapolated along
+   their velocity, commands already in the queue (both sides) passed as executed at
+   issue+21 (`viewer.queued_plays`), our in-flight plays cycled out of the hand
+   (`advance_own_hand`) with their cost spent. `L = 21 + median(tap -> issue ticks)`,
+   measured by the console from our own taps, default 24, fixed per battle (the tracker
+   refuses a clock that runs backwards). Toggle: "latency compensation" checkbox.
+   Limits: HP is not extrapolated, units that stop to fight are extrapolated only as far as
+   their measured velocity says, our own queued units are not synthesised onto the board.
+2. **Every card was sent as its normal form (fixed).** `hand_runtime_by_slot` and the
+   placement entries carried `form_code: 0`. The Hog specialists' deck is Hero Musketeer,
+   Evo Cannon, Evo Skeletons -- three of eight cards the policy saw as a different card.
+   `FirstLightRunner.hand_forms`: hero flag (0x2) -> form 2 always (their BattleEnv does
+   the same for hero form ids); evolution flag (0x1) -> form 1 exactly when *their tracker*,
+   fed our executed plays, has counted the evolution cycles down. Derived, not read: verify
+   on the device that the tracker's "ready" matches the in-game evo glow (see below).
+3. **The second play of a turn was always dropped (fixed).** The in-flight guard skipped any
+   tap while the previous card was still in hand (~1.2 s), and a queued own command blocked
+   all taps. So `max_micro_actions = 2` never happened and Hog + Ice Spirit, one decision,
+   was always half a play. Now every play in a turn taps; only a re-tap of a card already
+   in flight is dropped; reserved elixir is the sum of all in-flight plays until
+   issue+21; a play chosen against elixir that exists only after the lead waits (≤1.5 s)
+   until the client can place it.
+4. **Taps go by card identity, not slot.** The screen position is looked up from the card
+   the policy chose in the hand as memory holds it, so a lead-advanced hand, or any slot
+   disagreement, cannot tap the wrong card.
+5. **Deck check.** Starting fl:hog1/fl:hog2 now logs whether the deck and forms match the
+   specialist's training deck. Out of it they are a different, weaker model (their table:
+   specialist 2 vs General 88% on its deck, 59% on others).
+
+Offline, `mac012/test_lead_forms.py` (synthetic 3-minute match, Hog deck with forms,
+tap -> queue 3 ticks -> execute +21, reader hand/elixir changing only on execution):
+all five checkpoints, both sides, lead 0 and 24: 0 decide errors, the hand the policy sees
+never holds an in-flight card, forms always equal their tracker's readiness, hero always
+offered. hog2 spends 91-97% of the match's elixir.
+
+### Roadblocks that remain (not fixable from outside the process, or need the device)
+
+* **Latency is compensated, not removed.** Extrapolation cannot know that a Hog will stop
+  at a building or that a unit is about to die. Null's has none of this problem because it
+  is lockstep. This is the largest remaining gap and the reason not to expect Null's parity.
+* **Combat events are empty** (`events` holds only card plays). Their probe fills a 32-slot
+  channel from inside the game: damage, projectiles, shields, ability casts. Needs an
+  in-process hook, i.e. what their APK patch does.
+* **Spell entities are dropped** (Log/Fireball in flight): our reader reports the card id,
+  not the AreaEffect/projectile data id.
+* **Different game version.** 15.535 vs 160402012: any balance change since then is a
+  change the policy never trained on.
+* **Tower troop assumed Tower Princess.**
+* Things to confirm on the device, in one friendly:
+  1. the lead the console measures (log line "latency lead N ticks") -- expect 23-27;
+  2. evo readiness: when the tracker offers Evo Skeletons/Cannon as evolved, does the card
+     glow in hand? If evolutions start the match charged on this build, the tracker's
+     initial state is wrong and the fix is to seed it;
+  3. whether the hand in memory changes at tap or at execution (both are handled; the
+     answer tells which path runs);
+  4. A/B: same deck, lead on vs off, a few games each.

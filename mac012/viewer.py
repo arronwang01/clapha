@@ -127,6 +127,40 @@ def pump() -> None:
             time.sleep(2)
 
 
+def entry_side(entry: dict, accounts) -> int | None:
+    """The side a command-queue entry belongs to, from its account.
+
+    The queue probe maps accounts to sides; a trainer's commands carry account -1 and belong
+    to whichever side is not the one real account present.
+    """
+    sides = {a['lo']: a['side'] for a in (accounts or []) if a}
+    side = sides.get(entry.get('account_lo'))
+    if side is None:
+        real = [s for lo, s in sides.items() if lo is not None and lo > 0]
+        side = 1 - real[0] if len(real) == 1 else None
+    return side
+
+
+def queued_plays(entries: list, accounts, up_to_tick: int) -> list[dict]:
+    """Commands still in the queue that will have executed by up_to_tick, shaped like
+    executed_plays. The game consumes a command exactly 21 ticks after issue, so a queued
+    command is a play whose execution tick is already known."""
+    plays = []
+    for entry in entries or ():
+        card_id = int(entry.get('card_id') or 0)
+        issue = entry.get('issue_tick')
+        if card_id <= 0 or not isinstance(issue, int) or issue + 21 > up_to_tick:
+            continue
+        side = entry_side(entry, accounts)
+        if side is None:
+            continue
+        plays.append({'tick': issue + 21, 'side': int(side), 'card_id': card_id,
+                      'kind': 'card' if 25000000 <= card_id < 30000000 else 'ability',
+                      'x': entry.get('x'), 'y': entry.get('y'), 'seq': entry.get('seq'),
+                      'issue_tick': issue})
+    return plays
+
+
 def executed_plays(row: dict, entries: list, pending: dict) -> list[dict]:
     """Card plays that executed since the previous queue sample, from both players.
 
@@ -140,7 +174,6 @@ def executed_plays(row: dict, entries: list, pending: dict) -> list[dict]:
     tick = row.get('tick_0x60')
     if tick is None:
         return []
-    sides = {a['lo']: a['side'] for a in (row.get('accounts') or []) if a}
     current = {(e.get('account_lo'), e.get('seq'), e.get('issue_tick'), e.get('card_id')): e
                for e in entries if e.get('card_id', 0) > 0}
     played = []
@@ -148,12 +181,7 @@ def executed_plays(row: dict, entries: list, pending: dict) -> list[dict]:
         if key in current:
             continue
         del pending[key]
-        side = sides.get(entry.get('account_lo'))
-        if side is None:
-            # A trainer's commands carry no real account: they belong to the side that is not
-            # the one real account present.
-            real = [s for lo, s in sides.items() if lo is not None and lo > 0]
-            side = 1 - real[0] if len(real) == 1 else None
+        side = entry_side(entry, row.get('accounts'))
         if side is None:
             continue
         card_id = int(entry['card_id'])

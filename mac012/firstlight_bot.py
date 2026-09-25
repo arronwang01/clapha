@@ -40,10 +40,12 @@ expert's distribution and the expert waits most turns.
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
-FIRSTLIGHT = Path.home() / 'Documents/GitHub/FirstLight_CR'
+FIRSTLIGHT = Path(os.environ.get('FIRSTLIGHT_ROOT')
+                  or Path.home() / 'Documents/GitHub/FirstLight_CR')
 if str(FIRSTLIGHT) not in sys.path:
     sys.path.insert(0, str(FIRSTLIGHT))
 HERE = Path(__file__).resolve().parent
@@ -113,6 +115,33 @@ class FirstLightRunner:
                                        sample=self.sample)
         self.session.start_episode(observation, initial_elixir=initial_elixir)
         self.actor_owner = actor_owner
+
+    def hand_forms(self, deck, form_flags) -> dict[int, int]:
+        """card id -> the form our hand holds it in: 0 normal, 1 evolution, 2 hero.
+
+        FirstLight's probe reads this per hand card (card_parameter & 0xF). We cannot call the
+        game's selection builder from outside the process, so it is derived instead, from the
+        same rules their BattleEnv applies: a hero-enabled deck slot (form flag bit 0x2) is
+        always played as its hero form, and an evolution-enabled slot (bit 0x1) is evolved
+        exactly when their own tracker, fed our executed plays, has counted its evolution
+        cycles down. Sending 0 for everything told the policy an Evo Cannon was a plain Cannon
+        and a Hero Musketeer a plain Musketeer, in the deck the Hog specialists trained on.
+        """
+        forms: dict[int, int] = {}
+        if not deck or not form_flags or len(form_flags) != len(deck):
+            return forms
+        tracker = getattr(getattr(self.session, 'tensorizer', None), 'tracker', None)
+        for card_id, flag in zip(deck, form_flags):
+            flag = int(flag or 0)
+            if flag & 0x2:
+                forms[int(card_id)] = 2
+            elif flag & 0x1 and tracker is not None:
+                try:
+                    ready = tracker.card_state(self.actor_owner, int(card_id)).evolution_ready
+                except (KeyError, RuntimeError, ValueError):
+                    ready = False
+                forms[int(card_id)] = 1 if ready else 0
+        return forms
 
     def turn_tick(self, tick: int) -> int:
         """The five-tick decision turn this tick belongs to."""

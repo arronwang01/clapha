@@ -1,7 +1,8 @@
 """All five checkpoints, both sides, with entities that spawn, move, die and reuse addresses."""
 import random
 import sys
-sys.path.insert(0, '/Users/leafer/clapha')
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from mac012 import firstlight_obs as FLO
 from mac012 import firstlight_bot as FLB
 
@@ -11,7 +12,7 @@ troops = [c for c, i in C.items() if i.get('type') == 'troop' and i.get('elixir'
 bld = [c for c, i in C.items() if i.get('type') == 'building' and i.get('elixir') and i.get('standard_1v1')][:1]
 spells = [c for c, i in C.items() if i.get('type') == 'spell' and i.get('elixir') and i.get('standard_1v1')][:2]
 deck = troops + bld + spells
-TOW = [{'address': f'0xt{i}', 'category': 1, 'kind': 0, 'side': o, 'x': x, 'y': y,
+TOW = [{'address': f'0xf00{i}', 'category': 1, 'kind': 0, 'side': o, 'x': x, 'y': y,
         'card_id': -1, 'level': 14, 'hp': 2600, 'max_hp': 2600, 'behavior_state_raw': 0}
        for i, (x, y, o, k) in enumerate(FLO.TOWERS)]
 
@@ -72,17 +73,15 @@ def run(model, side, seed):
         except Exception as error:  # noqa: BLE001
             errors.append(f'{type(error).__name__}: {error}')
             continue
-        if not move:
-            continue
-        kind, slot, card, grid = move
-        if str(getattr(kind, 'value', kind)) != 'play_card' or grid is None:
-            continue
-        plays += 1
-        row = int(grid[1])
-        if C.get(card, {}).get('type') == 'spell':
-            spell_plays += 1
-        elif not ((row < 16) if side == 0 else (row >= 16)):
-            wrong += 1
+        for kind, slot, card, grid, _offset in move:
+            if str(getattr(kind, 'value', kind)) != 'play_card' or grid is None:
+                continue
+            plays += 1
+            row = int(grid[1])
+            if C.get(card, {}).get('type') == 'spell':
+                spell_plays += 1
+            elif not ((row < 16) if side == 0 else (row >= 16)):
+                wrong += 1
     return plays, spell_plays, wrong, errors, dict(battle.unresolved)
 
 

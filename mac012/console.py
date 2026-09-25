@@ -31,6 +31,26 @@ from native_core.mumu_live_protocol import adb_run  # noqa: E402
 PORT = int(os.environ.get('CR_CONSOLE_PORT', '8777'))
 LOG_FILE = Path(__file__).resolve().parents[1] / 'build' / f'bot_{PORT}.log'
 X_TILES, Y_TILES = 18, 32
+# The game consumes a queued command this many ticks after its issue tick (measured 22 ticks
+# queue -> unit on every play; FirstLight's COMMAND_CONSUMPTION_STEPS = 21).
+COMMAND_AGE_TICKS = 21
+# Lead used before any tap of ours has been timed: ~1.2 s tap -> unit, measured on MuMu.
+DEFAULT_LEAD_TICKS = 24
+# A tap that never reaches the queue (missed, or refused by the client) is given up on.
+IN_FLIGHT_SECONDS = 3.0
+# How long a play chosen against not-yet-available elixir may wait for it.
+DEFER_SECONDS = 1.5
+
+# The deck the Hog 2.6 specialists trained on (FirstLight checkpoints/README.md), with the
+# forms their interface sets explicitly: 1 = evolution, 2 = hero.
+HOG26_DECK = {26000021: 0,   # Hog Rider
+              26000014: 2,   # Musketeer (hero)
+              27000000: 1,   # Cannon (evolution)
+              28000000: 0,   # Fireball
+              28000011: 0,   # The Log
+              26000010: 1,   # Skeletons (evolution)
+              26000038: 0,   # Ice Golem
+              26000030: 0}   # Ice Spirit
 
 
 def opponent_deck_file(account, *, fresh_after: float):
@@ -70,6 +90,8 @@ class Bot:
         self.opp_deck = None
         self.seen_plays = 0
         self.deduced = ''
+        self.compensate = True
+        self.rtt: list[int] = []   # our taps: game ticks from tap to the command's issue tick
 
     def note(self, line: str) -> None:
         """Log a line on the page and to a file.
@@ -92,12 +114,13 @@ class Bot:
         except OSError:
             pass
 
-    def start(self, model: str, armed: bool) -> str:
+    def start(self, model: str, armed: bool, compensate: bool = True) -> str:
         if self.running:
             return 'already running'
         if model not in MA.MODELS and model not in FLB.CHECKPOINTS:
             return f'unknown model {model}'
         self.model, self.armed, self.plays = model, armed, 0
+        self.compensate = compensate
         self.running = True
         self.status = f'{model}: loading'
         self.log = []
@@ -109,6 +132,113 @@ class Bot:
         self.running = False
         self.status = 'off'
         return 'stopped'
+
+    def lead_ticks(self) -> int:
+        """Ticks from a tap to its play executing: the queue's fixed command age plus our
+        measured tap -> queue round trip (median of recent taps), or the default before any
+        tap has been timed."""
+        if not self.rtt:
+            return DEFAULT_LEAD_TICKS
+        recent = sorted(self.rtt[-20:])
+        return max(COMMAND_AGE_TICKS,
+                   min(40, COMMAND_AGE_TICKS + recent[len(recent) // 2]))
+
+    def _settle_in_flight(self, in_flight: list[dict], queue: list, executed: list,
+                          local_account, side: int, tick: int) -> list[dict]:
+        """Match our taps to their queue entries, time the round trip, and drop plays that
+        have executed (issue + 21, when the client debits the elixir) or never arrived.
+
+        A command the 100 ms queue sampler never caught still shows up in the executed list,
+        so that is searched too; otherwise its elixir would stay reserved until the timeout."""
+        claimed = {(f.get('issue_tick'), f.get('seq')) for f in in_flight}
+        own_executed = [dict(p, account_lo=local_account) for p in executed
+                        if p.get('side') == side and p.get('kind', 'card') == 'card']
+        for flight in in_flight:
+            if flight.get('issue_tick') is not None:
+                continue
+            for entry in [*queue, *own_executed]:
+                key = (entry.get('issue_tick'), entry.get('seq'))
+                if (key in claimed or entry.get('card_id') != flight['card']
+                        or not isinstance(entry.get('issue_tick'), int)
+                        or entry['issue_tick'] < flight['tap_tick'] - 2
+                        or (local_account is not None
+                            and entry.get('account_lo') != local_account)):
+                    continue
+                flight['issue_tick'], flight['seq'] = key
+                claimed.add(key)
+                self.rtt.append(max(0, entry['issue_tick'] - flight['tap_tick']))
+                del self.rtt[:-50]
+                break
+        now = time.time()
+        return [f for f in in_flight
+                if (f.get('issue_tick') is None and now - f['tap_time'] <= IN_FLIGHT_SECONDS)
+                or (f.get('issue_tick') is not None
+                    and tick < f['issue_tick'] + COMMAND_AGE_TICKS)]
+
+    def _try_play(self, move: dict, me: dict, deck: list, reserved: float,
+                  in_flight: list[dict], accounts, side: int, frame: dict) -> bool:
+        """Tap one play. True when it is done with (tapped, or refused for good); False when it
+        should wait for elixir.
+
+        The card is found by identity in the hand as memory holds it now, not by the policy's
+        slot: under a lead the policy sees the hand after our in-flight plays have cycled, and
+        a slot index from that hand would tap whatever the screen still shows there.
+        """
+        card = move['card']
+        name = V.CARDS.get(card, {}).get('name', str(card))
+        if any(f['card'] == card for f in in_flight):
+            return True        # already on its way; the policy's state includes it
+        positions = [pos for pos, index in enumerate(me['hand_deck_indices'])
+                     if 0 <= index < len(deck) and deck[index] == card]
+        if not positions:
+            return False       # not in the hand yet (the lead showed it cycling in)
+        position = positions[0]
+        cost = float(V.CARDS.get(card, {}).get('elixir') or 0)
+        if me['elixir_raw'] / 10000.0 - reserved < cost - 1e-6:
+            return False       # the client cannot place it yet
+        cell = move['row'] * X_TILES + move['column']
+        allowed, reason = scope_gate.check(accounts, side)
+        if reason != self.gate:
+            self.gate, self.gate_ok = reason, allowed
+            self.note(('scope: ' if allowed else 'SCOPE BLOCK: ') + reason)
+        if not self.armed or not allowed:
+            why = ' [dry run]' if not self.armed else ' [BLOCKED by scope gate]'
+            self.note(f't={frame["game_tick"]/20:5.1f}s  would play {name} '
+                      f'slot {position} at row {move["row"]} col {move["column"]}{why}')
+            return True
+        try:
+            send_card_taps(ADB, SERIAL, self.layout, position, cell, side=side)
+        except Exception as error:  # noqa: BLE001
+            self.note(f'tap failed: {error}')
+            return True
+        in_flight.append({'slot': me['hand_deck_indices'][position], 'card': card,
+                          'cost': cost, 'tap_tick': int(frame['game_tick']),
+                          'tap_time': time.time()})
+        self.plays += 1
+        self.last_play = f'{name} at row {move["row"]} col {move["column"]}'
+        waited = time.time() - move['since']
+        self.note(f't={frame["game_tick"]/20:5.1f}s  {name:<14} row {move["row"]:2} '
+                  f'col {move["column"]:2}' + (f'  (waited {waited:.1f}s for elixir)'
+                                               if waited > 0.15 else ''))
+        return True
+
+    def _check_deck_fit(self, deck, forms) -> None:
+        """The Hog specialists were trained on one deck with fixed forms. Say so when the
+        deck differs: out of that deck they are a different, weaker model."""
+        if self.model not in ('fl:hog1', 'fl:hog2'):
+            return
+        flags = {int(c): int(f or 0) for c, f in zip(deck or [], forms or [0] * 8)}
+        missing = [V.CARDS.get(c, {}).get('name', c) for c in HOG26_DECK if c not in flags]
+        wrong_form = [V.CARDS.get(c, {}).get('name', c) for c, form in HOG26_DECK.items()
+                      if c in flags and form and not flags[c] & form]
+        if missing or wrong_form:
+            self.note('DECK MISMATCH for the Hog specialist - trained on Hog, Hero Musketeer, '
+                      'Evo Cannon, Fireball, Log, Evo Skeletons, Ice Golem, Ice Spirit. '
+                      + (f'missing: {", ".join(map(str, missing))}. ' if missing else '')
+                      + (f'form not equipped: {", ".join(map(str, wrong_form))}.'
+                         if wrong_form else ''))
+        else:
+            self.note('deck matches the Hog specialist training deck')
 
     def _hand_position(self, hand_indices: list[int], deck_slot: int) -> int | None:
         return hand_indices.index(deck_slot) if deck_slot in hand_indices else None
@@ -134,7 +264,9 @@ class Bot:
         pending_battle, pending_since = None, 0.0
         episode_decks: dict = {}
         last_turn = -10 ** 9
-        in_flight = None
+        in_flight: list[dict] = []
+        deferred: list[dict] = []
+        lead = 0
         while self.running:
             with V.LOCK:
                 frame, health = V.STATE['frame'], V.STATE['health']
@@ -213,19 +345,40 @@ class Bot:
                 episode_decks = {side: tuple(our_deck),
                                  1 - side: tuple(opponent) if opponent_known else ()}
                 battle = frame['chain']['battle']
-                last_turn, in_flight = -10 ** 9, None
+                last_turn, in_flight, deferred = -10 ** 9, [], []
+                # Fixed for the whole battle: the tracker refuses a clock that runs backwards.
+                lead = self.lead_ticks() if self.compensate else 0
                 self.plays = 0
                 self.note(f'new battle, you are side {side}; '
-                          f'warm-up until tick {runner.first_decision_tick}')
+                          f'warm-up until tick {runner.first_decision_tick}; '
+                          + (f'latency lead {lead} ticks ({lead * 50} ms, '
+                             f'{len(self.rtt)} measured taps)' if lead
+                             else 'latency compensation OFF'))
+                self._check_deck_fit(our_deck, me.get('deck_form_flags'))
+
+            local_account = next((a['lo'] for a in (accounts or [])
+                                  if a and a.get('side') == side), None)
+            deck = me['deck_card_ids']
+            with V.LOCK:
+                executed = list(V.STATE['plays'])
+            in_flight = self._settle_in_flight(in_flight, queue, executed, local_account,
+                                               side, frame['game_tick'])
+            reserved = sum(f['cost'] for f in in_flight)
+
+            # A tap the policy chose against elixir that only exists once the lead has passed
+            # waits here until the client can actually place it.
+            deferred = [d for d in deferred if time.time() - d['since'] <= DEFER_SECONDS]
+            for move in list(deferred):
+                if self._try_play(move, me, deck, reserved, in_flight, accounts, side, frame):
+                    deferred.remove(move)
+                    reserved = sum(f['cost'] for f in in_flight)
 
             # One turn per five-tick window, and never a skipped one. decide() advances a
             # recurrent state and feeds its own chosen action into the next turn, so the
             # schedule belongs to the policy: our tap bookkeeping may suppress a tap, but it
             # must not suppress a turn. Ticks before their first decision tick are warm-up,
             # fed to the tensorizer without acting, as PolicyService's 'observe' op does.
-            local_account = next((a['lo'] for a in (accounts or [])
-                                  if a and a.get('side') == side), None)
-            turn = runner.turn_tick(frame['game_tick'])
+            turn = runner.turn_tick(frame['game_tick'] + lead)
             if turn <= last_turn:
                 time.sleep(0.02)
                 continue
@@ -235,15 +388,17 @@ class Bot:
             try:
                 seen = {index: list(cards) for index, cards
                         in enumerate(revealed or [[], []])}
-                reserved = 0.0
-                if in_flight and time.time() - in_flight[1] <= 2.5:
-                    reserved = float(in_flight[2])
                 with V.LOCK:
                     plays = list(V.STATE['plays'])
-                observation, fl_battle = FLO.build(frame, health, episode_id=str(battle),
-                                                   battle=fl_battle, revealed=seen,
-                                                   reserved=reserved, plays=plays,
-                                                   decks=episode_decks)
+                if lead:
+                    # Commands already queued execute within the lead: in the future the
+                    # policy is shown, they have happened (both sides).
+                    plays += V.queued_plays(queue, accounts, frame['game_tick'] + lead)
+                observation, fl_battle = FLO.build(
+                    frame, health, episode_id=str(battle), battle=fl_battle, revealed=seen,
+                    reserved=reserved, plays=plays, decks=episode_decks, lead_ticks=lead,
+                    in_flight=[f['slot'] for f in in_flight],
+                    hand_forms=runner.hand_forms(deck, me.get('deck_form_flags')))
                 for side_card in sorted(fl_battle.untracked_plays - reported_plays):
                     reported_plays.add(side_card)
                     who = 'opponent' if side_card[0] != side else 'own'
@@ -268,54 +423,25 @@ class Bot:
                 self.note(f'missed {skipped} decision turn(s) at tick {turn} - '
                           f'the policy state is behind the game')
             self.status = (f'{self.model} playing - {me["elixir_raw"]/10000:.1f} elixir - '
-                           f'{self.plays} plays')
+                           f'{self.plays} plays - lead {lead} ticks')
 
-            # A turn can carry two plays. Take them in the order the policy asked for.
-            for kind, hand_slot, card_id, target_grid, _offset in moves:
+            # A turn can carry two plays. Take them in the order the policy asked for; the
+            # second is a real play (Hog + Ice Spirit is one decision), not a duplicate.
+            for kind, _hand_slot, card_id, target_grid, _offset in moves:
                 if str(getattr(kind, 'value', kind)) != 'play_card' or target_grid is None:
                     continue
-                name = V.CARDS.get(card_id, {}).get('name', str(card_id))
                 # FirstLight decodes to a NATIVE grid point [x, y] (perspective already
                 # undone), so x is the column and y is the row. Reading it as (row, col)
                 # transposed every placement the model asked for.
                 column, row = int(target_grid[0]), int(target_grid[1])
-                cell = row * X_TILES + column
-                position = hand_slot if isinstance(hand_slot, int) else None
-                if position is None or not 0 <= position < 4 or not 0 <= cell < 576:
+                if not (0 <= column < X_TILES and 0 <= row < Y_TILES):
                     continue
-
-                allowed, reason = scope_gate.check(accounts, side)
-                if reason != self.gate:
-                    self.gate, self.gate_ok = reason, allowed
-                    self.note(('scope: ' if allowed else 'SCOPE BLOCK: ') + reason)
-                if not self.armed or not allowed:
-                    why = ' [dry run]' if not self.armed else ' [BLOCKED by scope gate]'
-                    self.note(f't={frame["game_tick"]/20:5.1f}s  would play {name} '
-                              f'slot {position} at row {row} col {column}{why}')
-                    continue
-                # The client needs ~20 ticks to accept a play. Suppress a duplicate tap for
-                # the same slot while one is outstanding -- but the turn above was still
-                # taken, so the policy's state stays aligned.
-                if in_flight:
-                    slot, since = in_flight[0], in_flight[1]
-                    if slot in me['hand_deck_indices'] and time.time() - since <= 2.5:
-                        continue
-                    in_flight = None
-                ours_pending = [e for e in queue if e['card_id'] > 0 and
-                                (e['account_lo'] == local_account
-                                 if local_account is not None else e['account_lo'] >= 0)]
-                if ours_pending:
-                    continue
-                try:
-                    send_card_taps(ADB, SERIAL, self.layout, position, cell, side=side)
-                except Exception as error:  # noqa: BLE001
-                    self.note(f'tap failed: {error}')
-                    continue
-                in_flight = (me['hand_deck_indices'][position], time.time(),
-                             float(V.CARDS.get(card_id, {}).get('elixir') or 0))
-                self.plays += 1
-                self.last_play = f'{name} at row {row} col {column}'
-                self.note(f't={frame["game_tick"]/20:5.1f}s  {name:<14} row {row:2} col {column:2}')
+                move = {'card': int(card_id), 'row': row, 'column': column,
+                        'since': time.time()}
+                if not self._try_play(move, me, deck, reserved, in_flight, accounts, side,
+                                      frame):
+                    deferred = [d for d in deferred if d['card'] != move['card']] + [move]
+                reserved = sum(f['cost'] for f in in_flight)
         runner.end_battle()
         self.status = 'off'
 
@@ -500,7 +626,8 @@ class Handler(BaseHTTPRequestHandler):
             action = (query.get('action') or [''])[0]
             if action == 'start':
                 result = BOT.start((query.get('model') or ['100k'])[0],
-                                   (query.get('armed') or ['0'])[0] == '1')
+                                   (query.get('armed') or ['0'])[0] == '1',
+                                   (query.get('lead') or ['1'])[0] == '1')
             elif action == 'stop':
                 result = BOT.stop()
             else:
@@ -543,6 +670,9 @@ PAGE = V.PAGE.replace('</div>\n</div>\n<script>', """</div>
     <label style="display:flex;gap:8px;align-items:center;margin:10px 0">
       <input type="checkbox" id="armed"><span>arm taps (Training Camp / own account only)</span>
     </label>
+    <label style="display:flex;gap:8px;align-items:center;margin:0 0 10px">
+      <input type="checkbox" id="lead" checked><span>latency compensation (FirstLight models)</span>
+    </label>
     <div style="display:flex;gap:8px">
       <button id="botStart" style="flex:1;padding:8px;border-radius:8px;border:1px solid var(--line);
         background:#2b3446;color:var(--ink);cursor:pointer">start</button>
@@ -574,7 +704,8 @@ function renderBot(b) {
   document.getElementById('botLog').textContent = (b.log || []).join('\\n');
 }
 document.getElementById('botStart').onclick = () =>
-  fetch(`/api/bot?action=start&model=${botModel}&armed=${document.getElementById('armed').checked?1:0}`);
+  fetch(`/api/bot?action=start&model=${botModel}&armed=${document.getElementById('armed').checked?1:0}`
+        + `&lead=${document.getElementById('lead').checked?1:0}`);
 document.getElementById('botStop').onclick = () => fetch('/api/bot?action=stop');
 """).replace("setInterval(tick, 150); tick();",
              "setInterval(tick, 150); tick();").replace(

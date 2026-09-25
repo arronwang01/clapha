@@ -20,10 +20,12 @@ sees are in the frame it was trained in.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
-FIRSTLIGHT = Path.home() / 'Documents/GitHub/FirstLight_CR'
+FIRSTLIGHT = Path(os.environ.get('FIRSTLIGHT_ROOT')
+                  or Path.home() / 'Documents/GitHub/FirstLight_CR')
 if str(FIRSTLIGHT) not in sys.path:
     sys.path.insert(0, str(FIRSTLIGHT))
 
@@ -44,6 +46,8 @@ TOWERS = ((9000, 3000, 0, 'king'),
 TOWER_PRINCESS = 159_000_000
 
 TICK_MS = 50
+# Native arena extent (18 x 32 tiles of 1000 units).
+ARENA_X, ARENA_Y = 18000.0, 32000.0
 
 _TIMELINE = None
 
@@ -368,13 +372,16 @@ def placement_context(tower_states, frame: dict, owner: int):
 
 
 def action_mask(frame: dict, side: int, elixir: float, reserved: float = 0.0,
-                tower_states=()):
+                tower_states=(), hand_forms: dict | None = None):
     """Which hand slots are playable, and where -- built the way BattleEnvV1.action_mask does.
 
     reserved is elixir already committed to a play the server has not acknowledged yet. The
     client does not debit it for ~20 ticks, so without holding it back a second play can be
     chosen against elixir that is already spent. reasons['reserved_elixir'] is their own field
     for this and is read straight into the scalar features.
+
+    hand_forms maps card id -> the form it would be played in (0 normal, 1 evolution, 2 hero).
+    The entry's form_code must agree with hand_runtime_by_slot, or the tensorizer raises.
     """
     from native_runner.contracts import ActionKind, ActionMaskV1
     from native_runner.training.v4.factory import production_semantic_bundle
@@ -403,10 +410,11 @@ def action_mask(frame: dict, side: int, elixir: float, reserved: float = 0.0,
                 reasons[str(position)] = 'mirror_unsupported'
                 continue
             cost = float(spec.elixir_cost)
+            form = int((hand_forms or {}).get(card_id, 0))
             base = _placement_entry(card_id, side, lanes, towers, buildings, unknown)
             entry = {**base, 'visible_card_id': card_id, 'effective_card_id': card_id,
                      'native_effective_card_id': card_id, 'effective_cost': cost,
-                     'form_code': 0, 'native_form_code': 0,
+                     'form_code': form, 'native_form_code': form,
                      'source_native_hand_slot': position}
             masks[str(position)] = entry
             if cost > available:
@@ -552,9 +560,17 @@ def play_events(plays, tick: int, decks: dict | None, battle):
 
     specs = production_semantic_bundle().card_specs
     events = []
+    seen_commands = set()
     for play in plays or ():
         if not tick - EVENT_WINDOW_TICKS <= play['tick'] <= tick:
             continue
+        # With a lead, a command still in the queue is passed in as a play at its execution
+        # tick, and later arrives again from the executed list. It is one play.
+        command = (play.get('side'), play.get('issue_tick'), play.get('seq'))
+        if play.get('issue_tick') is not None:
+            if command in seen_commands:
+                continue
+            seen_commands.add(command)
         if play.get('kind', 'card') != 'card':
             continue   # champion ability activations: not a card play (see viewer)
         card_id, side = int(play['card_id']), int(play['side'])
@@ -581,15 +597,65 @@ def play_events(plays, tick: int, decks: dict | None, battle):
     return tuple(events)
 
 
+def advance_own_hand(frame: dict, side: int, played_slots) -> dict:
+    """The frame with our own in-flight plays already taken out of the hand.
+
+    A play leaves the hand the way the game cycles it: the next card (front of the cycle)
+    takes the vacated hand position and the played card goes to the back of the cycle. Only
+    slots still showing in the hand are moved, so a play the reader already reflects is not
+    cycled twice.
+    """
+    me = next((p for p in frame['players'] if p['side'] == side), None)
+    if not me or not played_slots:
+        return frame
+    hand = list(me.get('hand_deck_indices') or [])
+    cycle = list(me.get('cycle_deck_indices') or [])
+    changed = False
+    for slot in played_slots:
+        if slot not in hand or not cycle:
+            continue
+        hand[hand.index(slot)] = cycle.pop(0)
+        cycle.append(slot)
+        changed = True
+    if not changed:
+        return frame
+    advanced = dict(me, hand_deck_indices=hand, cycle_deck_indices=cycle,
+                    next_deck_index=cycle[0] if cycle else -1)
+    return dict(frame, players=[advanced if p is me else p for p in frame['players']])
+
+
+# Units whose position is extrapolated under a lead. Buildings and towers do not move, and a
+# spell/area effect's velocity is not a trajectory.
+_MOVING_KINDS = frozenset({'troop', 'hero', 'character'})
+
+
 def build(frame: dict, health: dict, episode_id: str, deduced: dict | None = None,
           revealed: dict | None = None, battle: Battle | None = None,
-          reserved: float = 0.0, plays=None, decks: dict | None = None):
+          reserved: float = 0.0, plays=None, decks: dict | None = None,
+          lead_ticks: int = 0, in_flight=(), hand_forms: dict | None = None):
     """One ObservationV1 for the local actor, FAIR tier.
 
     Pass the same Battle for every frame of a battle: velocity, entity identity, age, the
     clock and the crown count all need continuity, and without it the policy sees a board
     where nothing moves, nothing has history and no tower has ever fallen.
+
+    lead_ticks shifts the observation that far into the future. FirstLight trained in a
+    lockstep engine where a play executes one tick after the decision (offline_agent
+    backdates the command age; PolicySessionV4 hard-codes base_latency_ticks = 1). On the live
+    server a tap executes ~21 ticks after it reaches the queue, plus the round trip, so every
+    decision lands on a board ~1.2 s older than the one the policy chose for. With a lead the
+    policy is shown the board as it will be when its play lands: the clock and elixir are
+    advanced, moving units are extrapolated along their velocity, queued commands that will
+    have executed by then are passed in `plays` as executed, and our own in-flight plays
+    (`in_flight`, deck slots) are cycled out of the hand with their cost already spent -- so
+    `reserved` is folded into the elixir rather than reported separately. The lead must stay
+    fixed for a battle: the tracker refuses a clock that runs backwards.
+
+    hand_forms: card id -> form for our hand (see action_mask).
     """
+    lead = max(0, int(lead_ticks))
+    if lead and in_flight:
+        frame = advance_own_hand(frame, health.get('local_side'), in_flight)
     from native_runner.contracts import (ENTITY_RUNTIME_SEMANTIC_FIELDS,
                                          TOWER_RUNTIME_SEMANTIC_FIELDS,
                                          CausalGroupKind, CausalGroupRefV1, EntityStateV1,
@@ -600,7 +666,8 @@ def build(frame: dict, health: dict, episode_id: str, deduced: dict | None = Non
     side = health.get('local_side')
     if battle is None or battle.episode_id != episode_id:
         battle = Battle(episode_id)
-    tick = battle.tick(frame['game_tick'])
+    raw_tick = battle.tick(frame['game_tick'])
+    tick = raw_tick + lead
     live = {(e['x'], e['y']): e for e in frame['entities'] if e['card_id'] == -1}
 
     phase, multiplier = timeline().phase(tick)
@@ -681,12 +748,17 @@ def build(frame: dict, health: dict, episode_id: str, deduced: dict | None = Non
                   else CausalGroupKind.DEPLOYMENT),
             handle=f"{e['side']}:{e['card_id']}:{birth}",
             source_card_id=int(e['card_id']))
+        velocity = battle.velocity(address, tick, e['x'], e['y'])
+        position = (float(e['x']), float(e['y']))
+        if lead and velocity is not None and kind in _MOVING_KINDS:
+            position = (min(ARENA_X, max(0.0, position[0] + velocity[0] * lead)),
+                        min(ARENA_Y, max(0.0, position[1] + velocity[1] * lead)))
         entities.append(EntityStateV1(
             native_data_global_id=global_id,
             entity_id=entity_id, owner=e['side'], card_id=e['card_id'],
             entity_kind=kind,
-            position=(float(e['x']), float(e['y'])),
-            velocity=battle.velocity(address, tick, e['x'], e['y']),
+            position=position,
+            velocity=velocity,
             hitpoints=float(e['hp']), max_hitpoints=float(e['max_hp'] or 1),
             age_ms=age_ms, visible=True, causal_group=group,
             visible_target=target_id, attack_state=attack,
@@ -709,6 +781,14 @@ def build(frame: dict, health: dict, episode_id: str, deduced: dict | None = Non
 
     own_elixir = next((p['elixir_raw'] / 10000.0 for p in frame['players']
                        if p['side'] == side), 0.0)
+    if lead:
+        # Elixir as it will be when our play lands: accrued over the lead on their own
+        # schedule (1x/2x/3x), capped at ten, less what our in-flight plays cost -- they have
+        # executed by then, so nothing is left in reserve.
+        from native_runner.training.tracking import _generated_elixir
+        own_elixir = max(0.0, min(10.0, own_elixir + _generated_elixir(raw_tick, tick))
+                         - max(0.0, reserved))
+        reserved = 0.0
     players = []
     for p in frame['players']:
         deck = p.get('deck_card_ids') or []
@@ -731,9 +811,11 @@ def build(frame: dict, health: dict, episode_id: str, deduced: dict | None = Non
             # (FORM_NORMAL = 0; evolutions would carry their own code, which we do not read).
             slot_by_card = {str(deck[i]): pos for pos, i in enumerate(hand_slots)
                             if deck and 0 <= i < len(deck)}
-            runtime_by_slot = {str(pos): {'form_code': 0} for pos in range(len(hand_slots))}
+            runtime_by_slot = {str(pos): {'form_code': int((hand_forms or {}).get(
+                                   deck[i] if deck and 0 <= i < len(deck) else -1, 0))}
+                               for pos, i in enumerate(hand_slots)}
             players.append(PlayerStateV1(
-                elixir_exact=p['elixir_raw'] / 10000.0,
+                elixir_exact=own_elixir,
                 hand=hand, next_card=nxt, deck=tuple(deck), cycle=cycle,
                 private_state_visible=True,
                 metadata={'hand_slot_by_card': slot_by_card,
@@ -753,7 +835,7 @@ def build(frame: dict, health: dict, episode_id: str, deduced: dict | None = Non
         phase=phase,
         players=tuple(players), towers=tuple(towers), entities=tuple(entities),
         events=play_events(plays, tick, decks, battle),
-        action_mask=action_mask(frame, side, own_elixir, reserved, towers),
+        action_mask=action_mask(frame, side, own_elixir, reserved, towers, hand_forms),
         episode_id=episode_id,
         ruleset_id=ruleset_id())
     return observation, battle
