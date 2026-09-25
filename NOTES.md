@@ -960,3 +960,64 @@ What breaks, and where it shows:
 * FirstLight's catalog is frozen at 15.535: `drift_check.py` lists cards/forms it cannot
   represent; the console logs refusals and unit fallbacks per match.
 * Balance changes: invisible to the frozen checkpoints; only retraining fixes them.
+
+## Device results, 2026-09-25 (runtime_probe, screenshot, queue_lead)
+
+**Ability controllers: same offsets as 15.535.** player+0x3a0 and +0x3a8 (slots 1, 2), found
+by the back-pointer (+0x20 == player). Selected character (+0x90 -> +0x40) matched FirstLight's
+archetype ids exactly: 130283371 = Hero Musketeer, 2979504115 (printed signed, -1315463181) =
+Hero Ice Golem. Observed: charges (+0x80) -1 (no hero bound) / 1 (unused) / 0 (used); configured
+cooldown 0 (hero abilities are single-use, per the user: usable once, when the hero is on the
+board and elixir suffices); button state (+0x98) takes 0, 1, 2, 6, 9 -- meaning still to be
+mapped (log it next to "hero on board / enough elixir / used"). action data id 1171272209.
+**Evolution progress: player+0x2e8, unchanged.** One int per deck slot. Evo Skeletons went
+0 -> 1 -> 2 -> 0: two normal plays, then the evolved play resets it. So the requirement is 2 --
+FirstLight's number is right for this build, and our catalog's `evolution_cycles` (3) counts
+the evolved play too. Keep the tracker on FirstLight's counts; better, read this vector.
+**Ability buttons** (screenshot, 1440x2560 device): one hero -> the button is at the LEFT;
+two heroes -> left and right. Measured centres ~(140, 1955) and ~(1300, 1955), just above the
+hand. (User setting decides placement with two heroes; default is both sides.)
+**Command lead** (queue_lead, 107 commands): opponent commands are in our queue a median
+14 ticks (700 ms, p10 11, p90 18) before they execute; ours 13. Issue -> our queue ~7-8 ticks.
+
+## HANDOFF (cloud session -> local session, 2026-09-25)
+
+Branch `main-8x1wxo`, everything pushed. FirstLight source is at
+~/Documents/GitHub/FirstLight_CR (override: FIRSTLIGHT_ROOT); native_core comes from the
+cr-native-sandbox checkout the profile already uses.
+
+Offline checks (all passing at handoff):
+    python3 mac012/test_forms.py fl:hog2 fl:il
+    python3 mac012/test_opponent_registry.py fl:hog2
+    python3 mac012/test_firstlight_churn.py
+    python3 mac012/drift_check.py --deck <ids>
+
+Done this session: side-1 placement mirroring fixed (verified live: 0 tiles off), resident
+fast_tap (place gap 8 / hold 16), 50 ms reader/queue polling, per-play latency + placement
+log, both plays of a turn tapped, evo/hero hand forms, opponent deck learned card by card
+(no silent drops), evolution units visible, form ids normalised, drift/queue-lead/runtime
+probes. The latency extrapolation was tried and REMOVED at the user's request -- do not
+reintroduce predicted board state.
+
+Next, in order:
+1. **Hero ability (implementation, not training).** Add to live_sampler_tbi.c per player: the
+   two controllers at +0x3a0/+0x3a8 (charges +0x80, button +0x98, character +0x90->+0x40) and
+   the progress vector at +0x2e8. Map button states. Then in firstlight_obs: own
+   `ability_runtime_states` (ability_id from the catalog, elixir_cost, charges, available,
+   attributes.controller_slot, attributes.source_card_id, source_entity = the hero unit's
+   entity id) and `action_mask.ability_sources` + kinds[activate_ability]; see FirstLight
+   training/v4/native_actions.ability_runtime_contract for exactly what is required. Console:
+   stop skipping ACTIVATE_ABILITY; tap the left button (right = second hero's slot 2).
+2. **Evolution state from memory** (+0x2e8) instead of the tracker derivation; fill
+   `evolution_runtime_states`.
+3. **Opponent deck memory** (user's list): remember revealed cards per opponent account
+   across matches; optional RoyaleAPI lookup by player tag and popular-deck completion as a
+   *prior* (not ground truth); evolution cycles tracked for the opponent too.
+4. **Pending commands** (both sides, ~700 ms of warning): a separate input type from real
+   troops, per the user. Needs a model input -> part of retraining, not the current
+   checkpoints.
+5. Retraining plan: command age 21 + measured round trip in the engine, IL aligned to the
+   human's decision (execute - 21), CLIENT-tier inputs (pending commands, exact own ability
+   and evolution state), oracle-tier critic.
+Reader already has attack wind-up (atk_stage / atk_timeline / atk_load) and movement charge
+progress (+0x1e0, Prince / Dark Prince charge) -- Sparky's charge is its attack load.
