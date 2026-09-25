@@ -19,7 +19,7 @@ struct Snapshot {
         let two = DeviceModel(id: 2, title: "Device 2 · second account", port: 8778)
         two.state = load(args[2]); two.reachable = true; two.logs.lines = two.state!.bot.log; two.board.state = two.state; two.refreshSummary()
         let view = ContentView(device1: one, device2: two, live: false)
-            .frame(width: 1400, height: 900)
+            .frame(width: 1000, height: 760)
             .background(Color(nsColor: .windowBackgroundColor))
         let renderer = ImageRenderer(content: view)
         renderer.scale = 1

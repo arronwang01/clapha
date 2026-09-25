@@ -17,44 +17,41 @@ struct ContentView: View {
     @StateObject private var tasks = TaskRunner(root: claphaRoot())
     @StateObject private var device1: DeviceModel
     @StateObject private var device2: DeviceModel
-    @State private var showTasks = true
+    @State private var page = 1
+    @State private var showTools = false
     private let live: Bool
 
     @MainActor
     init(device1: DeviceModel? = nil, device2: DeviceModel? = nil, live: Bool = true) {
-        _device1 = StateObject(wrappedValue: device1 ?? DeviceModel(id: 1, title: "Device 1 · main account", port: 8777))
-        _device2 = StateObject(wrappedValue: device2 ?? DeviceModel(id: 2, title: "Device 2 · second account", port: 8778))
+        _device1 = StateObject(wrappedValue: device1 ?? DeviceModel(id: 1, title: "Main account", port: 8777))
+        _device2 = StateObject(wrappedValue: device2 ?? DeviceModel(id: 2, title: "Second account", port: 8778))
         self.live = live
     }
 
     var body: some View {
         VStack(spacing: 0) {
-            TopBar(tasks: tasks, devices: [device1, device2], showTasks: $showTasks)
+            TopBar(tasks: tasks, page: $page, device1: device1, device2: device2, showTools: $showTools)
             Divider()
             if !device1.reachable && !device2.reachable {
                 HStack(spacing: 10) {
                     Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
                     Text(tasks.running ? "Starting… (emulators take ~40 s the first time)"
-                                       : "The engines are not running. Start everything brings up the emulators, readers and both devices.")
+                                       : "Nothing is running yet. Press Start to bring up the emulators and the bot.")
                     Spacer()
-                    if !tasks.running {
-                        Button("Start everything") {
-                            tasks.run("Start emulators and engines", "./start-consoles.sh")
-                        }.buttonStyle(.borderedProminent)
-                    }
                 }
                 .padding(10)
                 .background(Color.orange.opacity(0.12))
             }
-            HStack(alignment: .top, spacing: 0) {
-                DevicePanel(device: device1)
-                Divider()
-                DevicePanel(device: device2)
+            // One device per page: the tab in the top bar picks which.
+            if page == 1 {
+                DevicePanel(device: device1).id(1)
+            } else {
+                DevicePanel(device: device2).id(2)
             }
-            if showTasks {
+            if showTools {
                 Divider()
                 TasksPanel(tasks: tasks)
-                    .frame(height: 230)
+                    .frame(height: 340)
             }
         }
         .onAppear {
@@ -66,33 +63,47 @@ struct ContentView: View {
     }
 }
 
-// MARK: - Top bar: bring everything up / down, run checks
+// MARK: - Top bar: which device, Start, and everything else under More
 
 struct TopBar: View {
     @ObservedObject var tasks: TaskRunner
-    let devices: [DeviceModel]
-    @Binding var showTasks: Bool
+    @Binding var page: Int
+    @ObservedObject var device1: DeviceModel
+    @ObservedObject var device2: DeviceModel
+    @Binding var showTools: Bool
+
+    private func tab(_ device: DeviceModel) -> String {
+        device.summary.inBattle ? "\(device.title) · in battle" : device.title
+    }
 
     var body: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 12) {
             Text("Clapha").font(.title2.weight(.semibold))
-            Text("live reader · FirstLight bot").foregroundStyle(.secondary)
+            Picker("Device", selection: $page) {
+                Text(tab(device1)).tag(1)
+                Text(tab(device2)).tag(2)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(maxWidth: 380)
             Spacer()
             Button {
-                tasks.run("Start emulators and engines", "./start-consoles.sh")
-            } label: { Label("Start everything", systemImage: "play.circle.fill") }
+                tasks.run("Start emulators and bot", "./start-consoles.sh")
+            } label: { Label("Start", systemImage: "play.circle.fill") }
                 .buttonStyle(.borderedProminent)
                 .disabled(tasks.running)
-            Button {
-                tasks.run("Stop engines", "pkill -f mac012/console.py; sleep 1; echo engines stopped")
-            } label: { Label("Stop engines", systemImage: "stop.circle") }
-                .disabled(tasks.running)
-            Button {
-                tasks.run("Check devices", "CR_MUMU_SERIAL=127.0.0.1:26624 ./py mac012/preflight.py 127.0.0.1:26624 127.0.0.1:26656")
-            } label: { Label("Check devices", systemImage: "checkmark.shield") }
-                .disabled(tasks.running)
-            Toggle(isOn: $showTasks) { Label("Tasks", systemImage: "terminal") }
-                .toggleStyle(.button)
+                .help("Starts both emulators and the bot engines. Use after a reboot or an update, between matches.")
+            Menu {
+                Button("Stop the bot engines") {
+                    tasks.run("Stop engines", "pkill -f mac012/console.py; sleep 1; echo engines stopped")
+                }
+                Button("Check devices") {
+                    tasks.run("Check devices", "CR_MUMU_SERIAL=127.0.0.1:26624 ./py mac012/preflight.py 127.0.0.1:26624 127.0.0.1:26656")
+                }
+                Divider()
+                Toggle("Show tools and output", isOn: $showTools)
+            } label: { Label("More", systemImage: "ellipsis.circle") }
+                .fixedSize()
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
@@ -104,17 +115,18 @@ struct TopBar: View {
 struct DevicePanel: View {
     @ObservedObject var device: DeviceModel
     @State private var chosenModel: String = "fl:hog2"
+    @State private var showAdvanced = false
 
     private var sum: DeviceSummary { device.summary }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             header
-            HStack(alignment: .top, spacing: 12) {
+            HStack(alignment: .top, spacing: 16) {
                 BoardView(board: device.board)
-                    .frame(width: 250, height: 444)
+                    .frame(width: 300, height: 533)
                     .clipShape(RoundedRectangle(cornerRadius: 10))
-                VStack(alignment: .leading, spacing: 10) {
+                VStack(alignment: .leading, spacing: 12) {
                     controls
                     HandView(board: device.board)
                     LogView(logs: device.logs)
@@ -122,7 +134,7 @@ struct DevicePanel: View {
             }
         }
         .padding(14)
-        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .onAppear { if let m = sum.model { chosenModel = m } }
         .onChange(of: sum.model) { _, new in if let new, sum.running { chosenModel = new } }
     }
@@ -130,7 +142,6 @@ struct DevicePanel: View {
     private var header: some View {
         HStack(spacing: 8) {
             Text(device.title).font(.headline)
-            Text(sum.serial ?? "port \(device.port)").font(.caption).foregroundStyle(.secondary)
             Spacer()
             StatusChip(text: readerText, color: readerColor)
             StatusChip(text: battleText, color: battleColor)
@@ -138,9 +149,9 @@ struct DevicePanel: View {
     }
 
     private var readerText: String {
-        if !sum.reachable { return "engine not running" }
-        if let err = sum.readerError, !err.isEmpty { return "reader: \(err.prefix(40))" }
-        return "reader live"
+        if !sum.reachable { return "not running" }
+        if let err = sum.readerError, !err.isEmpty { return "can't read the game: \(err.prefix(40))" }
+        return "reading the game"
     }
     private var readerColor: Color {
         if !sum.reachable { return .gray }
@@ -166,10 +177,13 @@ struct DevicePanel: View {
             }
             Text(modeHelp).font(.caption).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            DecodingSwitch(value: sum.decoding, used: sum.decodingUsed, enabled: sum.reachable) { value in
-                Task { await device.setDecoding(value) }
+            Picker("Model", selection: $chosenModel) {
+                ForEach(orderedModels, id: \.self) { id in
+                    Text(modelLabel(id) + (sum.running && sum.model == id ? "  — running" : "")).tag(id)
+                }
             }
-            ModelList(models: orderedModels, chosen: $chosenModel, running: sum.running ? sum.model : nil)
+            .pickerStyle(.menu)
+            .frame(maxWidth: 360)
             if sum.running, let m = sum.model, m != chosenModel {
                 Button("Switch the running model to \(modelLabel(chosenModel))") {
                     Task { await device.setMode(device.mode, model: chosenModel) }
@@ -179,26 +193,35 @@ struct DevicePanel: View {
                 .font(.callout.monospaced())
                 .lineLimit(2)
                 .foregroundStyle(sum.botStatus.contains("FAIL") ? .red : .primary)
-            if let gate = sum.gate, !gate.isEmpty {
-                Label(gate, systemImage: sum.gateOk == true ? "lock.open" : "lock")
-                    .font(.caption).foregroundStyle(sum.gateOk == true ? Color.secondary : Color.red)
+            // The scope gate only needs attention when it blocks.
+            if let gate = sum.gate, !gate.isEmpty, sum.gateOk == false {
+                Label(gate, systemImage: "lock").font(.caption).foregroundStyle(.red)
             }
+            DisclosureGroup("Advanced", isExpanded: $showAdvanced) {
+                DecodingSwitch(value: sum.decoding, used: sum.decodingUsed, enabled: sum.reachable) { value in
+                    Task { await device.setDecoding(value) }
+                }
+                .padding(.top, 4)
+            }
+            .font(.caption)
+            .frame(maxWidth: 360, alignment: .leading)
         }
     }
 
+    /// FirstLight models first; the old simulator models only if nothing else is available.
     private var orderedModels: [String] {
         let all = sum.models.isEmpty ? Array(modelNames.keys) : sum.models
-        return all.sorted { a, b in
-            let fa = a.hasPrefix("fl:"), fb = b.hasPrefix("fl:")
-            return fa != fb ? fa : a < b
-        }
+        let firstLight = all.filter { $0.hasPrefix("fl:") }.sorted()
+        var list = firstLight.isEmpty ? all.sorted() : firstLight
+        if !list.contains(chosenModel) { list.append(chosenModel) }
+        return list
     }
 
     private var modeHelp: String {
         switch device.pendingMode ?? device.mode {
-        case "play": return "Play: the model decides and taps. Only against Training Camp bots or your own accounts (scope gate)."
-        case "watch": return "Watch: the model decides every turn and logs what it would play. No taps."
-        default: return "Off: no model running. Pick a model, then Watch or Play — before the battle starts."
+        case "play": return "Play: the bot plays this account. Training Camp or your own accounts only."
+        case "watch": return "Watch: the bot thinks along and logs what it would play, without touching the game."
+        default: return "Off. Pick a model, then Watch or Play before the battle starts."
         }
     }
 }
@@ -267,35 +290,6 @@ struct DecodingSwitch: View {
             }
         }
         .help("Auto: sampled against you or a bot (FirstLight's human-vs-AI), greedy when both devices run models against each other (FirstLight's AI duel).")
-    }
-}
-
-/// The models as a short list; the dot marks the one the engine is running.
-struct ModelList: View {
-    let models: [String]
-    @Binding var chosen: String
-    let running: String?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text("Model").font(.caption).foregroundStyle(.secondary)
-            ForEach(models, id: \.self) { id in
-                Button { chosen = id } label: {
-                    HStack(spacing: 6) {
-                        Image(systemName: chosen == id ? "largecircle.fill.circle" : "circle")
-                            .foregroundStyle(chosen == id ? Color.accentColor : .secondary)
-                        Text(modelLabel(id)).font(.caption)
-                        if running == id {
-                            Text("running").font(.caption2.weight(.semibold)).foregroundStyle(.green)
-                        }
-                        Spacer()
-                    }
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-            }
-        }
-        .frame(maxWidth: 330)
     }
 }
 
@@ -504,35 +498,50 @@ struct LogView: View {
 struct TasksPanel: View {
     @ObservedObject var tasks: TaskRunner
 
-    private let actions: [(String, String, String)] = [
-        ("Input report (last match)", "doc.text.magnifyingglass",
+    /// (button, icon, what it does in plain words, command)
+    private let actions: [(String, String, String, String)] = [
+        ("Show the bot's log", "text.alignleft",
+         "The last 80 lines of what the bot on the main account did and why.",
+         "tail -80 build/bot_8777.log"),
+        ("What did the bot see last match?", "doc.text.magnifyingglass",
+         "Lists every kind of game information the model gets, and which ones stayed empty.",
          "./py mac012/input_coverage.py | sed -n '/=== match_scalars/,$p' | grep -E '^===|^!!!|^ +[0-9]+ '"),
-        ("Replay last match through the model", "arrow.counterclockwise",
+        ("Re-run last match through the model", "arrow.counterclockwise",
+         "Feeds the recorded match back in, offline, to check nothing errors. Nothing is tapped.",
          "./py mac012/replay_decide.py"),
-        ("Hero / evolution checks", "sparkles", "./py mac012/test_hero_evo.py fl:hog2"),
-        ("All-cards sweep", "square.grid.3x3", "./py mac012/test_all_cards.py fl:il | tail -12"),
-        ("Tap benchmark (Training Camp)", "hand.tap", "./py mac012/tap_bench.py"),
-        ("Bot log (device 1)", "text.alignleft", "tail -80 build/bot_8777.log"),
+        ("Check hero & evolution handling", "sparkles",
+         "Offline test that heroes, abilities and evolved cards reach the model correctly.",
+         "./py mac012/test_hero_evo.py fl:hog2"),
+        ("Check every card can be placed", "square.grid.3x3",
+         "Offline test: every card in the game, both sides, gets a legal placement.",
+         "./py mac012/test_all_cards.py fl:il | tail -12"),
+        ("Measure tap speed", "hand.tap",
+         "Run inside a Training Camp battle: places cheap cards to time how fast taps register.",
+         "./py mac012/tap_bench.py"),
     ]
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
             VStack(alignment: .leading, spacing: 6) {
-                Text("Tasks").font(.headline)
+                Text("Tools").font(.headline)
                 ForEach(actions, id: \.0) { action in
-                    Button {
-                        tasks.run(action.0, action.2)
-                    } label: {
-                        Label(action.0, systemImage: action.1).frame(maxWidth: .infinity, alignment: .leading)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Button {
+                            tasks.run(action.0, action.3)
+                        } label: {
+                            Label(action.0, systemImage: action.1).frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .disabled(tasks.running)
+                        Text(action.2).font(.caption2).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
-                    .disabled(tasks.running)
                 }
                 if tasks.running {
                     Button("Cancel", role: .destructive) { tasks.cancel() }
                 }
                 Spacer()
             }
-            .frame(width: 270)
+            .frame(width: 300)
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
                     Text(tasks.title.isEmpty ? "Output" : tasks.title).font(.headline)

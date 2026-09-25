@@ -9,7 +9,7 @@ struct ClaphaApp: App {
     var body: some Scene {
         WindowGroup("Clapha") {
             ContentView()
-                .frame(minWidth: 1180, minHeight: 820)
+                .frame(minWidth: 820, minHeight: 700)
         }
         .windowResizability(.contentMinSize)
     }
