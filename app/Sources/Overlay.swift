@@ -108,13 +108,12 @@ enum HudArt {
     }
 }
 
-/// Landing warning, as LANDING-HUD-DESIGN.md specifies (sizes there are at 1080 px wide and are
+/// Landing warning for the opponent's plays, as LANDING-HUD-DESIGN.md specifies (sizes there are at 1080 px wide and are
 /// scaled to the overlay's width here). Positions come from the engine's tap geometry.
 struct OverlayView: View {
     @ObservedObject var board: BoardModel
 
     private static let red = Color(red: 235 / 255, green: 70 / 255, blue: 70 / 255)
-    private static let blue = Color(red: 70 / 255, green: 150 / 255, blue: 255 / 255)
     private static let gold = Color(red: 255 / 255, green: 205 / 255, blue: 60 / 255)
 
     var body: some View {
@@ -134,14 +133,27 @@ struct OverlayView: View {
         let pulse = 0.5 + 0.5 * sin(t * 9)
         // Ticks elapsed since this state was read, so the countdown runs between polls.
         let elapsedTicks = max(0, now.timeIntervalSince(board.receivedAt)) * 20
-        for pending in state.pendingCommands ?? [] where pending.kind == "card" {
+        // Opponent only: your own plays are not marked on the game.
+        for pending in state.pendingCommands ?? [] where pending.kind == "card" && pending.side != local {
             guard let sx = pending.screenX, let sy = pending.screenY,
                   let sw = pending.screenW, let sh = pending.screenH, sw > 0, sh > 0 else { continue }
             let p = CGPoint(x: Double(sx) / Double(sw) * size.width,
                             y: Double(sy) / Double(sh) * size.height)
+            // remaining_ticks -1: executed but still on its way (a spell in flight, a Miner
+            // underground, a Barrel in the air) -- no countdown, just "incoming".
+            let incoming = pending.remainingTicks < 0
             let seconds = max(0, Double(pending.remainingTicks) - elapsedTicks) / 20
-            let mine = pending.side == local
-            let colour = mine ? Self.blue : Self.red
+            let colour = Self.red
+
+            // A spell's range, until it hits.
+            if let rx = pending.radiusX, let ry = pending.radiusY, rx > 0, ry > 0 {
+                let ex = Double(rx) / Double(sw) * size.width
+                let ey = Double(ry) / Double(sh) * size.height
+                let area = Path(ellipseIn: CGRect(x: p.x - ex, y: p.y - ey, width: 2 * ex, height: 2 * ey))
+                context.fill(area, with: .color(colour.opacity(0.10 + 0.08 * pulse)))
+                context.stroke(area, with: .color(colour.opacity(0.85)),
+                               style: StrokeStyle(lineWidth: 4 * k, dash: [14 * k, 9 * k]))
+            }
 
             // Ring: flat ellipse (the board is foreshortened), pulsing radius and opacity.
             let r = (95 + 12 * pulse) * k
@@ -150,15 +162,8 @@ struct OverlayView: View {
             context.stroke(ring, with: .color(colour.opacity((150 + 80 * pulse) / 255)),
                            lineWidth: 7 * k)
 
-            let label = String(format: "%.1fs", seconds)
-            if mine {
-                // Own card: ring and a white countdown only, never an icon.
-                context.draw(Text(label).font(.system(size: 30 * k, weight: .heavy))
-                                .foregroundStyle(.white),
-                             at: CGPoint(x: p.x, y: p.y - 30 * k))
-                continue
-            }
-            var top: Double
+            let label = incoming ? "incoming" : String(format: "%.1fs", seconds)
+            let top: Double
             if let figure = HudArt.figure(pending.cardId) {
                 // Unit: its model standing in the ring, feet 22 px below the centre.
                 let rect = CGRect(x: p.x - 75 * k, y: p.y + 22 * k - 150 * k,
@@ -177,7 +182,7 @@ struct OverlayView: View {
             }
             // Gold countdown 44 px above the figure, never above the top 215 px.
             let y = max(215 * k, top - 44 * k)
-            context.draw(Text(label).font(.system(size: 34 * k, weight: .heavy))
+            context.draw(Text(label).font(.system(size: (incoming ? 26 : 34) * k, weight: .heavy))
                             .foregroundStyle(Self.gold),
                          at: CGPoint(x: p.x, y: y))
         }

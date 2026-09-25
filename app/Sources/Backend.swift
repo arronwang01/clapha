@@ -45,6 +45,9 @@ struct PendingInfo: Decodable {
     let screenY: Int?
     let screenW: Int?
     let screenH: Int?
+    /// A spell's range as an ellipse in device pixels (nil for troops).
+    let radiusX: Int?
+    let radiusY: Int?
 }
 
 struct BotInfo: Decodable {

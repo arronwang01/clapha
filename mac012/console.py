@@ -25,6 +25,7 @@ import firstlight_bot as FLB  # noqa: E402
 import firstlight_obs as FLO  # noqa: E402
 import tapper as TAP  # noqa: E402
 import opponent_intel as INTEL  # noqa: E402
+import landing as LANDING  # noqa: E402
 from cycle_tracker import Tracker, opponent_deck  # noqa: E402
 from mac_profile import ADB, SERIAL  # type: ignore  # noqa: E402
 from native_core.mumu_live_actions import ScreenLayout, send_card_taps  # noqa: E402
@@ -71,26 +72,62 @@ def pending_commands(queue: list, accounts, tick: int, local_side=None,
         remaining = issue + COMMAND_AGE_TICKS - int(tick)
         if side is None or remaining < 0:
             continue
-        screen = None
-        if layout is not None and local_side in (0, 1) and kind == 'card' \
-                and entry.get('x') is not None and entry.get('y') is not None:
-            # Device pixels, through the same verified geometry the taps use, so an overlay
-            # on the emulator window lines up with the game.
-            column = min(X_TILES - 1, max(0, int(entry['x']) // 1000))
-            row = min(Y_TILES - 1, max(0, int(entry['y']) // 1000))
-            try:
-                screen = layout.deployment_point(screen_cell(column, row, local_side), local_side)
-            except (ValueError, TypeError):
-                screen = None
-        out.append({'screen_x': screen[0] if screen else None,
-                    'screen_y': screen[1] if screen else None,
-                    'screen_w': getattr(layout, 'width', None),
-                    'screen_h': getattr(layout, 'height', None),
+        out.append({**(overlay_geometry(entry.get('x'), entry.get('y'), card_id, local_side,
+                                        layout) if kind == 'card' else {}),
                     'x': entry.get('x'), 'y': entry.get('y'), 'side': int(side),
                     'card_id': card_id, 'form': form, 'kind': kind,
                     'name': ('ability' if kind == 'ability' else
                              V.CARDS.get(card_id, {}).get('name', str(card_id))),
                     'remaining_ticks': remaining})
+    return out
+
+
+def native_to_screen(x: int, y: int, side: int, layout) -> tuple[float, float]:
+    """Native board point -> device pixel, the continuous form of layout_fix's
+    deployment_point (identical at tile centres, which the taps verify)."""
+    cx, cy = (18000 - x, 32000 - y) if side == 1 else (x, y)
+    fx = 1 - cx / 18000
+    return (layout.arena_left + fx * (layout.arena_right - layout.arena_left),
+            layout.arena_bottom - cy / 32000 * (layout.arena_bottom - layout.arena_top))
+
+
+def overlay_geometry(x, y, card_id: int, local_side, layout) -> dict:
+    """Where a marker goes on the device screen, and a spell's range as an ellipse in pixels."""
+    if layout is None or local_side not in (0, 1) or x is None or y is None:
+        return {}
+    try:
+        sx, sy = native_to_screen(int(x), int(y), local_side, layout)
+    except (AttributeError, TypeError):
+        return {}
+    radius = LANDING.SPELL_RADIUS.get(int(card_id))
+    return {'screen_x': round(sx), 'screen_y': round(sy),
+            'screen_w': layout.width, 'screen_h': layout.height,
+            'radius_x': (round(radius * 1000 / 18000 * (layout.arena_right - layout.arena_left))
+                         if radius else None),
+            'radius_y': (round(radius * 1000 / 32000 * (layout.arena_bottom - layout.arena_top))
+                         if radius else None)}
+
+
+LANDINGS = LANDING.LandingTracker()
+
+
+def landings_for_overlay(frame, health, plays, layout) -> list[dict]:
+    """Opponent spells still flying and Miner / Drill / Barrel still travelling, in the same
+    shape as pending_commands, with remaining_ticks = -1 ('incoming')."""
+    side = health.get('local_side')
+    if side not in (0, 1):
+        return []
+    out = []
+    for landing in LANDINGS.update((frame.get('chain') or {}).get('battle'),
+                                   int(frame.get('game_tick') or 0), 1 - side, plays,
+                                   frame.get('entities')):
+        out.append({**overlay_geometry(landing['x'], landing['y'], landing['card_id'], side,
+                                       layout),
+                    'x': landing['x'], 'y': landing['y'], 'side': 1 - side,
+                    'card_id': landing['card_id'], 'form': landing['form'], 'kind': 'card',
+                    'name': V.CARDS.get(landing['card_id'], {}).get('name',
+                                                                   str(landing['card_id'])),
+                    'remaining_ticks': -1})
     return out
 
 
@@ -1145,6 +1182,7 @@ class Handler(BaseHTTPRequestHandler):
                 age = time.time() - V.STATE['updated'] if V.STATE['updated'] else None
                 queue, gap = list(V.STATE['queue']), V.STATE['gap']
                 accounts = V.STATE['accounts']
+                plays = list(V.STATE['plays'])
             bot = {'running': BOT.running, 'armed': BOT.armed, 'model': BOT.model,
                    'status': BOT.status, 'plays': BOT.plays, 'last_play': BOT.last_play,
                    'log': BOT.log[-int((parse_qs(route.query).get('log') or ['14'])[0]):],
@@ -1165,7 +1203,8 @@ class Handler(BaseHTTPRequestHandler):
                 body = {'ok': True, 'age': age, 'pending': pending, 'lag_ticks': gap,
                         'pending_commands': pending_commands(
                             queue, accounts, frame.get('game_tick') or 0,
-                            health.get('local_side'), BOT.layout),
+                            health.get('local_side'), BOT.layout)
+                        + landings_for_overlay(frame, health, plays, BOT.layout),
                         'session': V.SESSION.name, 'bot': bot, 'revealed': revealed,
                         **V.to_state(frame, health)}
             else:
