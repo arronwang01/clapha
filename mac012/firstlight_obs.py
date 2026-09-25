@@ -74,6 +74,51 @@ def gameplay_end_tick() -> int:
     return int(NATIVE_GAMEPLAY_END_TICK)
 
 
+def regular_end_tick() -> int:
+    """First overtime tick on the standard timeline (3600: three minutes at 20 Hz)."""
+    end = gameplay_end_tick()
+    low, high = 0, end
+    while low < high:
+        middle = (low + high) // 2
+        if timeline().phase(middle)[0] == 'normal':
+            low = middle + 1
+        else:
+            high = middle
+    return low
+
+
+def battle_result(battle: 'Battle', tick: int) -> tuple[int | None, str] | None:
+    """(winning side or None for a draw, reason) once the battle is decided; else None.
+
+    Standard 1v1 rules on the towers this battle has seen fall: a king tower ends it at any
+    time; at full time (and on every tower after it -- sudden death) unequal crowns end it;
+    at the end of overtime it goes to the tiebreak. The live client keeps the clock running
+    for a few seconds after the end and accepts taps it will never execute, so the console
+    stops acting on this rather than on the clock stopping.
+    """
+    if battle.start_tick is None or tick <= battle.start_tick:
+        # A clock that has not moved since we started watching is a battle already over: its
+        # frozen end state or its teardown, which frees tower objects one by one (a finished
+        # 2026-09-25 win read as a loss that way). Its towers were never seen fall; no verdict.
+        return None
+    down = battle.towers_down
+    kings = {TOWERS[index][2] for index in down if TOWERS[index][3] == 'king'}
+    if kings:
+        return (None, 'both king towers destroyed') if len(kings) == 2 else \
+            (1 - kings.pop(), 'king tower destroyed')
+    crowns = {0: 0, 1: 0}
+    for index in down:
+        crowns[1 - TOWERS[index][2]] += 1
+    if tick >= regular_end_tick() and crowns[0] != crowns[1]:
+        winner = 0 if crowns[0] > crowns[1] else 1
+        last_fall = max(battle.tower_down_tick.get(index, 0) for index in down)
+        when = 'in overtime' if last_fall >= regular_end_tick() else 'at full time'
+        return winner, f'{crowns[winner]}-{crowns[1 - winner]} on crowns {when}'
+    if tick >= gameplay_end_tick():
+        return None, f'{crowns[0]}-{crowns[1]} at the end of overtime (tiebreak on tower health)'
+    return None
+
+
 _GLOBAL_BY_CARD: dict[int, int] | None = None
 
 
@@ -246,6 +291,10 @@ class Battle:
         self.previous: dict[str, tuple[int, int, int]] = {}
         self.tower_max: dict[int, float] = {}
         self.tower_seen: set[int] = set()
+        self.towers_down: set[int] = set()      # TOWERS indices seen alive, now destroyed
+        self.tower_hp: dict[int, float] = {}     # last readable health per tower
+        self.tower_down_tick: dict[int, int] = {}  # when each destroyed tower was first seen down
+        self.unreadable_hp = 0                   # unit readings left out: health read as < 0
         self.unresolved: dict[int, int] = {}
         self.form_fallbacks: set[int] = set()   # forms shown as their base unit
         self.untracked_plays: set[tuple[int, int]] = set()
@@ -909,15 +958,23 @@ def build(frame: dict, health: dict, episode_id: str, deduced: dict | None = Non
     tower_rows: list = []
     id_by_address: dict[int, int] = {}
     crowns = {0: 0, 1: 0}
+    destroyed: set[int] = set()
     tower_ids: dict[int, list[int]] = {0: [], 1: []}
     for index, (x, y, owner, kind) in enumerate(TOWERS):
         found = live.get((x, y))
         entity_id = 5000000 + index
         tower_ids[owner].append(entity_id)
-        if found:
+        if found and float(found.get('hp', 0)) >= 0:
             battle.tower_seen.add(index)
-            battle.tower_max[index] = float(found.get('max_hp') or 1)
+            if float(found.get('max_hp') or 1) > 0:
+                battle.tower_max[index] = float(found.get('max_hp') or 1)
             hitpoints = float(found.get('hp', 0))
+            battle.tower_hp[index] = hitpoints
+        elif found:
+            # Health unreadable this frame (the reader gives -1): keep the last reading. A
+            # glitch must not read as a destroyed tower -- that is a crown, and in overtime the
+            # end of the battle.
+            hitpoints = battle.tower_hp.get(index, battle.tower_max.get(index, 1.0))
         else:
             # Absent means destroyed only if we have seen it alive in this battle; before
             # that it is simply a tower we have not resolved, and must not score a crown.
@@ -926,6 +983,7 @@ def build(frame: dict, health: dict, episode_id: str, deduced: dict | None = Non
         active = hitpoints > 0
         if not active and index in battle.tower_seen:
             crowns[1 - owner] += 1
+            destroyed.add(index)
         tower_rows.append((found, dict(
             entity_id=entity_id, owner=owner, tower_kind=kind,
             position=(float(x), float(y)),
@@ -933,6 +991,13 @@ def build(frame: dict, health: dict, episode_id: str, deduced: dict | None = Non
             hitpoints=hitpoints, max_hitpoints=maximum, active=active)))
         if found and _addr(found.get('address')) is not None:
             id_by_address[_addr(found['address'])] = entity_id
+
+    battle.towers_down = destroyed
+    for index in list(battle.tower_down_tick):
+        if index not in destroyed:
+            del battle.tower_down_tick[index]
+    for index in destroyed:
+        battle.tower_down_tick.setdefault(index, tick)
 
     archetypes = archetype_by_card()
     entities = []
@@ -970,6 +1035,12 @@ def build(frame: dict, health: dict, episode_id: str, deduced: dict | None = Non
 
     for e in frame['entities']:
         if is_tower(e):
+            continue
+        if not is_effect(e) and (e.get('hp', 0) < 0 or e.get('max_hp', 0) < 0):
+            # Health unreadable this frame (a building being placed or torn down has read -1
+            # for one frame). Leaving the unit out for a frame costs little; passing -1 makes
+            # the strict contract reject the whole observation, and the turn with it.
+            battle.unreadable_hp += 1
             continue
         resolved = resolve(e)
         if resolved is None:

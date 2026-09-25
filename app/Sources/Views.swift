@@ -88,7 +88,7 @@ struct TopBar: View {
             } label: { Label("Stop engines", systemImage: "stop.circle") }
                 .disabled(tasks.running)
             Button {
-                tasks.run("Check devices", "CR_MUMU_SERIAL=127.0.0.1:26624 python3 mac012/preflight.py 127.0.0.1:26624 127.0.0.1:26656")
+                tasks.run("Check devices", "CR_MUMU_SERIAL=127.0.0.1:26624 ./py mac012/preflight.py 127.0.0.1:26624 127.0.0.1:26656")
             } label: { Label("Check devices", systemImage: "checkmark.shield") }
                 .disabled(tasks.running)
             Toggle(isOn: $showTasks) { Label("Tasks", systemImage: "terminal") }
@@ -491,12 +491,12 @@ struct TasksPanel: View {
 
     private let actions: [(String, String, String)] = [
         ("Input report (last match)", "doc.text.magnifyingglass",
-         "python3 mac012/input_coverage.py | sed -n '/=== match_scalars/,$p' | grep -E '^===|^!!!|^ +[0-9]+ '"),
+         "./py mac012/input_coverage.py | sed -n '/=== match_scalars/,$p' | grep -E '^===|^!!!|^ +[0-9]+ '"),
         ("Replay last match through the model", "arrow.counterclockwise",
-         "python3 mac012/replay_decide.py"),
-        ("Hero / evolution checks", "sparkles", "python3 mac012/test_hero_evo.py fl:hog2"),
-        ("All-cards sweep", "square.grid.3x3", "python3 mac012/test_all_cards.py fl:il | tail -12"),
-        ("Tap benchmark (Training Camp)", "hand.tap", "python3 mac012/tap_bench.py"),
+         "./py mac012/replay_decide.py"),
+        ("Hero / evolution checks", "sparkles", "./py mac012/test_hero_evo.py fl:hog2"),
+        ("All-cards sweep", "square.grid.3x3", "./py mac012/test_all_cards.py fl:il | tail -12"),
+        ("Tap benchmark (Training Camp)", "hand.tap", "./py mac012/tap_bench.py"),
         ("Bot log (device 1)", "text.alignleft", "tail -80 build/bot_8777.log"),
     ]
 

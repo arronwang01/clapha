@@ -134,6 +134,8 @@ def main(argv: list[str]) -> int:
         for what, how in PINNED:
             print(f'  - {what:48} {how}')
         print('The reader refuses an unverified build by itself ("reader not attached").')
+        print('The first four in one go, during any battle (Training Camp is fine):\n'
+              '  python3 mac012/rederive.py --serial <device>      (then --apply)')
     print('\nreference repos:')
     for name, path, github in (
             ('FirstLight_CR', CLAPHA / 'ref-firstlight', 'Jaasssoooonnnnn/FirstLight_CR'),

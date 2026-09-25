@@ -977,6 +977,9 @@ the evolved play too. Keep the tracker on FirstLight's counts; better, read this
 **Ability buttons** (screenshot, 1440x2560 device): one hero -> the button is at the LEFT;
 two heroes -> left and right. Measured centres ~(140, 1955) and ~(1300, 1955), just above the
 hand. (User setting decides placement with two heroes; default is both sides.)
+*Superseded the same morning:* on the account in the 07:55 friendly a single hero's button was on
+the RIGHT (centre ~(1295, 1965)), and both left-side taps did nothing. The side is per account;
+the console now learns it (see "Friendly 2026-09-25 07:55").
 **Command lead** (queue_lead, 107 commands): opponent commands are in our queue a median
 14 ticks (700 ms, p10 11, p90 18) before they execute; ours 13. Issue -> our queue ~7-8 ticks.
 
@@ -1138,6 +1141,51 @@ of data 47 -> 44. Still missing for projectiles: destination and homing.
   greedy when the other device runs a model against us), Sampled or Greedy.
 - GPU (MPS) inference is slower than CPU for this batch-1 recurrent model (137 vs 106 ms).
 
+## Friendly 2026-09-25 07:55 (fl:hog2, device 1 vs the main account) -- what memory shows
+
+Recording artifacts/viewer-sessions/20260925T115451Z (one battle, ticks 0..5040).
+- Input/timing healthy: every placement checked landed exactly (0.0 tiles), inference 83-123 ms,
+  tap -> issued 5-6 ticks, and each play shows in the hand ~1.3 s (26 ticks) after the decision.
+- **Evolution live:** "evolution requirement measured: Skeletons needs 2 plays" from +0x2e8.
+- **Hero ability taps missed.** The policy chose Musketeer_hero_Ability at t=106.5 and 109.8 s;
+  the console tapped (140, 1955) because the rule said "one hero -> left". Memory: controller 1
+  button stayed 2 (Ready) with 1 charge and elixir never dropped by 3; screenshot at t=203 shows
+  the button on the right. Fix: `_ability_side()` -- one hero defaults to RIGHT, two heroes left
+  for slot 1 / right for slot 2, and a tap that leaves the button Ready with the same charges for
+  2.5 s flips the side for that account (build/ability_buttons.json), logged once.
+- **The "repeated" Cannon/Log were taps after the battle was over.** Opponent's left princess tower
+  fell between t=235 and t=248 in overtime (sudden death -> the bot won). From t=246.1 no command
+  executed (hand frozen, elixir only rising) while the client's clock ran to 5040 and accepted
+  taps. Fix: `FLO.battle_result()` (king tower; unequal crowns at/after full time; tiebreak at
+  6000) + `OutcomeLatch` in the console: acted on only after holding 0.5 s, withdrawn if a tower
+  reappears; then no taps, deferred plays dropped, one line in the log and in build/results.jsonl
+  (model, sampled, side, won, reason, tick, plays, opponent account).
+  `mac012/test_battle_result.py` replays every recorded battle through it: ~75 battles, no
+  result ever withdrawn, none decided more than ~6 s before its recording's clock stopped. It also
+  found the one wrong verdict: a finished battle still on screen when the viewer restarted (frozen
+  at tick 5700) lost tower objects one by one as the client tore it down, reading a win as a loss.
+  No verdict now until the clock has moved while we watch (the console never acts on a frozen
+  clock anyway; this keeps results.jsonl honest when a console starts on a finished battle).
+- **Unreadable health crashed whole frames.** Session 20260925T010215Z tick 2863: a Tombstone read
+  hp -1 / max -1 for one frame -> EntityStateV1 contract error -> "decide failed", turn lost.
+  Units with health < 0 are now left out for that frame (`battle.unreadable_hp` counts them);
+  a tower with unreadable health keeps its last reading (a -1 would have counted as destroyed --
+  a crown, and in overtime the end of the battle).
+- **Evolution requirement mis-measured at every battle start.** `_measure_evolutions` compared
+  against the last snapshot from the previous battle; every counter starts a battle at 0, so a
+  battle that ended with Skeletons/Cannon at 1 logged "needs 1 plays (was 2)" at 09:34:29 and fed
+  the model a one-play evolution until the real evolved plays (09:36) measured 2 again. Now only
+  a fall inside one battle (same battle pointer, clock moved forward <= 100 ticks) counts; replayed
+  on the session that holds both battles, it keeps the two genuine measurements and drops the two
+  boundary ones. (The viewer session file keeps growing across battles while the viewer runs:
+  20260925T115451Z holds the 07:55 and the 09:34 battles.)
+- Device 2's console said "Clash Royale is not running" -- correct: the game was not open there.
+- **"load failed: No module named 'torch'" after Start everything (10:38).** The app runs tasks in
+  a login zsh, which does not read ~/.zshrc, where conda puts miniforge on PATH; `python3` there is
+  python.org 3.14 without torch (the 07:54 consoles had been started from a terminal). `./py` now
+  runs the first Python that has torch ($CLAPHA_PYTHON, cached choice in build/python_path,
+  PATH, miniforge/conda/Homebrew locations); start-consoles.sh and every app button use it.
+
 ## Sandbox from the latest libg: assessment (2026-09-25)
 
 What it takes (cr-native-sandbox docs/SANDBOX_RUNTIME_TECHNICAL #27): freeze hashes; relocate
@@ -1169,3 +1217,37 @@ Plan, in order, each a go/no-go gate:
      reader's live frames as the reference (we can read both).
   4. Throughput and multi-battle stability; then training with the real 21-tick command age.
 Realistically weeks, not a night; gate 1 is a day and tells whether it is feasible at all.
+
+## Sandbox gate 1: result -- closed on ARM64 (2026-09-25 morning)
+
+Test app `sandbox/loadprobe/` (Java ProbeActivity + build.sh; aapt2/d8/apksigner, no INTERNET
+permission, extractNativeLibs) bundling the build's own ARM64 libs from
+runtime/160402012/apks/split_config.arm64_v8a.apk (build output git-ignored: it contains the
+game's libraries). Ran in a fresh MuMu instance created for it (never signed in, no game
+installed), then deleted; the game devices were not touched.
+- Order c++_shared, fmod, fmodstudio, sentry, sentry-android, scid_sdk, g: **libscid_sdk SIGSEGV**
+  (SEGV_MAPERR, pc 0x68d9c0 unmapped, lr libscid_sdk+0x173644) -- the same failure the
+  cr-native-sandbox authors saw under QEMU (RVA 0x17b170 -> 0x681780 on 160402002). Not an
+  emulation artefact. (FMOD's JNI_OnLoad returns a bad version when loaded standalone; harmless.)
+- Why: the ARM64 libscid_sdk.so (2.0 MB; x86_64 15.535 copy is 14.7 MB) and libg.so are packed:
+  5 section headers, extra loader LOAD segments (libscid 0x178000/0x1a0000, libg 0x1ab8000/
+  0x1ae4000), rwx mappings in the live game. libg's code is **encrypted on disk**: live code pages
+  differ from the file (0.4% equal bytes), entropy 7.99 bits/byte on disk vs 6.69 in memory.
+  The game loads libsupercell_clashroyale.so first (dzmxszrox.aI, from the Application) --
+  its protection runtime; 0x68d9c0 lies inside that library's size, i.e. the unpacker calls into
+  it and jumps to base 0 when it is absent.
+- Loading libsupercell_clashroyale first: loads in 95 ms, then the process vanishes (no tombstone,
+  no ApplicationExitInfo) -- consistent with it refusing to run inside anything but the genuine
+  app. Going further means spoofing the game's identity, patching the protection or dumping the
+  decrypted code: circumventing anti-tamper. **Not done; the ARM64 route is closed.**
+- Remaining in-bounds route = cr-native-sandbox's: x86_64 libraries (their 15.535 x86_64 libg
+  loads without the protection library) in an x86_64 Android. Needs the current build's
+  split_config.x86_64.apk from an official install on an Intel/AMD device (the user's own Play
+  install; nothing from mirrors) and an x86_64 host to run it. Unverified whether the current
+  x86_64 build is packed too.
+- Consequence for staying current: offsets cannot be re-derived from the file offline.
+  `mac012/rederive.py` does it from game *data* during one battle (find_manager -> reader checks
+  on hand/elixir/deck/towers/units -> comp_probe classification of the attack and movement
+  vtables), writes build/rederive_<version>.json, and with --apply updates mac_profile.py and the
+  reader's #defines. Checks tested on recordings; not yet run live (`--force` on the current build
+  must re-find 0x1A57E88 / 0x28 / 0x193ad50 / 0x193aeb8).

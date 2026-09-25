@@ -83,6 +83,33 @@ def opponent_deck_file(account, *, fresh_after: float):
     return list(deck), body.get('forms'), f'opponent deck from their console: {names}'
 
 
+class OutcomeLatch:
+    """Acts on a battle result only once it has held for half a second -- one misread frame
+    must not end a battle for us -- and resumes play if the result goes away again."""
+    HOLD_S = 0.5
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.result, self.since, self.over = None, None, False
+
+    def update(self, result, now: float) -> str | None:
+        """'over' the moment the battle counts as decided, 'withdrawn' if a decided result
+        goes away, otherwise None. A decided battle is recorded once."""
+        if result is None:
+            self.since = None
+            if self.over:
+                self.over, self.result = False, None
+                return 'withdrawn'
+            return None
+        self.since = self.since if self.since is not None else now
+        if not self.over and now - self.since >= self.HOLD_S:
+            self.result, self.over = result, True
+            return 'over'
+        return None
+
+
 class Bot:
     """Mirrors the user's bots.py loop: decide every STEP_TICKS, one play in flight at a
     time, never decide while our own command is still queued."""
@@ -94,6 +121,7 @@ class Bot:
         self.status = 'off'
         self.plays = 0
         self.last_play = ''
+        self.last_result = ''
         self._last_line, self._repeats, self._first_stamp = None, 0, ''
         self.log: list[str] = []
         self.thread = None
@@ -163,17 +191,22 @@ class Bot:
                 self._evo_required = {}
         return self._evo_required
 
-    def _measure_evolutions(self, deck: list, me: dict) -> None:
+    def _measure_evolutions(self, deck: list, me: dict, battle, tick: int) -> None:
         """The game's own evolution requirement per card: a deck slot's progress counter rises
         by one per normal play and falls to 0 on the evolved play (device: Skeletons
         0 -> 1 -> 2 -> 0), so a fall from k to 0 means the card needs k. Remembered across
-        runs; used instead of FirstLight's 15.535 cycle counts, which differ for many cards."""
+        runs; used instead of FirstLight's 15.535 cycle counts, which differ for many cards.
+
+        Only a fall inside one battle counts: every counter starts the next battle at 0, and
+        comparing across that boundary read "needs 1" for Skeletons and Cannon at the start of
+        the 2026-09-25 09:34 friendly (the previous battle had ended with both at 1)."""
         progress = me.get('evo_progress') or []
         previous = getattr(self, '_last_progress', None)
-        self._last_progress = (list(deck), list(progress))
-        if not previous or previous[0] != list(deck) or len(progress) != len(deck):
+        self._last_progress = (battle, int(tick), list(deck), list(progress))
+        if (not previous or previous[0] != battle or not 0 <= int(tick) - previous[1] <= 100
+                or previous[2] != list(deck) or len(progress) != len(deck)):
             return
-        for slot, (before, now) in enumerate(zip(previous[1], progress)):
+        for slot, (before, now) in enumerate(zip(previous[3], progress)):
             if before > 0 and now == 0:
                 card = int(deck[slot])
                 known = self.evo_required.get(card)
@@ -382,15 +415,43 @@ class Bot:
                                                if waited > 0.15 else ''))
         return True
 
-    # Hero ability buttons, measured on the 1440x2560 device (screenshot, 2026-09-25): one hero
-    # -> the button is on the LEFT; two heroes -> left for controller slot 1, right for slot 2.
+    # Hero ability buttons on the 1440x2560 device: centres ~(140, 1955) and ~(1300, 1955), just
+    # above the hand. Which side a button uses is a game setting, so it differs per account: one
+    # screenshot (2026-09-24) had a single hero on the LEFT, the 2026-09-25 friendly had it on the
+    # RIGHT (and taps on the left did nothing). The side is therefore learned per account: a tap
+    # that leaves the button Ready with the same charges for 2.5 s missed, and the other side is
+    # used from then on (build/ability_buttons.json).
     ABILITY_BUTTONS = {'left': (140, 1955), 'right': (1300, 1955)}
+    ABILITY_DEFAULTS = {'single': 'right', 'dual_1': 'left', 'dual_2': 'right'}
+    ABILITY_SIDES = Path(__file__).resolve().parents[1] / 'build' / 'ability_buttons.json'
 
-    def _ability_point(self, controller_slot: int, me: dict) -> tuple[int, int]:
+    def _ability_sides(self) -> dict:
+        try:
+            return json.loads(self.ABILITY_SIDES.read_text())
+        except (OSError, ValueError):
+            return {}
+
+    def _ability_side(self, controller_slot: int, me: dict, account) -> tuple[str, str]:
         bound = [a for a in me.get('abilities') or () if int(a.get('character_id') or 0)]
-        side_name = 'left' if len(bound) < 2 or controller_slot == 1 else 'right'
+        key = 'single' if len(bound) < 2 else f'dual_{controller_slot}'
+        learned = self._ability_sides().get(str(account), {})
+        return key, learned.get(key, self.ABILITY_DEFAULTS.get(key, 'right'))
+
+    def _ability_point(self, side_name: str) -> tuple[int, int]:
         x, y = self.ABILITY_BUTTONS[side_name]
         return (round(x * self.layout.width / 1440), round(y * self.layout.height / 2560))
+
+    def _ability_missed(self, flight: dict) -> None:
+        """The button stayed Ready with its charges: the tap was on the wrong side."""
+        other = 'left' if flight['side'] == 'right' else 'right'
+        sides = self._ability_sides()
+        sides.setdefault(str(flight['account']), {})[flight['side_key']] = other
+        try:
+            self.ABILITY_SIDES.write_text(json.dumps(sides, indent=1) + '\n')
+        except OSError:
+            pass
+        self.note(f'ability tap on the {flight["side"].upper()} did nothing (button still Ready '
+                  f'after 2.5 s) - this account has it on the {other.upper()}; using that now')
 
     def _try_ability(self, move, observation, me: dict, in_flight: list[dict], accounts,
                      side: int, frame: dict) -> None:
@@ -415,7 +476,9 @@ class Bot:
             why = ' [dry run]' if not self.armed else ' [BLOCKED by scope gate]'
             self.note(f't={frame["game_tick"]/20:5.1f}s  would use {name}{why}')
             return
-        point = self._ability_point(slot, me)
+        account = next((a['lo'] for a in (accounts or []) if a and a.get('side') == side), None)
+        side_key, side_name = self._ability_side(slot, me, account)
+        point = self._ability_point(side_name)
         try:
             if self.tapper is not None and self.tapper.alive():
                 self.tapper.tap(point)
@@ -424,12 +487,38 @@ class Bot:
         except Exception as error:  # noqa: BLE001
             self.note(f'ability tap failed: {error}')
             return
+        charges = next((int(a.get('charges', -1)) for a in me.get('abilities') or ()
+                        if int(a.get('controller_slot', 0)) == slot), -1)
         in_flight.append({'slot': slot, 'source': source, 'cost': float(state.elixir_cost or 0),
-                          'time': time.time()})
+                          'time': time.time(), 'charges': charges, 'account': account,
+                          'side': side_name, 'side_key': side_key})
         self.plays += 1
         self.last_play = name
         self.note(f't={frame["game_tick"]/20:5.1f}s  ABILITY {name} (controller {slot}, '
                   f'button at {point[0]},{point[1]})')
+
+    RESULTS = Path(__file__).resolve().parents[1] / 'build' / 'results.jsonl'
+
+    def _record_result(self, result, side: int, tick: int, runner, accounts) -> None:
+        """Say who won, and keep one line per battle in build/results.jsonl."""
+        winner, reason = result
+        verdict = 'no winner yet (tiebreak)' if winner is None else \
+            ('YOU WON' if winner == side else 'you lost')
+        self.last_result = f'{verdict} - {reason}'
+        self.note(f'battle over at t={tick / 20:.1f}s: {self.last_result}. {self.plays} plays; '
+                  f'no more taps this battle')
+        opponent = next((a['lo'] for a in (accounts or []) if a and a.get('side') == 1 - side),
+                        None)
+        entry = {'utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'port': PORT,
+                 'serial': SERIAL, 'model': self.model, 'sampled': bool(runner.sample),
+                 'side': side, 'won': None if winner is None else winner == side,
+                 'reason': reason, 'tick': tick, 'plays': self.plays,
+                 'opponent_account': opponent}
+        try:
+            with self.RESULTS.open('a') as handle:
+                handle.write(json.dumps(entry) + '\n')
+        except OSError:
+            pass
 
     def _check_deck_fit(self, deck, forms) -> None:
         """The Hog specialists were trained on one deck with fixed forms. Say so when the
@@ -487,6 +576,7 @@ class Bot:
             self.note(f'warm-up failed (first decision will be slow): {error}')
         battle = None
         fl_battle = None
+        latch = OutcomeLatch()
         reported: set[int] = set()
         reported_untracked: set[tuple[int, int]] = set()
         pending_battle, pending_since = None, 0.0
@@ -530,7 +620,7 @@ class Bot:
             if len(our_deck) != 8:
                 time.sleep(0.2)
                 continue
-            self._measure_evolutions(our_deck, me)
+            self._measure_evolutions(our_deck, me, frame['chain']['battle'], frame['game_tick'])
 
             if frame['chain']['battle'] != battle:
                 # The episode config needs both decks, and FirstLight's tracker needs the
@@ -579,6 +669,7 @@ class Bot:
                 handled_queue: set = set()
                 last_turn, in_flight, deferred = -10 ** 9, [], []
                 abilities_in_flight.clear()
+                latch.reset()
                 self.plays = 0
                 self.note(f'new battle, you are side {side}; '
                           f'warm-up until tick {runner.first_decision_tick}')
@@ -595,7 +686,8 @@ class Bot:
 
             # A tap chosen a moment before the client credits the elixir (frame age, rounding)
             # waits here, briefly, until the client can actually place it.
-            deferred = [d for d in deferred if time.time() - d['since'] <= DEFER_SECONDS]
+            deferred = [d for d in deferred if time.time() - d['since'] <= DEFER_SECONDS
+                        and not latch.over]
             for move in list(deferred):
                 if self._try_play(move, me, deck, reserved, in_flight, accounts, side, frame):
                     deferred.remove(move)
@@ -665,6 +757,21 @@ class Bot:
                     base = FLO.base_card(card_id)
                     self.note(f'{V.CARDS.get(base, {}).get("name", base)} form {card_id} is '
                               f'unknown to FirstLight - shown to the model as the base unit')
+                # Once the battle is decided the client keeps its clock running for a few
+                # seconds and accepts taps it never executes (2026-09-25: four taps after a
+                # sudden-death win). Stop acting then; a result that does not hold for half a
+                # second is not acted on, and one that is withdrawn resumes play.
+                event = latch.update(FLO.battle_result(fl_battle, frame['game_tick']),
+                                     time.time())
+                if event == 'over':
+                    self._record_result(latch.result, side, frame['game_tick'], runner,
+                                        accounts)
+                elif event == 'withdrawn':
+                    self.note('battle result withdrawn (a tower read as down is back) - '
+                              'playing on')
+                if latch.over:
+                    self.status = f'{self.model}: battle over - {self.last_result}'
+                    continue
                 if turn < runner.first_decision_tick:
                     runner.observe(observation)
                     self.status = (f'{self.model}: warm-up '
@@ -701,6 +808,12 @@ class Bot:
             # card, takes ~21 ticks to execute) or 2.5 s pass; until then it is not re-offered.
             live_buttons = {int(a.get('controller_slot', 0)): int(a.get('button', 0))
                             for a in me.get('abilities') or ()}
+            live_charges = {int(a.get('controller_slot', 0)): int(a.get('charges', -1))
+                            for a in me.get('abilities') or ()}
+            for a in abilities_in_flight:
+                if (time.time() - a['time'] >= 2.5 and live_buttons.get(a['slot']) in (2, 4)
+                        and live_charges.get(a['slot']) == a['charges']):
+                    self._ability_missed(a)
             abilities_in_flight[:] = [
                 a for a in abilities_in_flight
                 if time.time() - a['time'] < 2.5 and live_buttons.get(a['slot']) in (2, 4)]

@@ -25,3 +25,7 @@ runtime/
 
 # upstream FirstLight_CR clone (models + code), kept current by update_check
 ref-firstlight/
+
+# probe APK builds (contain the game's libraries)
+sandbox/loadprobe/out/
+sandbox/loadprobe/debug.keystore
