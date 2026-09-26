@@ -114,6 +114,14 @@ def _keep(items):
     return items
 
 
+def _collate(items):
+    """Runs in the DataLoader worker: pad and collate the group there, so the training process
+    only moves finished batches to the GPU. -> (batch or None, errors, sequence count)."""
+    errors = [item['error'] for item in items if 'error' in item]
+    sequences = [item['sequence'] for item in items if item.get('sequence') is not None]
+    return (batch_sequences(sequences) if sequences else None), errors, len(sequences)
+
+
 def _one_thread(_worker: int) -> None:
     """Each DataLoader worker tensorizes on one CPU thread: thirty workers each opening a
     full-width torch thread pool would oversubscribe the machine."""
@@ -196,6 +204,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument('--smoke', action='store_true')
     parser.add_argument('--extras', action='store_true', help='Stage B inputs: pending commands, opponent elixir, delay')
     parser.add_argument('--head-lr-mult', type=float, default=10.0, help='learning rate multiplier for the new head')
+    parser.add_argument('--limit-units', type=int, default=0, help='train on the first N sides only (tests)')
+    parser.add_argument('--max-updates', type=int, default=0, help='stop after N updates (tests)')
     args = parser.parse_args(argv)
 
     import torch
@@ -205,9 +215,12 @@ def main(argv: list[str]) -> int:
     from native_runner.training.v4.imitation import imitation_loss, slice_il_sequence
     from native_runner.training.v4.learning import evaluate_recurrent_sequence
 
+    if sys.platform.startswith('linux'):
+        # a batch holds ~10^5 small tensors; one file descriptor each exceeds the default limit
+        torch.multiprocessing.set_sharing_strategy('file_system')
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    if device.type != 'cuda' and not args.smoke:
-        raise SystemExit('training needs CUDA (the Mac is for --smoke checks only)')
+    if device.type != 'cuda' and not (args.smoke or args.max_updates):
+        raise SystemExit('training needs CUDA (the Mac is for --smoke and --max-updates checks only)')
     torch.manual_seed(args.seed)
     args.out.mkdir(parents=True, exist_ok=True)
     log = (args.out / 'train-metrics.jsonl').open('a')
@@ -217,6 +230,8 @@ def main(argv: list[str]) -> int:
     val_units = [u for u in units if held_out(u[0])]
     if args.smoke:
         train_units, val_units, args.batch, args.workers = train_units[:2], val_units[:1] or train_units[:1], 2, 0
+    if args.limit_units:
+        train_units, val_units = train_units[:args.limit_units], val_units[:2]
     print(f'{len(units)} Hog 2.6 sides: {len(train_units)} train, {len(val_units)} validation; device {device}',
           flush=True)
 
@@ -250,17 +265,14 @@ def main(argv: list[str]) -> int:
         order = list(train_units)
         random.Random(args.seed + epoch).shuffle(order)
         loader = DataLoader(ReplaySequences(order, max_turns, args.extras), batch_size=args.batch, shuffle=False,
-                            num_workers=args.workers, collate_fn=_keep, persistent_workers=False,
+                            num_workers=args.workers, collate_fn=_collate, persistent_workers=False,
                             worker_init_fn=_one_thread,
                             prefetch_factor=2 if args.workers else None)
-        for group_index, items in enumerate(loader):
-            for item in items:
-                if 'error' in item:
-                    print('skipped', item['error'], flush=True)
-            sequences = [item['sequence'] for item in items if item.get('sequence') is not None]
-            if not sequences:
+        for group_index, (batch, errors, sequence_count) in enumerate(loader):
+            for error in errors:
+                print('skipped', error, flush=True)
+            if batch is None:
                 continue
-            batch = batch_sequences(sequences)
             state = policy.initial_state(batch.batch_size, device=device)
             metrics = Counter()
             for start in range(0, batch.time_steps, args.time_steps):
@@ -283,10 +295,10 @@ def main(argv: list[str]) -> int:
                     count = float(getattr(losses, f'{name}_count').detach())
                     metrics[name] += float(getattr(losses, name).detach()) * count
                     metrics[f'{name}_count'] += count
-                if args.smoke and update >= 2:
+                if (args.smoke and update >= 2) or (args.max_updates and update >= args.max_updates):
                     break
             row = {'event': 'group', 'epoch': epoch, 'group': group_index, 'update': update,
-                   'sequences': len(sequences), 'turns': batch.time_steps, 'elapsed_s': round(time.time() - started),
+                   'sequences': sequence_count, 'turns': batch.time_steps, 'elapsed_s': round(time.time() - started),
                    **{h: round(metrics[h] / metrics[f'{h}_count'], 4) for h in ('gate', 'candidate', 'target', 'delay')
                       if metrics[f'{h}_count']}}
             print(json.dumps(row), flush=True)
@@ -304,7 +316,7 @@ def main(argv: list[str]) -> int:
                            **evaluate(policy, val_sequences, device, args.time_steps)}
                     print(json.dumps(row), flush=True)
                     log.write(json.dumps(row) + '\n')
-            if args.smoke:
+            if args.smoke or (args.max_updates and update >= args.max_updates):
                 return 0
     path = args.out / f'checkpoint-{update:08d}.pt'
     save_actor_critic_checkpoint(path, policy, optimizer=optimizer, update_step=update, training_stage='imitation',
