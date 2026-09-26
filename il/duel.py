@@ -59,7 +59,8 @@ def _overhead(rng: random.Random) -> int:
     return rng.choices(values, weights)[0]
 
 
-def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id: str, record: bool = False) -> dict:
+def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id: str, record: bool = False,
+               extra_delay: dict | None = None) -> dict:
     """One battle to the end; returns the result and per-side counters.
 
     The engine is stepped to the next thing that happens: a decision turn (every 5 ticks), a tap
@@ -78,6 +79,7 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
     counters = {side: {'decided': 0, 'tapped': 0, 'executed': 0, 'dropped_elixir': 0, 'dropped_hand': 0,
                        'abilities': 0, 'abilities_dropped': 0} for side in (0, 1)}
     tick, ended, seq = 0, False, 0
+    extra_delay = extra_delay or {0: 0, 1: 0}   # ticks added to a live side's tap (a slower pipeline)
     recorded_frames: list[dict] = []          # record=True: every decision-tick snapshot, as a conversion saves
     done: list[Command] = []                   # executed commands, for the recording
 
@@ -115,7 +117,7 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
                     pending.append((c.card_id, form_now(c.side, c.card_id), 1, c.grid, c.execute - tick))
         opponent_raw = {p['owner']: p['elixirRaw'] for p in frame['state']['players']}[1 - side]
         overhead = sum(k * v for k, v in OWN_OVERHEAD_TICKS.items()) / sum(OWN_OVERHEAD_TICKS.values())
-        delay = round(COMMAND_AGE_TICKS - 1 + overhead) if delays[side] == 'live' else 1
+        delay = round(COMMAND_AGE_TICKS - 1 + overhead + extra_delay[side]) if delays[side] == 'live' else 1
         runner.session.next_extras = build_extras(runner.session.tensorizer, pending,
                                                   opponent_elixir=opponent_raw / 10000.0, delay=delay)
 
@@ -246,7 +248,7 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
             for move in runner.decide(observation):
                 kind, _slot, card_id, target_grid, offset = move
                 kind = str(getattr(kind, 'value', kind))
-                tap = tick + int(offset) + (_overhead(rng) if delays[side] == 'live' else 0)
+                tap = tick + int(offset) + (_overhead(rng) + extra_delay[side] if delays[side] == 'live' else 0)
                 seq += 1
                 if kind == 'activate_ability':
                     entity = getattr(move, 'source_entity', None)
@@ -373,6 +375,9 @@ def main(argv: list[str]) -> int:
     parser.add_argument('--a-lead', type=int, default=0, help="elixir_lead_ticks for a's mask (0 = live today)")
     parser.add_argument('--b-lead', type=int, default=0)
     parser.add_argument('--matches', type=int, default=20)
+    parser.add_argument('--a-extra-delay', type=int, default=0,
+                        help="ticks added to a's taps (a slower pipeline); an extended model is told the true delay")
+    parser.add_argument('--b-extra-delay', type=int, default=0)
     parser.add_argument('--frames', type=Path, default=CLAPHA / 'runs/conv-hog26')
     parser.add_argument('--out', type=Path, default=CLAPHA / 'runs/duels.jsonl')
     parser.add_argument('--port', type=int, default=26789)
@@ -397,7 +402,8 @@ def main(argv: list[str]) -> int:
         started = time.time()
         try:
             result = play_match(native, runners, delays, leads, config, forms, rng, f'{tag[:8]}-{index}',
-                                record=args.record is not None)
+                                record=args.record is not None,
+                                extra_delay={a_side: args.a_extra_delay, 1 - a_side: args.b_extra_delay})
         except Exception as error:  # noqa: BLE001  (one broken match must not end the set)
             print(f'match {index + 1} failed: {type(error).__name__}: {error}', flush=True)
             for runner in runners.values():
@@ -410,6 +416,8 @@ def main(argv: list[str]) -> int:
         label = 'draw' if winner not in (0, 1) else ('a' if winner == a_side else 'b')
         wins[label] += 1
         row = {'a': args.a, 'a_delay': args.a_delay, 'b': args.b, 'b_delay': args.b_delay, 'deck_from': tag,
+               'a_lead': args.a_lead, 'b_lead': args.b_lead, 'a_extra_delay': args.a_extra_delay,
+               'b_extra_delay': args.b_extra_delay,
                'a_side': a_side, 'result': label, 'crowns': result['crowns'], 'end_tick': result['tick'],
                'counters': result['counters'], 'seconds': round(time.time() - started)}
         with args.out.open('a') as handle:
