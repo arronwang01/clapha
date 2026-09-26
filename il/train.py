@@ -115,15 +115,22 @@ def _keep(items):
 
 
 def _collate(items):
-    """Runs in the DataLoader worker: pad and collate the group there, and hand it over as ONE
-    pickled buffer. A batch holds ~10^5 small tensors; passed as tensors, each crosses processes
-    through its own shared-memory handle, which on Windows stalled a run for hours without one
-    batch arriving. -> (pickled batch or None, errors, sequence count)."""
-    import pickle
+    """Runs in the DataLoader worker: pad and collate the group there, and hand it over as one
+    packed buffer (il/pack.py). A batch holds ~10^5 small tensors; passed as tensors, each crossed
+    processes through its own shared-memory handle, which on Windows stalled a run for hours
+    without one batch arriving, and plain pickling costs seconds per batch on both sides.
+    The sequences are dropped as soon as they are collated, to keep the worker's peak down.
+    -> (packed batch or None, errors, sequence count)."""
+    from il.pack import pack
     errors = [item['error'] for item in items if 'error' in item]
-    sequences = [item['sequence'] for item in items if item.get('sequence') is not None]
-    payload = pickle.dumps(batch_sequences(sequences), protocol=pickle.HIGHEST_PROTOCOL) if sequences else None
-    return payload, errors, len(sequences)
+    sequences = [item.pop('sequence') for item in items if item.get('sequence') is not None]
+    count = len(sequences)
+    if not sequences:
+        return None, errors, 0
+    batch = batch_sequences(sequences, consume=True)
+    packed = pack(batch)
+    del batch
+    return packed, errors, count
 
 
 def _one_thread(_worker: int) -> None:
@@ -142,18 +149,26 @@ def _rows(collection) -> int:
     return 0
 
 
-def batch_sequences(sequences):
+def batch_sequences(sequences, consume: bool = False):
     """FirstLight's padded collation, after padding every turn's variable collections (active
-    effects, relation edges, candidates) to the batch's largest, as their cache loader does."""
+    effects, relation edges, candidates) to the batch's largest, as their cache loader does.
+    consume=True empties the given list while padding, so each original is freed once padded."""
     from native_runner.training.v4.cache import _pad_sequence_dynamic_observations
     from native_runner.training.v4.imitation import collate_padded_il_sequences
     counts = {name: max(_rows(getattr(observation, name)) for sequence in sequences
                         for observation in sequence.observations)
               for name in ('active_effects', 'relation_edges', 'candidates')}
-    padded = [_pad_sequence_dynamic_observations(sequence, active_effect_count=counts['active_effects'],
-                                                 relation_edge_count=counts['relation_edges'],
-                                                 candidate_count=counts['candidates'])
-              for sequence in sequences]
+
+    def pad(sequence):
+        return _pad_sequence_dynamic_observations(sequence, active_effect_count=counts['active_effects'],
+                                                  relation_edge_count=counts['relation_edges'],
+                                                  candidate_count=counts['candidates'])
+    if consume:
+        padded = []
+        while sequences:
+            padded.append(pad(sequences.pop(0)))
+    else:
+        padded = [pad(sequence) for sequence in sequences]
     return collate_padded_il_sequences(padded)
 
 
@@ -165,15 +180,14 @@ def load_policy(init: str, device):
     return load_extended(FLB.CHECKPOINTS.get(init, Path(init)), device)
 
 
-def evaluate(policy, sequences, device, time_steps: int) -> dict:
-    """Loss and gate/card agreement on held-out sequences, no gradient."""
+def evaluate(policy, batch, device, time_steps: int) -> dict:
+    """Held-out losses per head, no gradient. batch: the collated validation sequences."""
     import torch
     from native_runner.training.v4.imitation import imitation_loss, slice_il_sequence
     from native_runner.training.v4.learning import evaluate_recurrent_sequence
     totals, counts = Counter(), Counter()
     policy.eval()
     with torch.no_grad():
-        batch = batch_sequences(sequences)
         state = policy.initial_state(batch.batch_size, device=device)
         for start in range(0, batch.time_steps, time_steps):
             chunk = slice_il_sequence(batch, start, min(batch.time_steps, start + time_steps)).to(device)
@@ -200,6 +214,9 @@ def main(argv: list[str]) -> int:
     parser.add_argument('--batch', type=int, default=8, help='sequences per update group')
     parser.add_argument('--time-steps', type=int, default=32)
     parser.add_argument('--workers', type=int, default=8)
+    parser.add_argument('--prefetch', type=int, default=1,
+                        help='batches in flight per worker (each ~0.6 GB, plus ~2 GB peak while one is built)')
+    parser.add_argument('--val-sides', type=int, default=32, help='held-out game sides evaluated at each checkpoint')
     parser.add_argument('--learning-rate', type=float, default=3e-5)
     parser.add_argument('--weight-decay', type=float, default=1e-2)
     parser.add_argument('--max-grad-norm', type=float, default=1.0)
@@ -257,10 +274,13 @@ def main(argv: list[str]) -> int:
         return {**values, **(extras_payload(head) if head is not None else {})}
     autocast = device.type == 'cuda'
     max_turns = 64 if args.smoke else None
-    val_items = [ReplaySequences(val_units[:32], max_turns, args.extras)[i] for i in range(min(32, len(val_units)))]
-    val_sequences = [item['sequence'] for item in val_items if item.get('sequence') is not None]
-    if val_sequences:
-        row = {'event': 'validation', 'update': 0, **evaluate(policy, val_sequences, device, args.time_steps)}
+    val_data = ReplaySequences(val_units[:args.val_sides], max_turns, args.extras)
+    val_sequences = [item['sequence'] for item in (val_data[i] for i in range(len(val_data)))
+                     if item.get('sequence') is not None]
+    val_batch = batch_sequences(val_sequences, consume=True) if val_sequences else None
+    if val_batch is not None:
+        row = {'event': 'validation', 'update': 0, 'sides': val_batch.batch_size,
+               **evaluate(policy, val_batch, device, args.time_steps)}
         print(json.dumps(row), flush=True)
         log.write(json.dumps(row) + '\n')
 
@@ -271,14 +291,15 @@ def main(argv: list[str]) -> int:
         loader = DataLoader(ReplaySequences(order, max_turns, args.extras), batch_size=args.batch, shuffle=False,
                             num_workers=args.workers, collate_fn=_collate, persistent_workers=False,
                             worker_init_fn=_one_thread,
-                            prefetch_factor=2 if args.workers else None)
-        for group_index, (payload, errors, sequence_count) in enumerate(loader):
+                            prefetch_factor=args.prefetch if args.workers else None)
+        for group_index, (packed, errors, sequence_count) in enumerate(loader):
             for error in errors:
                 print('skipped', error, flush=True)
-            if payload is None:
+            if packed is None:
                 continue
-            import pickle
-            batch = pickle.loads(payload)
+            from il.pack import unpack
+            batch = unpack(packed)
+            del packed
             state = policy.initial_state(batch.batch_size, device=device)
             metrics = Counter()
             for start in range(0, batch.time_steps, args.time_steps):
@@ -317,9 +338,9 @@ def main(argv: list[str]) -> int:
                                              extra=payload(init=args.init, epoch=epoch, group=group_index,
                                                            recipe='clapha il.train: live-code samples, bot timing',
                                                            extras=args.extras))
-                if val_sequences:
+                if val_batch is not None:
                     row = {'event': 'validation', 'update': update,
-                           **evaluate(policy, val_sequences, device, args.time_steps)}
+                           **evaluate(policy, val_batch, device, args.time_steps)}
                     print(json.dumps(row), flush=True)
                     log.write(json.dumps(row) + '\n')
             if args.smoke or (args.max_updates and update >= args.max_updates):
