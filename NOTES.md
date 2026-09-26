@@ -1426,3 +1426,6 @@ Facts the new model must be built around:
     then `tools/gcp/launch.sh clapha-train-b full g2-standard-32 4 "--init fl:il --extras --workers 30 --save-every 100"`
     and `tools/gcp/watch.sh clapha-train-b <zone>`. The VM deletes itself at 4 h at the latest.
   - A 15-minute smoke VM (g2-standard-4) was created and deleted while finding this; under $1.
+- **Conversion finished 03:42:** all 14,040 Hog 2.6 games tried; 13,830 converted, 210 refused by
+  FirstLight's deal calibration; 10,360 exact (towers within 100 HP, 74.9%), winner right 93.8%;
+  12.7 M decision-tick snapshots, 2.27 GB (runs/conv-hog26), 1.68 s per game on one engine.
