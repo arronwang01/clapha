@@ -81,10 +81,27 @@ class Move(tuple):
     ability_id = None
 
 
-class FirstLightRunner:
-    """One policy bound to one battle. Rebuild it when the battle changes."""
+class _TeacherSession:
+    """The part of PolicySessionV4 that has no model: the episode tensorizer. Imitation data
+    (il/samples.py) drives the runner in this mode, so every input is built by the same code
+    as live and the expert's action is recorded where the policy's would be."""
 
-    def __init__(self, model: str, device: str = 'cpu', sample: bool = True):
+    def __init__(self, tensorizer):
+        self.tensorizer = tensorizer
+
+    def start_episode(self, observation, *, initial_elixir) -> None:
+        self.tensorizer.start_episode(observation, initial_elixir=initial_elixir)
+
+    def end_episode(self) -> None:
+        self.tensorizer.end_episode()
+
+
+class FirstLightRunner:
+    """One policy bound to one battle. Rebuild it when the battle changes.
+
+    model None: teacher mode (no policy; decide() is not available)."""
+
+    def __init__(self, model: str | None, device: str = 'cpu', sample: bool = True):
         from native_runner.training.v4.policy_session import load_policy_v4
         from native_runner.training.v4.expert import (FIRST_POLICY_DECISION_TICK,
                                                       POLICY_DECISION_TICKS)
@@ -92,8 +109,11 @@ class FirstLightRunner:
         self.device = device
         self.decision_ticks = POLICY_DECISION_TICKS
         self.first_decision_tick = FIRST_POLICY_DECISION_TICK
-        loaded = load_policy_v4(CHECKPOINTS[model], device=device)
-        self.model = getattr(loaded, 'model', loaded)
+        if model is None:
+            self.model = None
+        else:
+            loaded = load_policy_v4(CHECKPOINTS[model], device=device)
+            self.model = getattr(loaded, 'model', loaded)
         self.sample = bool(sample)
         self.session = None
         self.actor_owner = None
@@ -135,8 +155,9 @@ class FirstLightRunner:
             decision_hz=20.0 / self.decision_ticks,
             **({'tags': tags} if tags else {}))
         tensorizer = build_episode_tensorizer_v4(episode, actor_owner=actor_owner)
-        self.session = PolicySessionV4(self.model, tensorizer, device=self.device,
-                                       sample=self.sample)
+        self.session = (_TeacherSession(tensorizer) if self.model is None else
+                        PolicySessionV4(self.model, tensorizer, device=self.device,
+                                        sample=self.sample))
         self.session.start_episode(observation, initial_elixir=initial_elixir)
         self.actor_owner = actor_owner
         self.opponent_seen, self.refused, self._processed = [], [], set()

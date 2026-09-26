@@ -1350,3 +1350,35 @@ Facts the new model must be built around:
   (battle_env.py, cr_native_env.queue_hand_action_at): the AI's card lands 1-4 ticks after it
   decides, while a human's tap takes the normal ~21. No bot can do that in the live game.
 
+
+## Conversion at ~1.7 s per game; training samples through the live code (2026-09-25 night)
+
+- **Conversion speed.** FirstLight's client opened a new TCP connection per request (~5 ms each);
+  its persistent control session halves the time (8.3 -> 4.3 s per replay). The probe's new
+  `run-lean UNTIL EVERY` command (il/probe_observe_lean.patch) steps the headless battle to the
+  next recorded play and returns every decision-tick snapshot on the way in one reply, without the
+  provenance/capability tables (the same in every snapshot; kept once in meta.json), plus the plain
+  observation's elixir/hand/cycle/deck/crowns ("state"; the rich snapshot's players have none of
+  that). ~1.7 s per Hog 2.6 game (they are long, ~1,100 snapshots); identical to the step +
+  observe-lean reference on every board and state field. Probe build: runs/libcrprobe_run.so
+  (md5 d59657b8...), installed on CR_4k. tools/play_firstlight.sh still swaps in FirstLight's
+  attested probe for its sandbox.
+- **Not reproducible, excluded from inputs:** phaseRuntime's hook fields (attack/movement/deploy
+  StepTick/Input/Output, movementDelta, effectiveMovementSpeed) differ between two runs of the
+  same replay in the same mode: they carry values over from earlier battles in the engine session.
+- **Output:** runs/conv-hog26 (git-ignored): one zstd file per replay (il/frames.py, ~170 KB),
+  index.jsonl, resumable, --shard i/n to split machines, relaunches the engine if it stops
+  answering. Full Hog 2.6 run (14,040 games) started 20:55, ~6.5 h on CR_4k. So far: 74% exact
+  (towers within 100 HP), 94% right winner, 2% refused by FirstLight's deal calibration (decks
+  with several cards barred from the opening hand). Three-crown games: the recording lists all
+  the loser's towers at 0, so only the king is compared.
+- **Samples: il/samples.py.** Engine snapshot -> the reader's frame format -> firstlight_obs.build
+  and FirstLightRunner in teacher mode (mac012/firstlight_bot.py, model None) -> FirstLight's
+  tensorizer; labels re-timed (il/timeline.py) and aligned by FirstLight's own
+  build_expert_action_batch. ~6 s of CPU per game side. Rules and measurements in il/SPEC.md:
+  screen hand/elixir, elixir counted at the tap (firstlight_obs `elixir_lead_ticks`, default 0 =
+  unchanged live behaviour), 93-94% of labels aligned.
+- **L is the execution tick** (confirmed: plays' elixir spare at L peaks at 23 ticks of regen =
+  tapped when affordable + 21). ~9% of plays look tapped short of elixir; unexplained (SPEC).
+- Windows PC: not needed for Hog 2.6 conversion. For converting the other ~238k games or RL later
+  it needs an Android 12 MuMu instance (one GUI step, the user's); training needs no MuMu.

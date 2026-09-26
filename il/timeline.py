@@ -21,7 +21,7 @@ Labels at t: a's plays whose decision tick is t, with their offset (0-4) inside 
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
 from il.params import DECISION_TICKS, FIRST_DECISION_TICK, command_delay, opponent_lead
@@ -200,3 +200,30 @@ def sample_at(timeline: Timeline, actor: int, tick: int) -> Sample:
 def decision_ticks(timeline: Timeline) -> range:
     end = timeline.end_tick or (timeline.plays[-1].lands if timeline.plays else FIRST_DECISION_TICK)
     return range(FIRST_DECISION_TICK, end + 1, DECISION_TICKS)
+
+
+def timeline_to_json(timeline: Timeline) -> dict[str, Any]:
+    """Plain JSON (the engine conversion stores it with each replay's board snapshots)."""
+    data = asdict(timeline)
+    data['deals'] = {str(owner): deal for owner, deal in timeline.deals.items()}
+    data['first_certain_play'] = {str(owner): count for owner, count in timeline.first_certain_play.items()}
+    return data
+
+
+def timeline_from_json(data: dict[str, Any]) -> Timeline:
+    def ints(values) -> tuple[int, ...]:
+        return tuple(int(v) for v in values)
+
+    return Timeline(
+        replay_tag=data['replay_tag'],
+        decks=(ints(data['decks'][0]), ints(data['decks'][1])),
+        form_availability=(ints(data['form_availability'][0]), ints(data['form_availability'][1])),
+        tower_troops=tuple(data['tower_troops']),
+        deals={int(owner): (ints(deal[0]), ints(deal[1])) for owner, deal in data['deals'].items()},
+        first_certain_play={int(owner): int(count) for owner, count in data['first_certain_play'].items()},
+        plays=tuple(Play(owner=p['owner'], kind=p['kind'], card_id=p['card_id'],
+                         grid=tuple(p['grid']) if p['grid'] is not None else None, lands=p['lands'],
+                         index=p['index'], ability_keys=tuple(p['ability_keys'])) for p in data['plays']),
+        end_tick=data['end_tick'],
+        winner=data['winner'],
+        omit_from_opening=(ints(data['omit_from_opening'][0]), ints(data['omit_from_opening'][1])))

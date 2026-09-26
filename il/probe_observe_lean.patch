@@ -1,15 +1,34 @@
---- a/native_runner/probe/cr_replay_probe.cpp	2026-09-25 18:49:42
-+++ b/native_runner/probe/cr_replay_probe.cpp	2026-09-25 18:50:50
+--- a/native_runner/probe/cr_replay_probe.cpp
++++ b/native_runner/probe/cr_replay_probe.cpp
 @@ -4705,7 +4705,7 @@
  }
  
  bool build_rich_observation_json(void *manager, std::uint64_t generation, char *response, std::size_t response_size,
 -                                 bool *complete_out = nullptr) {
-+                                 bool *complete_out = nullptr, bool lean = false) {
++                                 bool *complete_out = nullptr, bool lean = false, bool bare = false) {
    if (complete_out != nullptr) {
      *complete_out = false;
    }
-@@ -5235,46 +5235,54 @@
+@@ -4737,7 +4737,17 @@
+   const std::uint64_t state_epoch = runtime_state_epoch_for_manager_locked(manager, generation);
+   std::size_t used = 0;
+   JsonWriter json(response, response_size, used);
+-  if (!json.append(
++  if (bare) {
++    // run-lean frames: the statusEnum, provenance and capability tables below are the same in
++    // every snapshot of a build (over half its bytes), so observe-lean carries them once and
++    // these frames leave them out.
++    if (!json.append("{\"ok\":true,\"schema\":\"%s\",\"generation\":%llu,\"stateEpoch\":%llu,\"tick\":%d,"
++                     "\"bare\":true,\"count\":%d,\"objects\":[",
++                     kRichTelemetrySchema, static_cast<unsigned long long>(generation),
++                     static_cast<unsigned long long>(state_epoch), tick, count)) {
++      return false;
++    }
++  } else if (!json.append(
+           "{\"ok\":true,\"schema\":\"%s\","
+           "\"statusEnum\":[\"authoritative\",\"derived\",\"pending\",\"unavailable\"],"
+           "\"generation\":%llu,\"stateEpoch\":%llu,\"tick\":%d,\"provenance\":{"
+@@ -5235,47 +5245,55 @@
        } else if (!item_json.append("null,")) {
          item_failed = true;
        }
@@ -90,18 +109,19 @@
 +            }
            }
          }
--      }
--      if (item_failed || !item_json.append("]}}")) {
--        truncated = true;
--        break;
 +        if (item_failed || !item_json.append("]}}")) {
 +          truncated = true;
 +          break;
 +        }
        }
+-      if (item_failed || !item_json.append("]}}")) {
+-        truncated = true;
+-        break;
+-      }
      }
      if (used + item_used + 96 >= response_size) {
-@@ -5298,68 +5306,74 @@
+       truncated = true;
+@@ -5298,68 +5316,74 @@
        encoded = false;
      }
    }
@@ -192,18 +212,21 @@
      encode_stage = "tower-troop-runtime";
      encoded = append_tower_troop_runtime_envelope_json(generation, state_epoch, tick, response, response_size, &used);
    }
-@@ -6532,6 +6546,7 @@
+@@ -6532,6 +6556,7 @@
         std::strncmp(command, "step ", 5) == 0 || std::strncmp(command, "play ", 5) == 0 ||
         std::strncmp(command, "transition ", 11) == 0 || std::strncmp(command, "inject ", 7) == 0 ||
         std::strcmp(command, "observe") == 0 || std::strcmp(command, "observe-rich") == 0 ||
-+       std::strcmp(command, "observe-lean") == 0 ||
++       std::strcmp(command, "observe-lean") == 0 || std::strncmp(command, "run-lean ", 9) == 0 ||
         std::strcmp(command, "observe-atomic") == 0 || is_replay_schedule_command(command))) {
      send_control_error(socket_fd, "resident mode requires env ID command prefixes");
      return;
-@@ -6936,6 +6951,40 @@
-     return;
-   }
- 
+@@ -6933,6 +6958,136 @@
+                     "{\"ok\":false,\"error\":\"failed to encode observation\"}");
+     }
+     send_control_response(socket_fd, observation_response.get());
++    return;
++  }
++
 +  if (std::strcmp(command, "observe-lean") == 0) {
 +    // Rich per-unit runtime state without event histories or component inventories. Used for
 +    // imitation data (clapha il/engine_convert.py): a snapshot every decision tick at plain speed.
@@ -238,6 +261,99 @@
 +    return;
 +  }
 +
-   if (std::strcmp(command, "observe-rich") == 0) {
-     std::unique_ptr<char[]> rich_response(new (std::nothrow) char[kFullObservationResponseBytes]());
-     if (rich_response == nullptr) {
++  unsigned long long run_until = 0;
++  unsigned long long run_every = 0;
++  if (std::sscanf(command, "run-lean %llu %llu", &run_until, &run_every) == 2) {
++    // Imitation data (clapha il/engine_convert.py): advance the headless battle to tick UNTIL and
++    // return a bare lean snapshot at every tick on the way that is a multiple of EVERY. One
++    // request instead of a step and an observe-lean per snapshot (each ~2 ms of round trip).
++    // Stops early with "complete":false when the battle ends or the response is nearly full;
++    // the caller continues from "tick".
++    constexpr std::size_t kRunBytes = 12 * 1024 * 1024;      // under the host's 16 MiB bound
++    constexpr std::size_t kRunFrameBytes = 2 * 1024 * 1024;  // observe-lean's bound
++    static std::unique_ptr<char[]> run_response(new (std::nothrow) char[kRunBytes]);
++    static std::unique_ptr<char[]> run_frame(new (std::nothrow) char[kRunFrameBytes]);
++    static std::unique_ptr<char[]> run_plain(new (std::nothrow) char[kRunFrameBytes]);
++    if (run_response == nullptr || run_frame == nullptr || run_plain == nullptr) {
++      send_control_error(socket_fd, "could not allocate run-lean buffers");
++      return;
++    }
++    if (run_every == 0 || run_every > 1000 || run_until > 1000000ULL) {
++      send_control_error(socket_fd, "run-lean expects UNTIL (<= 1000000) and EVERY (1..1000)");
++      return;
++    }
++    if (g_runner_mode.load(std::memory_order_acquire) == static_cast<std::int32_t>(RunnerMode::NativeRender)) {
++      send_control_error(socket_fd, "run-lean needs the headless runner");
++      return;
++    }
++    pthread_mutex_lock(&g_control_mutex);
++    std::int64_t tick = g_controlled_manager == nullptr ? -1 : g_last_controlled_tick;
++    pthread_mutex_unlock(&g_control_mutex);
++    if (tick < 0) {
++      send_control_error(socket_fd, "headless manager is not ready");
++      return;
++    }
++    std::size_t used = 0;
++    const auto put = [&](const char *text, std::size_t length) {
++      std::memcpy(run_response.get() + used, text, length);
++      used += length;
++      run_response[used] = '\0';
++    };
++    put("{\"ok\":true,\"frames\":[", 21);
++    std::int32_t frames = 0;
++    bool ended = false;
++    while (static_cast<unsigned long long>(tick) < run_until && used + 2 * kRunFrameBytes + 256 < kRunBytes) {
++      const unsigned long long aligned = (static_cast<unsigned long long>(tick) / run_every + 1) * run_every;
++      const unsigned long long next = aligned < run_until ? aligned : run_until;
++      const StepResult step = advance_controlled_manager(next - static_cast<unsigned long long>(tick));
++      if (step.generation == 0 || !step.completed) {
++        send_control_error(socket_fd, "run-lean: headless step did not complete");
++        return;
++      }
++      if (!step.ended && step.tick <= tick) {
++        send_control_error(socket_fd, "run-lean: the battle tick did not advance");
++        return;
++      }
++      tick = step.tick;
++      ended = step.ended;
++      if (tick >= 0 && static_cast<unsigned long long>(tick) % run_every == 0) {
++        // The rich snapshot's players carry evolution and ability state only; elixir, hand,
++        // cycle, deck and crowns are in the plain observation, whose part before its object
++        // list goes into the frame as "state".
++        run_frame[0] = '\0';
++        run_plain[0] = '\0';
++        pthread_mutex_lock(&g_control_mutex);
++        const bool encoded = build_rich_observation_json(g_controlled_manager, g_control_generation, run_frame.get(),
++                                                         kRunFrameBytes, nullptr, true, true) &&
++                             build_observation_json(g_controlled_manager, g_control_generation, run_plain.get(),
++                                                    kRunFrameBytes);
++        pthread_mutex_unlock(&g_control_mutex);
++        const char *plain_objects = encoded ? std::strstr(run_plain.get(), ",\"objects\":[") : nullptr;
++        const std::size_t frame_length = encoded ? std::strlen(run_frame.get()) : 0;
++        if (plain_objects == nullptr || frame_length < 2 || run_frame[frame_length - 1] != '}') {
++          send_control_error(socket_fd, "run-lean: failed to encode observation");
++          return;
++        }
++        if (frames > 0) {
++          put(",", 1);
++        }
++        put(run_frame.get(), frame_length - 1);
++        put(",\"state\":", 9);
++        put(run_plain.get(), static_cast<std::size_t>(plain_objects - run_plain.get()));
++        put("}}", 2);
++        ++frames;
++      }
++      if (ended) {
++        break;
++      }
++    }
++    char tail[160] = {};
++    const int tail_length =
++        std::snprintf(tail, sizeof(tail), "],\"count\":%d,\"tick\":%lld,\"ended\":%s,\"complete\":%s}", frames,
++                      static_cast<long long>(tick), ended ? "true" : "false",
++                      static_cast<unsigned long long>(tick) >= run_until ? "true" : "false");
++    put(tail, static_cast<std::size_t>(tail_length));
++    send_control_response(socket_fd, run_response.get());
+     return;
+   }
+ 

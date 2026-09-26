@@ -59,11 +59,38 @@ The audit was tested by planting three mistakes; each fails it (every sample for
 true hand; 5,656 samples for "opponent commands visible from the moment they are issued";
 3,599 + 3,442 for "the chosen play shown as already sent").
 
+## Board state: engine conversion, then the live code (2026-09-25 night)
+
+`il/engine_convert.py` replays each recording in Null's engine and saves a snapshot every
+decision tick (`il/frames.py`). `il/samples.py` turns each snapshot into the frame the memory
+reader would give, and runs it through the console's own code: `firstlight_obs.build` and
+`FirstLightRunner` in teacher mode (no policy; the expert's action is recorded as the previous
+action, where the policy's own is live). FirstLight's tensorizer then makes the model input and
+its `build_expert_action_batch` aligns the label, so a label is kept only if the live mask would
+offer that play.
+
+| rule | why |
+|---|---|
+| a play dated L executes in the step after L | the engine's hand still holds the card in the snapshot at L and not at L + 5; `plays` (executed) holds it from L + 1 |
+| own hand and elixir are the **screen's**: plays sent and not executed are taken out of the hand (next card in) and their cost off the elixir | the client does that at the tap; the game state ~1 s later. Humans play the card that just cycled in (Hog, then the Ice Spirit behind it); on the reader's hand the bot cannot. **The console must apply the same conversion to its in-flight taps before a model trained on it plays live** (and tap by the screen hand) |
+| the mask counts elixir as of the actor's latest tap in the window (`elixir_lead_ticks` = overhead + 4) | the game checks elixir at the tap, 3-11 ticks after the decision. Labels aligned: 87% with elixir at the decision tick, 94% with elixir at the tap |
+| hero controllers are named by FirstLight's ability id (the engine's `actionDataName`) | two-hero decks exist (Hero Musketeer + Hero Ice Golem); champions have no hero form and are skipped, as live |
+| labels still illegal at the decision tick are masked out of the loss (FirstLight's own handling), not turned into WAIT | ~5% of labels: cards short of elixir at the tap (below), abilities not ready yet |
+
+Label alignment on 12 exact replays: 720 of 772 labels (93%); 42 short of elixir at the tap, 10
+abilities not ready.
+
 ## Still to verify
 
-- Opponent command leads above 21 ticks (about 10% of those measured, up to 48) would mean a
-  command was visible before it was issued. Held out of the lead table until explained, most
-  likely a command that executed later than issue + 21.
+- **Plays that look tapped short of elixir.** Of 17,599 plays (300 exact replays), the elixir
+  spare when the play executes peaks at 23 ticks of regeneration at 1x and 2x, which is "tapped
+  the moment it was affordable, executed 21 ticks later": L is the execution tick. But ~9% have
+  less than 21 ticks spare (4% at 1x, 9% at 2x, 17% at 3x, with a bump at 12-16 ticks), which a
+  fixed 21-tick age does not allow. Live recordings (1,830 commands, both sides) show every
+  command issued with enough elixir and 20-21 ticks in the queue, so it is not early placement.
+  Engine elixir is right (starts at 6.0, 178.6 raw per tick at 1x as live, charges exactly each
+  card's cost). Unexplained; those labels are masked.
+- Opponent command leads above 21 ticks: the live queue shows no command staying more than 20
+  ticks, so the tail is a measurement artifact of the earlier lead table, not waiting commands.
 - The live console must build these same inputs with this same code (parity check on recorded
-  matches), including the conversion from the reader's hand (updates when a play executes) to
-  the on-screen hand (updates when it is sent).
+  matches): screen hand and elixir from in-flight taps, `elixir_lead_ticks`, and the new inputs.

@@ -620,13 +620,16 @@ def legal_ability_sources(abilities, elixir: float, pending=()) -> tuple[int, ..
 
 def action_mask(frame: dict, side: int, elixir: float, reserved: float = 0.0,
                 tower_states=(), hand_forms: dict | None = None, abilities=(),
-                pending_ability_sources=()):
+                pending_ability_sources=(), lead_ticks: int = 0, tick: int = 0):
     """Which hand slots are playable, and where -- built the way BattleEnvV1.action_mask does.
 
     reserved is elixir already committed to a play the server has not acknowledged yet. The
     client does not debit it for ~20 ticks, so without holding it back a second play can be
     chosen against elixir that is already spent. reasons['reserved_elixir'] is their own field
     for this and is read straight into the scalar features.
+
+    lead_ticks: the elixir counted is what regenerates by the time the tap goes out, this many
+    ticks after the decision (the game checks elixir at the tap). 0 is the decision tick itself.
 
     hand_forms maps card id -> the form it would be played in (0 normal, 1 evolution, 2 hero).
     The entry's form_code must agree with hand_runtime_by_slot, or the tensorizer raises.
@@ -636,6 +639,9 @@ def action_mask(frame: dict, side: int, elixir: float, reserved: float = 0.0,
 
     specs = production_semantic_bundle().card_specs
     available = max(0.0, elixir - max(0.0, reserved))
+    if lead_ticks > 0:
+        per_tick = float(timeline().elixir_rate(tick).raw_per_tick) / 10000.0
+        available = min(10.0, available + per_tick * lead_ticks)
     lanes, towers, buildings, unknown = placement_context(tower_states, frame, side)
     player = next((p for p in frame['players'] if p['side'] == side), None)
     slots: list[bool] = [False, False, False, False]
@@ -946,7 +952,7 @@ def build(frame: dict, health: dict, episode_id: str, deduced: dict | None = Non
           revealed: dict | None = None, battle: Battle | None = None,
           reserved: float = 0.0, plays=None, decks: dict | None = None,
           hand_forms: dict | None = None, pending_ability_sources=(),
-          evo_required: dict | None = None):
+          evo_required: dict | None = None, elixir_lead_ticks: int = 0):
     """One ObservationV1 for the local actor, FAIR tier.
 
     Pass the same Battle for every frame of a battle: velocity, entity identity, age, the
@@ -954,6 +960,7 @@ def build(frame: dict, health: dict, episode_id: str, deduced: dict | None = Non
     where nothing moves, nothing has history and no tower has ever fallen.
 
     hand_forms: card id -> form for our hand (see action_mask).
+    elixir_lead_ticks: decision -> tap, for the elixir the mask counts (see action_mask).
     """
     from native_runner.contracts import (PLAYER_RUNTIME_SEMANTIC_FIELDS, SemanticEvidenceLevel,
                                          ENTITY_RUNTIME_SEMANTIC_FIELDS,
@@ -1198,7 +1205,8 @@ def build(frame: dict, health: dict, episode_id: str, deduced: dict | None = Non
         players=tuple(players), towers=tuple(towers), entities=tuple(entities),
         events=play_events(plays, tick, decks, battle),
         action_mask=action_mask(frame, side, own_elixir, reserved, towers, hand_forms,
-                                own_abilities, pending_ability_sources),
+                                own_abilities, pending_ability_sources,
+                                lead_ticks=elixir_lead_ticks, tick=tick),
         episode_id=episode_id,
         ruleset_id=ruleset_id())
     return observation, battle
