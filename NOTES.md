@@ -1530,3 +1530,57 @@ model trained on); the fix is to record each play's form at issue time in sample
   them in place of calibrated.replay. The 4080 PC: upload of conv-hog26-002.zip running; needs the
   Mac unlocked (ToDesk) to unpack and train there.
 - The CR_4k emulator was started by me for the duels; stop it (adb emu kill) when duels are done.
+
+## 2026-09-26 evening: the distilled model live, benchmark results, extras v2
+
+**Engine duels (runs/duels.jsonl; live input path, real delay; 20 matches unless noted):** no-delay
+fl:hog2 vs today's live fl:hog2 20-0 (and 17-0 the other way round); control, live fl:hog2 with
+elixir lead 9 vs lead 0: 8-2. distill-1 (human weight 0.25) @1526: 11-9 over its two sets; @3048:
+26-14. **Pure distillation distill-t0b @1520 (640 sides): 17-3 vs today's live fl:hog2 (benchmark
+#1), 19-1 vs fl:hog2 given the same lead 9 (the training effect alone), 5-4 after 9 vs no-delay
+fl:hog2 (upper bound; paused for the live test, 11 to go, seed 1313).**
+
+**Live test (the user, clapha:distill-1520 in the console):** most delay-caused plays gone; some
+plays still mistimed (a few early) and weak plays that look like imitation limits, not delay or
+pending cards. The user's own battles are private: judge them by what the user reports; test
+with engine recordings (il.duel --record), never their recordings or match logs.
+- Live tests: pause the CR_4k emulator (`kill -STOP <qemu pid>`, `-CONT` after). With it running
+  the Mac (8 cores, two MuMu instances) was overloaded and decisions slowed.
+- The app listed only `fl:` models; it now lists `clapha:` ones too, and a named clapha checkpoint
+  gets our inputs (firstlight_bot: recipe checked for every name not starting with fl:).
+
+**Console timing = training timing (931e968; live at the next console restart, after an engine
+check):** the console taps at the play's moment (decision turn + the model's 0-4 tick offset; it
+used to tap at once, up to 0.2 s early) and measures each play's delay, moment -> issue tick, plays
+held for elixir left out. il.params.live_delay (median of the last 9 plays, prior 5, clamped
+20-32) is what an extended model is told, and our checkpoints' elixir lead follows it
+(elixir_lead = delay - 16). il.duel --a-lead auto applies the same rule.
+
+**Extras v2 (8197905):** pending cards get a 4th input, ticks until they ARRIVE (il/flight.py: a
+thrown spell or tunnelling unit lands after flying from its King Tower -- a pending Goblin Barrel's
+goblins come ~1 s after it executes; the user saw logs land before the goblins, and once one land
+perfectly). Both players' hero and champion controllers become tokens: phase (FirstLight's button
+enum), cooldown left, charges, ticks since last activation (AbilityClock). FirstLight's observation
+had only the actor's own heroes and dropped champions entirely (both sides). A v1 head loads as v2
+computing exactly what it did (checked); the ability branch and the arrival input start at zero.
+Live controllers are named by the unit's character (firstlight_obs.ability_card_by_character: 16
+heroes, 8 champions); training frames by FirstLight's ability id -> the same cards. The champion
+characters' live ids are assumed to be their archetype ids, as verified for heroes on the device.
+- FLIGHT is empty until `./py -m il.flight --measure` runs in the engine (every spell and the two
+  tunnellers cast at 7 distances; base + per_tile fit): until then arrival = execute + 1.
+
+**Habits (il/habits.py, engine recordings):** per Log, what its path held; per Ice Golem, what was
+near. Human baseline (150 public replays): Log ground 85-89%, nothing 10-15%, air only ~1%; Ice
+Golem pullable 55-58%, none near ~40%, building-targeters only 2-3%. To run on recordings of
+no-delay fl:hog2, our model and today's live bot: is a habit the teacher's or ours?
+
+**Decisions for the next run:** consistent delay (the user: "in the real game delay is
+consistent") -- per-side 23-27 as distill-t0b had (the measured live table), no --delay-range;
+extras v2 with the measured flight table; init from the better of distill-d1's final checkpoint
+and t0b @1520 (engine duels decide). Strategy habits the user reported (Ice Golem on a lone Hog,
+Log on air units, the evolved Cannon's deploy aim) come from the teacher unless the habit check
+says otherwise; improving on the teacher needs the RL stage.
+
+**distill-d1 (4080):** from t0b @1520, --delay-range 20 32 (per side, told to the model), the other
+9,677 sides; ~16.5 s per 16 sides; first checkpoint (update 1522 of this run) downloaded to
+~/crtrain-stage/train2/; validation t_gate 0.386 -> 0.368, t_candidate 0.464 -> 0.450. ETA ~20:45.
