@@ -119,9 +119,11 @@ class FirstLightRunner:
             root = str(HERE.parent)
             if root not in sys.path:
                 sys.path.insert(0, root)
-            from il.extras import checkpoint_extra, load_policy
+            from il.extras import cache_static_encodings, checkpoint_extra, load_policy
             path = CHECKPOINTS.get(model, Path(model))
             self.model = load_policy(path, device)
+            # the runner only ever infers: keep FirstLight's weight-only encodings (il/extras.py)
+            cache_static_encodings(self.model)
             # Our checkpoints (il/train.py) were trained on the screen's hand and elixir, elixir
             # counted as of the tap, and (Stage B) the extras; the console builds their inputs
             # that way. FirstLight's own keep today's inputs exactly.

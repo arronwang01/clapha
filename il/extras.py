@@ -197,6 +197,39 @@ def load_policy(path: str | Path, device):
     return policy
 
 
+def cache_static_encodings(model) -> None:
+    """Inference only: FirstLight re-encodes its whole effect catalog and mechanic-profile table in
+    every encode_observation (and the extras head asks for them again) -- ~60% of one decision on
+    the Mac's CPU (duel profile: 109 of 184 s). Both depend on the weights alone, so without
+    gradients the first result is kept and reused; with gradients enabled (training) the original
+    computation runs every time. The cached tensors are the ones the first call produced, so the
+    policy's outputs are unchanged bit for bit."""
+    import torch
+    effects, profiles = model.effect_encoder, model.mechanic_profile_encoder
+    if getattr(effects, '_clapha_cached', False):
+        return
+    original_effects, original_profiles = effects.all_effects, profiles.forward
+    kept: dict = {}
+
+    def all_effects():
+        if torch.is_grad_enabled():
+            return original_effects()
+        if 'effects' not in kept:
+            kept['effects'] = original_effects()
+        return kept['effects']
+
+    def profile_forward(effect_memory):
+        if torch.is_grad_enabled() or effect_memory is not kept.get('effects'):
+            return original_profiles(effect_memory)
+        if 'profiles' not in kept:
+            kept['profiles'] = original_profiles(effect_memory)
+        return kept['profiles']
+
+    effects.all_effects = all_effects
+    profiles.forward = profile_forward
+    effects._clapha_cached = True
+
+
 def install_session_hook(session) -> None:
     """Make a PolicySessionV4 feed extras to an extended model: before each decide(), set
     `session.next_extras` (build_extras); its tensorizer then returns the extended batch. The
