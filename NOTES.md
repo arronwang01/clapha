@@ -1429,3 +1429,9 @@ Facts the new model must be built around:
 - **Conversion finished 03:42:** all 14,040 Hog 2.6 games tried; 13,830 converted, 210 refused by
   FirstLight's deal calibration; 10,360 exact (towers within 100 HP, 74.9%), winner right 93.8%;
   12.7 M decision-tick snapshots, 2.27 GB (runs/conv-hog26), 1.68 s per game on one engine.
+- **What the delay costs (engine duels, 2026-09-26 03:42-04:40, il/duel.py):** fl:hog2 playing with
+  the live timing (tap after the measured overhead, execute 21 ticks later) against fl:hog2 with
+  FirstLight's sandbox timing (execute 1-4 ticks after deciding), Hog 2.6 mirrors, sides swapped:
+  **0 wins in 17** (3 matches voided by a harness bug since fixed), mostly 0-1 on crowns. The same
+  model loses every game to itself once its plays take the real time to land: the delay, not the
+  model's play, is what the live bot is up against.
