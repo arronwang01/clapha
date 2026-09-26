@@ -158,6 +158,43 @@ def _collate(items):
     return packed, errors, count
 
 
+def merged_groups(loader, merge: int):
+    """Join `merge` worker groups into one update batch in the training process: workers stay at
+    small groups (a worker's memory peaks at ~2 GB per 8 sides while it collates, and they all
+    peak together), updates still see merge x as many sides. Joining re-pads and collates the
+    groups exactly as one bigger group would be (checked: identical losses and label counts).
+    Yields (last worker group index, batch, teacher labels or None, sequence count)."""
+    from il.pack import unpack
+    parts, teachers, count, group_index = [], [], 0, -1
+    for group_index, (packed, errors, sequence_count) in enumerate(loader):
+        for error in errors:
+            print('skipped', error, flush=True)
+        if packed is None:
+            continue
+        item = unpack(packed)
+        del packed
+        batch, teacher = item if isinstance(item, tuple) else (item, None)
+        parts.append(batch)
+        teachers.append(teacher)
+        count += sequence_count
+        if len(parts) >= merge:
+            yield (group_index, *_join(parts, teachers), count)
+            parts, teachers, count = [], [], 0
+    if parts:
+        yield (group_index, *_join(parts, teachers), count)
+
+
+def _join(parts: list, teachers: list):
+    if len(parts) == 1:
+        return parts[0], teachers[0]
+    steps = max(part.time_steps for part in parts)
+    teacher = None
+    if teachers[0] is not None:
+        from il.teacher import collate_labels
+        teacher = collate_labels(teachers, steps)
+    return batch_sequences(parts, consume=True), teacher
+
+
 def _one_thread(_worker: int) -> None:
     """Each DataLoader worker tensorizes on one CPU thread: thirty workers each opening a
     full-width torch thread pool would oversubscribe the machine."""
@@ -268,6 +305,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument('--batch', type=int, default=8, help='sequences per update group')
     parser.add_argument('--time-steps', type=int, default=32)
     parser.add_argument('--workers', type=int, default=8)
+    parser.add_argument('--merge', type=int, default=1,
+                        help='worker groups joined per update batch (updates see batch x merge sides)')
     parser.add_argument('--prefetch', type=int, default=1,
                         help='batches in flight per worker (each ~0.6 GB, plus ~2 GB peak while one is built)')
     parser.add_argument('--val-sides', type=int, default=32, help='held-out game sides evaluated at each checkpoint')
@@ -276,7 +315,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument('--learning-rate', type=float, default=3e-5)
     parser.add_argument('--weight-decay', type=float, default=1e-2)
     parser.add_argument('--max-grad-norm', type=float, default=1.0)
-    parser.add_argument('--save-every', type=int, default=200, help='update groups between checkpoints')
+    parser.add_argument('--save-every', type=int, default=200, help='update batches between checkpoints')
     parser.add_argument('--seed', type=int, default=20260925)
     parser.add_argument('--smoke', action='store_true')
     parser.add_argument('--extras', action='store_true', help='Stage B inputs: pending commands, opponent elixir, delay')
@@ -365,17 +404,7 @@ def main(argv: list[str]) -> int:
                             num_workers=args.workers, collate_fn=_collate, persistent_workers=False,
                             worker_init_fn=_one_thread,
                             prefetch_factor=args.prefetch if args.workers else None)
-        for group_index, (packed, errors, sequence_count) in enumerate(loader):
-            for error in errors:
-                print('skipped', error, flush=True)
-            if packed is None:
-                continue
-            from il.pack import unpack
-            batch = unpack(packed)
-            del packed
-            teacher = None
-            if isinstance(batch, tuple):
-                batch, teacher = batch
+        for step_index, (group_index, batch, teacher, sequence_count) in enumerate(merged_groups(loader, args.merge)):
             state = policy.initial_state(batch.batch_size, device=device)
             metrics, metrics_counts = Counter(), Counter()
             for start in range(0, batch.time_steps, args.time_steps):
@@ -410,7 +439,7 @@ def main(argv: list[str]) -> int:
                     metrics[f'{name}_count'] += count
                 if (args.smoke and update >= 2) or (args.max_updates and update >= args.max_updates):
                     break
-            row = {'event': 'group', 'epoch': epoch, 'group': group_index, 'update': update,
+            row = {'event': 'group', 'epoch': epoch, 'batch': step_index, 'group': group_index, 'update': update,
                    'sequences': sequence_count, 'turns': batch.time_steps, 'elapsed_s': round(time.time() - started),
                    **{h: round(metrics[h] / metrics[f'{h}_count'], 4) for h in ('gate', 'candidate', 'target', 'delay')
                       if metrics[f'{h}_count']},
@@ -419,7 +448,7 @@ def main(argv: list[str]) -> int:
             print(json.dumps(row), flush=True)
             log.write(json.dumps(row) + '\n')
             log.flush()
-            if args.smoke or (group_index + 1) % args.save_every == 0:
+            if args.smoke or (step_index + 1) % args.save_every == 0:
                 path = args.out / f'checkpoint-{update:08d}.pt'
                 save_actor_critic_checkpoint(path, policy, optimizer=optimizer, update_step=update,
                                              training_stage='imitation', gamma_per_decision=0.997,

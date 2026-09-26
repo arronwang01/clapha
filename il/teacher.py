@@ -304,8 +304,9 @@ def student_labels(sequence, ticks, labels: dict, delay: int, stats: Counter) ->
 
 
 def collate_labels(lanes: list[TeacherLabels], time_steps: int) -> TeacherLabels:
-    """Lanes side by side over the batch's time_steps (FirstLight pads a short sequence by repeating
-    its last turn with the masks cleared; the repeats here carry zero weights)."""
+    """Lanes (or already collated groups) side by side over the batch's time_steps (FirstLight pads
+    a short sequence by repeating its last turn with the masks cleared; the repeats here carry zero
+    weights)."""
     import torch
     from native_runner.training.v4.tensors import concatenate_padded_tensor_records
     actions = tuple(concatenate_padded_tensor_records(tuple(lane.actions[min(step, lane.time_steps - 1)]
@@ -313,7 +314,7 @@ def collate_labels(lanes: list[TeacherLabels], time_steps: int) -> TeacherLabels
                     for step in range(time_steps))
 
     def column(name):
-        return torch.cat([torch.cat((value, value.new_zeros(time_steps - value.shape[0], 1)))
+        return torch.cat([torch.cat((value, value.new_zeros(time_steps - value.shape[0], value.shape[1])))
                           for value in (getattr(lane, name) for lane in lanes)], dim=1)
     return TeacherLabels(actions=actions, p_target=column('p_target'), gate_weight=column('gate_weight'),
                          cond_weight=column('cond_weight'))
