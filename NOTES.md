@@ -1504,3 +1504,9 @@ build (no run-lean). After every restart: install runs/libcrprobe_run.so into Nu
 night's "killed" run had left its 14 workers alive (~35 GB): `taskkill /T` reported success but
 they stayed; with a new run on top the PC stopped answering. Check with Get-CimInstance
 Win32_Process before starting anything there.
+
+**Card forms, a training quirk to fix at the next data rebuild:** il/samples' form_at gives a play
+the form its card has *now* (evolution ready as of the current turn), for pending plays and for
+every executed play, recomputed each turn -- not the form it was played in. Live, the viewer
+reports the true form. il/duel.py now follows training's rule (so the benchmark sees what the
+model trained on); the fix is to record each play's form at issue time in samples and duel alike.

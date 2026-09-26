@@ -105,11 +105,11 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
                 continue
             execute = c.execute if c.execute is not None else c.tap + COMMAND_AGE_TICKS
             if c.side == side:
-                pending.append((c.card_id, 0, 0, c.grid, execute - tick))
+                pending.append((c.card_id, form_now(c.side, c.card_id), 0, c.grid, execute - tick))
             elif c.execute is not None:
                 lead = leads_drawn.setdefault(c.seq, rng.choices(*zip(*sorted(OPPONENT_LEAD_TICKS.items())))[0])
                 if c.execute - lead <= tick < c.execute:
-                    pending.append((c.card_id, 0, 1, c.grid, c.execute - tick))
+                    pending.append((c.card_id, form_now(c.side, c.card_id), 1, c.grid, c.execute - tick))
         opponent_raw = {p['owner']: p['elixirRaw'] for p in frame['state']['players']}[1 - side]
         overhead = sum(k * v for k, v in OWN_OVERHEAD_TICKS.items()) / sum(OWN_OVERHEAD_TICKS.values())
         delay = round(COMMAND_AGE_TICKS - 1 + overhead) if delays[side] == 'live' else 1
@@ -117,6 +117,20 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
                                                   opponent_elixir=opponent_raw / 10000.0, delay=delay)
 
     leads_drawn: dict[int, int] = {}
+    evolution_ready: dict[tuple[int, int], bool] = {}
+    last_players: list = []
+
+    def form_now(owner: int, card_id: int) -> int:
+        """A play's form by il/samples' rule (form_at), so the duel feeds what training fed: hero
+        -> 2; evolution flag with the evolution ready as of the latest decision frame -> 1."""
+        state = next((q for q in last_players if q['owner'] == owner), None)
+        if state is None:
+            return 0
+        deck = [d['cardId'] for d in sorted(state['deck'], key=lambda d: d['deckSlot'])]
+        flag = int(deck_forms[owner][deck.index(card_id)]) if card_id in deck else 0
+        if flag & S.HERO_FLAG:
+            return 2
+        return 1 if flag & S.EVOLUTION_FLAG and evolution_ready.get((owner, card_id)) else 0
 
     def inject_due() -> None:
         for command in [c for c in commands if c.execute is not None and not c.injected and c.execute - 1 == tick]:
@@ -157,6 +171,10 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
         if not decision:
             continue
         frame = frames[-1]
+        last_players[:] = frame['state']['players']
+        for player in frame.get('players') or ():
+            for evolution in player.get('evolutionRuntime') or ():
+                evolution_ready[(player['owner'], int(evolution['cardId']))] = bool(evolution.get('ready'))
         # executed: out of the hand in the snapshot at their execute tick; dated like the viewer's
         for command in [c for c in commands if c.execute is not None and c.execute <= tick]:
             if command.kind == 'ability':
@@ -171,6 +189,10 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
                                       'issue_tick': command.execute - COMMAND_AGE_TICKS})
             counters[command.side]['executed'] += 1
             commands.remove(command)
+        for row in executed_rows:
+            # training recomputes every executed play's form each turn (il/samples.executed_plays)
+            if row['kind'] == 'card':
+                row['form_code'] = form_now(row['side'], row['card_id'])
         revealed = {0: [], 1: []}
         for row in executed_rows:
             if row['card_id'] not in revealed[row['side']]:
