@@ -1130,10 +1130,13 @@ def build(frame: dict, health: dict, episode_id: str, deduced: dict | None = Non
                 position=(float(e['x']), float(e['y'])),
                 velocity=velocity, projectile_state=projectile,
                 age_ms=age_ms, visible=True,
+                # the card is part of the handle: two shots of one kind fired on the same tick by
+                # an evolved and a normal Cannon are two volleys, and one group with two source
+                # cards makes the tensorizer refuse the whole turn
                 causal_group=CausalGroupRefV1(
                     kind=(CausalGroupKind.VOLLEY if kind == 'projectile'
                           else CausalGroupKind.PERSISTENT_EFFECT),
-                    handle=f"{e['side']}:{global_id}:{birth}", source_card_id=card),
+                    handle=f"{e['side']}:{card}:{global_id}:{birth}", source_card_id=card),
                 runtime_provenance=runtime_provenance(ENTITY_RUNTIME_SEMANTIC_FIELDS, None,
                                                       None, None, tick, projectile)))
             continue
