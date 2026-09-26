@@ -48,6 +48,9 @@ class Command:
     kind: str = 'card'
     seq: int = 0
     injected: bool = False
+    cost: float = 0.0
+    native_object_id: int | None = None      # an ability's source unit in the engine
+    entity_id: int | None = None             # the same unit in the live code's ids
 
 
 def _overhead(rng: random.Random) -> int:
@@ -65,25 +68,24 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
     import firstlight_obs as FLO
     from il.engine_convert import run_lean
     from native_runner.arena import cell_to_world
-    from native_runner.cr_native_env import HandAction
+    from native_runner.cr_native_env import NATIVE_OBJECT_ID_ENTITY_KEY_TAG, AbilityAction, HandAction
 
     native.create_match(config)
     battles = {0: None, 1: None}
     commands: list[Command] = []
     executed_rows: list[dict] = []
     counters = {side: {'decided': 0, 'tapped': 0, 'executed': 0, 'dropped_elixir': 0, 'dropped_hand': 0,
-                       'abilities_ignored': 0} for side in (0, 1)}
+                       'abilities': 0, 'abilities_dropped': 0} for side in (0, 1)}
     tick, ended, seq = 0, False, 0
 
     def screen_elixir(side: int, logic_raw: int) -> float:
         in_flight = [c for c in commands if c.side == side and c.execute is not None]
-        return logic_raw / 10000.0 - sum(S._card_cost(c.card_id) or 0 for c in in_flight)
+        return logic_raw / 10000.0 - sum(c.cost for c in in_flight)
 
     def process_taps(state_players) -> None:
         for command in sorted((c for c in commands if c.execute is None and c.tap <= tick), key=lambda c: c.seq):
             logic = {p['owner']: p['elixirRaw'] for p in state_players}[command.side]
-            cost = S._card_cost(command.card_id) or 0
-            if screen_elixir(command.side, logic) >= cost - 1e-6:
+            if screen_elixir(command.side, logic) >= command.cost - 1e-6:
                 command.execute = tick + COMMAND_AGE_TICKS
                 counters[command.side]['tapped'] += 1
             elif tick - command.tap > DEFER_TICKS:
@@ -99,6 +101,8 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
         install_session_hook(runner.session)
         pending = []
         for c in commands:
+            if c.kind != 'card':
+                continue
             execute = c.execute if c.execute is not None else c.tap + COMMAND_AGE_TICKS
             if c.side == side:
                 pending.append((c.card_id, 0, 0, c.grid, execute - tick))
@@ -116,6 +120,15 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
 
     def inject_due() -> None:
         for command in [c for c in commands if c.execute is not None and not c.injected and c.execute - 1 == tick]:
+            if command.kind == 'ability':
+                try:
+                    native.queue_ability_action_at(AbilityAction(command.side, NATIVE_OBJECT_ID_ENTITY_KEY_TAG,
+                                                                 command.native_object_id), execute_in_ticks=1)
+                    command.injected = True
+                except Exception:  # noqa: BLE001  (the source unit died or the ability is not ready)
+                    counters[command.side]['abilities_dropped'] += 1
+                    commands.remove(command)
+                continue
             state = next(p for p in native.observe()['players'] if p['owner'] == command.side)
             slot = next((h['handIndex'] for h in state['hand'] if h['cardId'] == command.card_id), None)
             if slot is None:
@@ -146,10 +159,16 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
         frame = frames[-1]
         # executed: out of the hand in the snapshot at their execute tick; dated like the viewer's
         for command in [c for c in commands if c.execute is not None and c.execute <= tick]:
-            x, y = cell_to_world(command.grid)
-            executed_rows.append({'tick': command.execute, 'side': command.side, 'card_id': command.card_id,
-                                  'form_code': 0, 'kind': 'card', 'x': x, 'y': y, 'seq': command.seq,
-                                  'issue_tick': command.execute - COMMAND_AGE_TICKS})
+            if command.kind == 'ability':
+                # the viewer's row for an ability: no card (65535); the console joins it to a hero
+                executed_rows.append({'tick': command.execute, 'side': command.side, 'card_id': 65535,
+                                      'form_code': 0, 'kind': 'ability', 'x': None, 'y': None, 'seq': command.seq,
+                                      'issue_tick': command.execute - COMMAND_AGE_TICKS})
+            else:
+                x, y = cell_to_world(command.grid)
+                executed_rows.append({'tick': command.execute, 'side': command.side, 'card_id': command.card_id,
+                                      'form_code': 0, 'kind': 'card', 'x': x, 'y': y, 'seq': command.seq,
+                                      'issue_tick': command.execute - COMMAND_AGE_TICKS})
             counters[command.side]['executed'] += 1
             commands.remove(command)
         revealed = {0: [], 1: []}
@@ -161,7 +180,7 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
             # every play this side has decided and that has not executed is gone from its screen
             # hand, tapped or not: the console taps within the turn, and training counts a play as
             # sent from the turn after its decision (il/samples in_flight)
-            sent = [_Sent(c.card_id) for c in sorted(commands, key=lambda c: c.seq) if c.side == side]
+            sent = [_Sent(c.card_id) for c in sorted(commands, key=lambda c: c.seq) if c.side == side and c.kind == 'card']
             try:
                 raw = S.reader_frame(frame, side, deck_forms, sent)
             except ValueError:
@@ -181,27 +200,43 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
                 opponent = {p['owner']: p for p in frame['state']['players']}[1 - side]
                 runner.adopt_api_deck([d['cardId'] for d in sorted(opponent['deck'], key=lambda d: d['deckSlot'])])
             runner.register_plays(executed_rows, revealed)
+            runner.attribute_opponent_abilities(executed_rows, raw['players'][1 - side])
             seen = {side: revealed[side], 1 - side: [c for c in revealed[1 - side] if c in runner.opponent_seen]}
             me = raw['players'][side]
             observation, battles[side] = FLO.build(
                 raw, health, episode_id=f'{match_id}:{side}', battle=battles[side], revealed=seen, reserved=0.0,
                 plays=executed_rows, decks=runner.tracked_decks(),
                 hand_forms=runner.hand_forms(me['deck_card_ids'], me['deck_form_flags'], me['evo_progress']),
+                pending_ability_sources=tuple(c.entity_id for c in commands if c.side == side and c.kind == 'ability'),
                 elixir_lead_ticks=leads[side])
             if tick < runner.first_decision_tick:
                 runner.observe(observation)
                 continue
             if runner.model is not None and '_extras_head' in runner.model.__dict__:
                 session_extras(runner, side, tick, frame)
-            for kind, _slot, card_id, target_grid, offset in runner.decide(observation):
-                if str(getattr(kind, 'value', kind)) != 'play_card' or target_grid is None:
-                    counters[side]['abilities_ignored'] += int(str(getattr(kind, 'value', kind)) == 'activate_ability')
-                    continue
+            for move in runner.decide(observation):
+                kind, _slot, card_id, target_grid, offset = move
+                kind = str(getattr(kind, 'value', kind))
+                tap = tick + int(offset) + (_overhead(rng) if delays[side] == 'live' else 0)
                 seq += 1
-                counters[side]['decided'] += 1
-                command = Command(side=side, card_id=int(card_id), grid=(int(target_grid[0]), int(target_grid[1])),
-                                  decided=tick, tap=tick + int(offset) + (_overhead(rng) if delays[side] == 'live' else 0),
-                                  seq=seq)
+                if kind == 'activate_ability':
+                    entity = getattr(move, 'source_entity', None)
+                    address = {eid: addr for addr, eid in battles[side].ids.items()}.get(entity)
+                    joined = FLO.ability_by_card().get(FLO.base_card(int(card_id))) if card_id is not None else None
+                    if address is None:
+                        counters[side]['abilities_dropped'] += 1
+                        continue
+                    counters[side]['abilities'] += 1
+                    command = Command(side=side, card_id=int(card_id or 0), grid=(0, 0), decided=tick, tap=tap,
+                                      seq=seq, kind='ability',
+                                      cost=float(getattr(joined[1], 'elixir_cost', 0) or 0) if joined else 0.0,
+                                      native_object_id=int(address, 16) & 0x00FFFFFFFFFFFFFF, entity_id=int(entity))
+                elif kind == 'play_card' and target_grid is not None:
+                    counters[side]['decided'] += 1
+                    command = Command(side=side, card_id=int(card_id), grid=(int(target_grid[0]), int(target_grid[1])),
+                                      decided=tick, tap=tap, seq=seq, cost=S._card_cost(int(card_id)) or 0.0)
+                else:
+                    continue
                 if delays[side] != 'live':
                     # FirstLight's sandbox: execute_in_ticks = max(1, offset), no tap and no wait
                     command.execute = tick + max(1, int(offset))
