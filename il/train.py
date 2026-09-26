@@ -115,11 +115,15 @@ def _keep(items):
 
 
 def _collate(items):
-    """Runs in the DataLoader worker: pad and collate the group there, so the training process
-    only moves finished batches to the GPU. -> (batch or None, errors, sequence count)."""
+    """Runs in the DataLoader worker: pad and collate the group there, and hand it over as ONE
+    pickled buffer. A batch holds ~10^5 small tensors; passed as tensors, each crosses processes
+    through its own shared-memory handle, which on Windows stalled a run for hours without one
+    batch arriving. -> (pickled batch or None, errors, sequence count)."""
+    import pickle
     errors = [item['error'] for item in items if 'error' in item]
     sequences = [item['sequence'] for item in items if item.get('sequence') is not None]
-    return (batch_sequences(sequences) if sequences else None), errors, len(sequences)
+    payload = pickle.dumps(batch_sequences(sequences), protocol=pickle.HIGHEST_PROTOCOL) if sequences else None
+    return payload, errors, len(sequences)
 
 
 def _one_thread(_worker: int) -> None:
@@ -268,11 +272,13 @@ def main(argv: list[str]) -> int:
                             num_workers=args.workers, collate_fn=_collate, persistent_workers=False,
                             worker_init_fn=_one_thread,
                             prefetch_factor=2 if args.workers else None)
-        for group_index, (batch, errors, sequence_count) in enumerate(loader):
+        for group_index, (payload, errors, sequence_count) in enumerate(loader):
             for error in errors:
                 print('skipped', error, flush=True)
-            if batch is None:
+            if payload is None:
                 continue
+            import pickle
+            batch = pickle.loads(payload)
             state = policy.initial_state(batch.batch_size, device=device)
             metrics = Counter()
             for start in range(0, batch.time_steps, args.time_steps):
