@@ -1510,3 +1510,23 @@ the form its card has *now* (evolution ready as of the current turn), for pendin
 every executed play, recomputed each turn -- not the form it was played in. Live, the viewer
 reports the true form. il/duel.py now follows training's rule (so the benchmark sees what the
 model trained on); the fix is to record each play's form at issue time in samples and duel alike.
+
+**Status 2026-09-26 ~12:00 (session paused at a usage limit):**
+- clapha-distill-1 (GCP, capped 5 h, self-deleting ~16:25): teacher labelling ~61 sides/min, ETA
+  ~14:30, then distillation training (checkpoints every 20 batches -> gs://clapha-train-aa479a94/
+  out/clapha-distill-1/train/; labels -> conv-hog26/teacher). tools/gcp/watch.sh copies results
+  to runs/gcp/clapha-distill-1 and deletes the VM. Continuation: launch.sh 7th argument = a gs://
+  checkpoint (--init runs/init.pt), prep "none" (labels are in the bucket).
+- Engine duels (runs/duels.jsonl): control fl:hog2 lead 9 vs lead 0 (both live) was 5-1 after 6 --
+  the elixir-at-the-tap lead alone helps a lot; then queued: no-delay vs live (lead 0), no-delay vs
+  live (lead 9). Benchmark rows to run on distill checkpoints (--a-lead 9): vs fl:hog2 live lead
+  0; vs fl:hog2 live lead 9 (training effect alone); vs fl:hog2 none (upper bound).
+- Inference 2.5x faster (cached weight-only encodings, identical moves): duels ~2x quicker, and the
+  live tap leaves sooner.
+- Console fixes (pending-card forms, landed commands) and replay_decide's console path: 0 errors
+  on a recorded match. Next: a device check with a distilled checkpoint (the user starts matches).
+- Not started: the correction-round (DAgger) recorder -- duels must save frames + a timeline and
+  ActionV1 expert actions (metadata source_command_tick = execute - 1, source_index); samples take
+  them in place of calibrated.replay. The 4080 PC: upload of conv-hog26-002.zip running; needs the
+  Mac unlocked (ToDesk) to unpack and train there.
+- The CR_4k emulator was started by me for the duels; stop it (adb emu kill) when duels are done.
