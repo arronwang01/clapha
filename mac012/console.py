@@ -502,7 +502,10 @@ class Bot:
         for flight in in_flight:
             issue = flight.get('issue_tick', flight['tap_tick'])
             column, row = (flight['target'][0] // 1000, flight['target'][1] // 1000) if flight.get('target') else (None, None)
-            pending.append((flight['card'], int(hand_forms.get(flight['card'], 0)), 0,
+            # the form it was tapped in: once sent, the card is no longer in the hand to ask
+            # (a hero read as 0 here would contradict training, which gives heroes 2)
+            form = flight['form'] if 'form' in flight else int(hand_forms.get(flight['card'], 0))
+            pending.append((flight['card'], int(form), 0,
                             (column, row) if column is not None else None, issue + COMMAND_AGE_TICKS - tick))
         own_account = next((a['lo'] for a in (accounts or []) if a and a.get('side') == side), None)
         for entry in queue or ():
@@ -511,6 +514,8 @@ class Bot:
             card_id, form_code, kind = V.card_identity(entry.get('card_id'))
             if kind != 'card' or entry.get('x') is None:
                 continue
+            if entry['issue_tick'] + COMMAND_AGE_TICKS - tick <= 0:
+                continue       # executed already: the queue keeps landed commands for a while
             pending.append((card_id, form_code, 1, (int(entry['x']) // 1000, int(entry['y']) // 1000),
                             entry['issue_tick'] + COMMAND_AGE_TICKS - tick))
         opponent = next((p for p in frame['players'] if p.get('side') == 1 - side), {})
@@ -563,6 +568,7 @@ class Bot:
         if 'decided' in timing:
             timing['send_ms'] = (sent - timing['decided']) * 1000.0
         in_flight.append({'slot': me['hand_deck_indices'][position], 'card': card,
+                          'form': int((getattr(self, '_hand_forms', None) or {}).get(card, 0)),
                           'cost': cost, 'tap_tick': int(frame['game_tick']),
                           'tap_time': sent, 'timing': timing,
                           'target': (move['column'] * 1000 + 500, move['row'] * 1000 + 500)})
@@ -905,10 +911,10 @@ class Bot:
                                                  me.get('evo_progress'), self.evo_required),
                     pending_ability_sources=tuple(a['source'] for a in abilities_in_flight),
                     evo_required=self.evo_required, elixir_lead_ticks=runner.elixir_lead)
+                self._hand_forms = runner.hand_forms(deck, me.get('deck_form_flags'),
+                                                     me.get('evo_progress'), self.evo_required)
                 if runner.has_extras:
-                    self._feed_extras(runner, frame, side, in_flight, queue, accounts,
-                                      runner.hand_forms(deck, me.get('deck_form_flags'),
-                                                        me.get('evo_progress'), self.evo_required))
+                    self._feed_extras(runner, frame, side, in_flight, queue, accounts, self._hand_forms)
                 for character in sorted(fl_battle.unresolved_abilities - reported_abilities):
                     reported_abilities.add(character)
                     self.note(f'hero controller character {character} has no single FirstLight '
