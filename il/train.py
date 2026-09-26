@@ -385,8 +385,16 @@ def main(argv: list[str]) -> int:
 
     units = select_units(args.frames)
     if args.teacher:
+        import os
         from il.teacher import label_path
-        labelled = [u for u in units if label_path(args.frames, u[0], u[1]).exists()]
+        # one listing per directory, not one existence check per side: on the 4080 PC every file
+        # check goes through the security suite's filter and 10,535 of them took ~25 minutes
+        present = set()
+        root = args.frames / 'teacher'
+        for sub in (os.scandir(root) if root.exists() else ()):
+            if sub.is_dir():
+                present.update(entry.name for entry in os.scandir(sub.path))
+        labelled = [u for u in units if label_path(args.frames, u[0], u[1]).name in present]
         print(f'teacher labels for {len(labelled)} of {len(units)} sides', flush=True)
         units = labelled
     teacher_dir = args.frames if args.teacher else None
