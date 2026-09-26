@@ -602,7 +602,7 @@ def own_runtime_states(player: dict, entities, side: int, tick: int, battle,
     return tuple(abilities), tuple(evolutions)
 
 
-def screen_view(player: dict, sent_cards) -> dict:
+def screen_view(player: dict, sent_cards, strict: bool = True) -> dict:
     """The actor's own player row as its screen shows it (a copy; the reader row is left alone).
 
     The client takes a card out of the hand and its cost off the elixir bar at the tap; the game
@@ -614,7 +614,9 @@ def screen_view(player: dict, sent_cards) -> dict:
         the next card and its cost (FirstLight's card spec, as the action mask uses) off the elixir.
     Training (il/samples.py) builds its inputs with this function, so a model trained on them
     must get them from it live too: the console passes its in-flight taps.
-    Raises ValueError if a sent card is not in the hand (the caller's in-flight list is wrong).
+    strict: a sent card that is not in the hand raises ValueError (training: the in-flight list
+    is wrong). Otherwise it is skipped: live or in a duel a policy can send a card that is not on
+    screen yet (the second of two plays whose first was not sent); it cannot be tapped.
     """
     from native_runner.training.v4.factory import production_semantic_bundle
 
@@ -627,7 +629,11 @@ def screen_view(player: dict, sent_cards) -> dict:
         if slot < 0 and len(cycle) > 4:
             hand[position] = cycle.pop(0)
     for card in sent_cards:
-        slot = deck.index(int(card))
+        slot = deck.index(int(card)) if int(card) in deck else None
+        if slot is None or slot not in hand:
+            if strict:
+                raise ValueError(f'sent card {card} is not in the hand')
+            continue
         position = hand.index(slot)
         hand[position] = cycle.pop(0)
         cycle.append(slot)

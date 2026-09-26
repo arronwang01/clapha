@@ -182,7 +182,7 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
             # sent from the turn after its decision (il/samples in_flight)
             sent = [_Sent(c.card_id) for c in sorted(commands, key=lambda c: c.seq) if c.side == side and c.kind == 'card']
             try:
-                raw = S.reader_frame(frame, side, deck_forms, sent)
+                raw = S.reader_frame(frame, side, deck_forms, sent, strict=False)
             except ValueError:
                 state = {p['owner']: p for p in frame['state']['players']}[side]
                 print('DEBUG tick', tick, 'side', side, 'hand', [(h['handIndex'], h['deckSlot'], h['cardId']) for h in state['hand']],

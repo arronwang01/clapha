@@ -130,7 +130,8 @@ def reader_abilities(lean_player: dict) -> list[dict]:
     return rows
 
 
-def reader_frame(frame: dict, actor: int, deck_forms: dict[int, list[int]], in_flight: list) -> dict:
+def reader_frame(frame: dict, actor: int, deck_forms: dict[int, list[int]], in_flight: list,
+                 strict: bool = True) -> dict:
     """The frame the reader would give at this tick, own hand and elixir as the screen shows."""
     state = {p['owner']: p for p in frame['state']['players']}
     lean = {p['owner']: p for p in frame['players']}
@@ -153,7 +154,7 @@ def reader_frame(frame: dict, actor: int, deck_forms: dict[int, list[int]], in_f
                         'cycle_deck_indices': cycle, 'deck_card_ids': deck, 'deck_form_flags': forms,
                         'evo_progress': progress})
             # as the screen shows it: drawn card in, sent cards out (the console does the same)
-            row = FLO.screen_view(row, [p.card_id for p in in_flight if p.kind == 'card'])
+            row = FLO.screen_view(row, [p.card_id for p in in_flight if p.kind == 'card'], strict=strict)
         else:
             row.update({'next_deck_index': -1, 'hand_deck_indices': [-1, -1, -1, -1],
                         'cycle_deck_indices': [], 'deck_card_ids': [], 'deck_form_flags': [],
