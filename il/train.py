@@ -84,7 +84,33 @@ def held_out(path: str) -> bool:
     return int(hashlib.sha256(Path(path).name.encode()).hexdigest()[:8], 16) % 50 == 0
 
 
-class ReplaySequences:
+class UnitsViaFile:
+    """Datasets whose unit list crosses to DataLoader workers through a file, not the pipe.
+
+    On Windows each worker is spawned and receives the dataset pickled through a pipe that holds
+    ~64 KB; a bigger pickle (10,000 units is ~1 MB) blocks the trainer until that worker has
+    imported torch -- minutes per process on the 4080 PC -- so ten workers started one after
+    another (~35 min). With the list in a file the pickle is tiny and all workers start at once."""
+
+    def __getstate__(self):
+        import json
+        import tempfile
+        if getattr(self, '_units_file', None) is None:
+            with tempfile.NamedTemporaryFile('w', suffix='.units.json', delete=False) as handle:
+                json.dump([list(unit) for unit in self.units], handle)
+            self._units_file = handle.name
+        state = dict(self.__dict__)
+        state.pop('units')
+        return state
+
+    def __setstate__(self, state):
+        import json
+        self.__dict__.update(state)
+        with open(self._units_file) as handle:
+            self.units = [tuple(unit) for unit in json.load(handle)]
+
+
+class ReplaySequences(UnitsViaFile):
     """torch Dataset: one ILSequenceV4 per (replay, actor), made by the live code; with the
     teacher's labels on the same turns (il/teacher.py) when `teacher` is the frames directory."""
 

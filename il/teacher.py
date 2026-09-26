@@ -53,7 +53,16 @@ def label_path(frames_dir: Path, replay_file: str, actor: int) -> Path:
 # ----------------------------------------------------------------------------- phase 1: label
 
 class TeacherViews:
-    """torch Dataset: one side's turns in FirstLight's own timing, with each turn's tick."""
+    """torch Dataset: one side's turns in FirstLight's own timing, with each turn's tick. The unit
+    list reaches workers through a file (il.train.UnitsViaFile)."""
+
+    def __getstate__(self):
+        from il.train import UnitsViaFile
+        return UnitsViaFile.__getstate__(self)
+
+    def __setstate__(self, state):
+        from il.train import UnitsViaFile
+        UnitsViaFile.__setstate__(self, state)
 
     def __init__(self, units):
         self.units = list(units)
