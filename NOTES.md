@@ -1439,3 +1439,12 @@ Facts the new model must be built around:
 - **fl:il against fl:hog2, both with the live timing:** fl:hog2 won all 20 (several three-crown
   games). FirstLight's imitation model is far weaker than the Hog specialist even on equal terms,
   so re-timing fl:il alone will not beat fl:hog2: the first training run starts from fl:hog2.
+- **fl:hog1 against fl:hog2, both with the live timing:** 7-3 for fl:hog1 (10 matches; side 0
+  looks disadvantaged in these mirrors: fl:hog2 lost all 5 of its side-0 games, fl:hog1 won 5/5 on
+  side 1 and 2/5 on side 0). Weak evidence that fl:hog1 copes with the delay better; fl:hog2 stays
+  the first training start (the reference to beat), fl:hog1 the second.
+- **Beyond imitation of humans:** the strongest signal we have is fl:hog2 itself. Self-distillation
+  (fl:hog2 playing with FirstLight's instant timing in the engine; a student learns to choose, from
+  the board ~1 s earlier, what the teacher then played) would keep the specialist's strength while
+  teaching it to act ahead. Needs engine self-play data: ~2 min per match on the one Mac engine, so
+  the Windows MuMu cluster (Android 12 step) would be the way to make hundreds of games.
