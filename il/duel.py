@@ -90,6 +90,30 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
                 counters[command.side]['dropped_elixir'] += 1
                 commands.remove(command)
 
+    def session_extras(runner, side: int, tick: int, frame: dict) -> None:
+        """Stage B inputs as the console would build them: this side's commands not executed yet
+        (execute time estimated as tap + 21 until tapped), the opponent's once visible in the queue
+        (issue + 21 - lead, lead drawn per command from the measured table), exact opponent elixir."""
+        from il.extras import build_extras, install_session_hook
+        from il.params import OPPONENT_LEAD_TICKS, OWN_OVERHEAD_TICKS
+        install_session_hook(runner.session)
+        pending = []
+        for c in commands:
+            execute = c.execute if c.execute is not None else c.tap + COMMAND_AGE_TICKS
+            if c.side == side:
+                pending.append((c.card_id, 0, 0, c.grid, execute - tick))
+            elif c.execute is not None:
+                lead = leads_drawn.setdefault(c.seq, rng.choices(*zip(*sorted(OPPONENT_LEAD_TICKS.items())))[0])
+                if c.execute - lead <= tick < c.execute:
+                    pending.append((c.card_id, 0, 1, c.grid, c.execute - tick))
+        opponent_raw = {p['owner']: p['elixirRaw'] for p in frame['state']['players']}[1 - side]
+        overhead = sum(k * v for k, v in OWN_OVERHEAD_TICKS.items()) / sum(OWN_OVERHEAD_TICKS.values())
+        delay = round(COMMAND_AGE_TICKS - 1 + overhead) if delays[side] == 'live' else 1
+        runner.session.next_extras = build_extras(runner.session.tensorizer, pending,
+                                                  opponent_elixir=opponent_raw / 10000.0, delay=delay)
+
+    leads_drawn: dict[int, int] = {}
+
     def inject_due() -> None:
         for command in [c for c in commands if c.execute is not None and not c.injected and c.execute - 1 == tick]:
             state = next(p for p in native.observe()['players'] if p['owner'] == command.side)
@@ -167,6 +191,8 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
             if tick < runner.first_decision_tick:
                 runner.observe(observation)
                 continue
+            if runner.model is not None and '_extras_head' in runner.model.__dict__:
+                session_extras(runner, side, tick, frame)
             for kind, _slot, card_id, target_grid, offset in runner.decide(observation):
                 if str(getattr(kind, 'value', kind)) != 'play_card' or target_grid is None:
                     counters[side]['abilities_ignored'] += int(str(getattr(kind, 'value', kind)) == 'activate_ability')

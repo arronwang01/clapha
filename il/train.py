@@ -65,9 +65,10 @@ def held_out(path: str) -> bool:
 class ReplaySequences:
     """torch Dataset: one ILSequenceV4 per (replay, actor), made by the live code."""
 
-    def __init__(self, units, max_turns: int | None = None):
+    def __init__(self, units, max_turns: int | None = None, extras: bool = False):
         self.units = list(units)
         self.max_turns = max_turns
+        self.extras = extras
 
     def __len__(self) -> int:
         return len(self.units)
@@ -80,7 +81,7 @@ class ReplaySequences:
         stats: Counter = Counter()
         try:
             header, frames = load_replay(Path(path))
-            sequence = actor_sequence(header, frames, actor, stats)
+            sequence = actor_sequence(header, frames, actor, stats, extras=self.extras)
         except Exception as error:  # noqa: BLE001  (one bad replay must not stop training)
             return {'error': f'{Path(path).name} actor {actor}: {type(error).__name__}: {error}'[:300]}
         if sequence is not None and self.max_turns and sequence.time_steps > self.max_turns:
@@ -117,11 +118,11 @@ def batch_sequences(sequences):
 
 
 def load_policy(init: str, device):
+    """A FirstLight checkpoint by name (firstlight_bot.CHECKPOINTS) or path; an extended one
+    (il/extras.py) comes back with its head attached."""
     import firstlight_bot as FLB
-    from native_runner.training.v4.policy_session import load_policy_v4
-    path = FLB.CHECKPOINTS.get(init, Path(init))
-    loaded = load_policy_v4(path, device=device)
-    return getattr(loaded, 'model', loaded)
+    from il.extras import load_policy as load_extended
+    return load_extended(FLB.CHECKPOINTS.get(init, Path(init)), device)
 
 
 def evaluate(policy, sequences, device, time_steps: int) -> dict:
@@ -165,6 +166,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument('--save-every', type=int, default=200, help='update groups between checkpoints')
     parser.add_argument('--seed', type=int, default=20260925)
     parser.add_argument('--smoke', action='store_true')
+    parser.add_argument('--extras', action='store_true', help='Stage B inputs: pending commands, opponent elixir, delay')
+    parser.add_argument('--head-lr-mult', type=float, default=10.0, help='learning rate multiplier for the new head')
     args = parser.parse_args(argv)
 
     import torch
@@ -190,11 +193,24 @@ def main(argv: list[str]) -> int:
           flush=True)
 
     policy = load_policy(args.init, device)
+    head = None
+    if args.extras:
+        from il.extras import attach_extras
+        head = policy.__dict__.get('_extras_head') or attach_extras(policy)
+        head.train()
     policy.train()
-    optimizer = torch.optim.AdamW(policy.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    groups = [{'params': list(policy.parameters())}]
+    if head is not None:
+        groups.append({'params': list(head.parameters()), 'lr': args.learning_rate * args.head_lr_mult})
+    optimizer = torch.optim.AdamW(groups, lr=args.learning_rate, weight_decay=args.weight_decay)
+    all_parameters = [p for group in groups for p in group['params']]
+
+    def payload(**values) -> dict:
+        from il.extras import extras_payload
+        return {**values, **(extras_payload(head) if head is not None else {})}
     autocast = device.type == 'cuda'
     max_turns = 64 if args.smoke else None
-    val_items = [ReplaySequences(val_units[:32], max_turns)[i] for i in range(min(32, len(val_units)))]
+    val_items = [ReplaySequences(val_units[:32], max_turns, args.extras)[i] for i in range(min(32, len(val_units)))]
     val_sequences = [item['sequence'] for item in val_items if item.get('sequence') is not None]
     if val_sequences:
         row = {'event': 'validation', 'update': 0, **evaluate(policy, val_sequences, device, args.time_steps)}
@@ -205,7 +221,7 @@ def main(argv: list[str]) -> int:
     for epoch in range(args.epochs):
         order = list(train_units)
         random.Random(args.seed + epoch).shuffle(order)
-        loader = DataLoader(ReplaySequences(order, max_turns), batch_size=args.batch, shuffle=False,
+        loader = DataLoader(ReplaySequences(order, max_turns, args.extras), batch_size=args.batch, shuffle=False,
                             num_workers=args.workers, collate_fn=_keep, persistent_workers=False,
                             prefetch_factor=2 if args.workers else None)
         for group_index, items in enumerate(loader):
@@ -230,13 +246,14 @@ def main(argv: list[str]) -> int:
                 if not torch.isfinite(losses.total):
                     raise FloatingPointError(f'non-finite loss at epoch {epoch} group {group_index} turn {start}')
                 losses.total.backward()
-                torch.nn.utils.clip_grad_norm_(policy.parameters(), args.max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(all_parameters, args.max_grad_norm)
                 optimizer.step()
                 state = evaluation.final_state.detach()
                 update += 1
-                for head in ('gate', 'candidate', 'target', 'delay'):
-                    metrics[head] += float(getattr(losses, head)) * float(getattr(losses, f'{head}_count'))
-                    metrics[f'{head}_count'] += float(getattr(losses, f'{head}_count'))
+                for name in ('gate', 'candidate', 'target', 'delay'):
+                    count = float(getattr(losses, f'{name}_count').detach())
+                    metrics[name] += float(getattr(losses, name).detach()) * count
+                    metrics[f'{name}_count'] += count
                 if args.smoke and update >= 2:
                     break
             row = {'event': 'group', 'epoch': epoch, 'group': group_index, 'update': update,
@@ -250,8 +267,9 @@ def main(argv: list[str]) -> int:
                 path = args.out / f'checkpoint-{update:08d}.pt'
                 save_actor_critic_checkpoint(path, policy, optimizer=optimizer, update_step=update,
                                              training_stage='imitation', gamma_per_decision=0.997,
-                                             extra={'init': args.init, 'epoch': epoch, 'group': group_index,
-                                                    'recipe': 'clapha il.train: live-code samples, bot timing'})
+                                             extra=payload(init=args.init, epoch=epoch, group=group_index,
+                                                           recipe='clapha il.train: live-code samples, bot timing',
+                                                           extras=args.extras))
                 if val_sequences:
                     row = {'event': 'validation', 'update': update,
                            **evaluate(policy, val_sequences, device, args.time_steps)}
@@ -261,8 +279,8 @@ def main(argv: list[str]) -> int:
                 return 0
     path = args.out / f'checkpoint-{update:08d}.pt'
     save_actor_critic_checkpoint(path, policy, optimizer=optimizer, update_step=update, training_stage='imitation',
-                                 gamma_per_decision=0.997, extra={'init': args.init, 'epochs': args.epochs,
-                                                                  'recipe': 'clapha il.train'})
+                                 gamma_per_decision=0.997, extra=payload(init=args.init, epochs=args.epochs,
+                                                                         recipe='clapha il.train', extras=args.extras))
     return 0
 
 

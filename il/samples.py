@@ -190,11 +190,12 @@ def revealed_cards(timeline, tick: int) -> dict[int, list[int]]:
 
 
 def actor_samples(header: dict, frames: list[dict], actor: int, stats: Counter, keep: bool = False,
-                  delay: int | None = None) -> list:
+                  delay: int | None = None, extras: bool = False) -> list:
     """Replay one actor's turns; returns (tick, frame batch, action sequence, label usable)."""
     import torch
     from native_runner.training.v4.expert import (ExpertActionAlignmentError, TimedExpertActionV4,
                                                   build_expert_action_batch, replay_expert_actions)
+    from il.params import opponent_seen_tick
     timeline = timeline_from_json(header['timeline'])
     tag = timeline.replay_tag
     # delay None: the bot's (21 + measured overhead); 0 reproduces FirstLight's labels (execute at
@@ -287,7 +288,17 @@ def actor_samples(header: dict, frames: list[dict], actor: int, stats: Counter, 
                                                  config=tensorizer.config, validate=False)
         tensorizer.record_action(sequence, batch, row=0, validate=False)
         if keep:
-            samples.append((tick, batch.to_storage('cpu', float_dtype=torch.float16), sequence, usable))
+            storage = batch.to_storage('cpu', float_dtype=torch.float16)
+            if extras:
+                from il.extras import build_extras, extend_batch
+                pending = [(p.card_id, form_at(p), 0, p.grid, p.lands + 1 - tick) for p in in_flight if p.kind == 'card']
+                pending += [(p.card_id, form_at(p), 1, p.grid, p.lands + 1 - tick) for p in timeline.plays
+                            if p.owner != actor and p.kind == 'card' and p.lands >= tick
+                            and opponent_seen_tick(tag, p.index, p.lands) <= tick]
+                opponent_raw = {q['owner']: q['elixirRaw'] for q in frame['state']['players']}[1 - actor]
+                built = build_extras(tensorizer, pending, opponent_elixir=opponent_raw / 10000.0, delay=delay)
+                storage = extend_batch(storage, built.to_storage('cpu', float_dtype=torch.float16))
+            samples.append((tick, storage, sequence, usable))
     runner.end_battle()
     return samples
 
@@ -295,7 +306,8 @@ def actor_samples(header: dict, frames: list[dict], actor: int, stats: Counter, 
 HOG26_CARDS = frozenset({26000021, 26000014, 27000000, 26000038, 26000030, 26000010, 28000000, 28000011})
 
 
-def actor_sequence(header: dict, frames: list[dict], actor: int, stats: Counter, delay: int | None = None):
+def actor_sequence(header: dict, frames: list[dict], actor: int, stats: Counter, delay: int | None = None,
+                   extras: bool = False):
     """FirstLight's ILSequenceV4 for one actor: every decision turn from tick 90, in order.
 
     Unusable labels (not offered by the live mask at the decision tick) keep their frame but
@@ -303,7 +315,7 @@ def actor_sequence(header: dict, frames: list[dict], actor: int, stats: Counter,
     (value_loss_mask False): its return definition is FirstLight's reward, and RL comes later."""
     import torch
     from native_runner.training.v4.imitation import ILSequenceV4
-    samples = actor_samples(header, frames, actor, stats, keep=True, delay=delay)
+    samples = actor_samples(header, frames, actor, stats, keep=True, delay=delay, extras=extras)
     if not samples:
         return None
     steps = len(samples)

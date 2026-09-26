@@ -112,8 +112,14 @@ class FirstLightRunner:
         if model is None:
             self.model = None
         else:
-            loaded = load_policy_v4(CHECKPOINTS[model], device=device)
-            self.model = getattr(loaded, 'model', loaded)
+            # A name (CHECKPOINTS) or a checkpoint path. il.extras.load_policy is FirstLight's strict
+            # loader plus the Stage B head when a checkpoint carries one (il/extras.py); for their own
+            # checkpoints it returns exactly what load_policy_v4 does.
+            root = str(HERE.parent)
+            if root not in sys.path:
+                sys.path.insert(0, root)
+            from il.extras import load_policy
+            self.model = load_policy(CHECKPOINTS.get(model, Path(model)), device)
         self.sample = bool(sample)
         self.session = None
         self.actor_owner = None
