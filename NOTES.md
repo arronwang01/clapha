@@ -1436,3 +1436,6 @@ Facts the new model must be built around:
   **0 wins in 17** (3 matches voided by a harness bug since fixed), mostly 0-1 on crowns. The same
   model loses every game to itself once its plays take the real time to land: the delay, not the
   model's play, is what the live bot is up against.
+- **fl:il against fl:hog2, both with the live timing:** fl:hog2 won all 20 (several three-crown
+  games). FirstLight's imitation model is far weaker than the Hog specialist even on equal terms,
+  so re-timing fl:il alone will not beat fl:hog2: the first training run starts from fl:hog2.
