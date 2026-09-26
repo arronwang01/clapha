@@ -180,21 +180,30 @@ def load_policy(init: str, device):
     return load_extended(FLB.CHECKPOINTS.get(init, Path(init)), device)
 
 
-def evaluate(policy, batch, device, time_steps: int) -> dict:
+def evaluate_chunk(policy, chunk, state, fused: bool):
+    """One [T,B] chunk teacher-forced: il/fused.py (one LSTM kernel, heads batched over T*B;
+    checked equal to FirstLight's step-by-step evaluation) or their evaluate_recurrent_sequence."""
+    if fused:
+        from il.fused import evaluate_sequence_fused
+        return evaluate_sequence_fused(policy, chunk.observations, chunk.actions, chunk.episode_start,
+                                       initial_state=state)
+    from native_runner.training.v4.learning import evaluate_recurrent_sequence
+    return evaluate_recurrent_sequence(policy, chunk.observations, chunk.actions, chunk.episode_start,
+                                       initial_state=state, gate_temperature=1.0, action_temperature=1.0,
+                                       continue_temperature=1.0, validate=False, preencode_observations=True)
+
+
+def evaluate(policy, batch, device, time_steps: int, fused: bool = True) -> dict:
     """Held-out losses per head, no gradient. batch: the collated validation sequences."""
     import torch
     from native_runner.training.v4.imitation import imitation_loss, slice_il_sequence
-    from native_runner.training.v4.learning import evaluate_recurrent_sequence
     totals, counts = Counter(), Counter()
     policy.eval()
     with torch.no_grad():
         state = policy.initial_state(batch.batch_size, device=device)
         for start in range(0, batch.time_steps, time_steps):
             chunk = slice_il_sequence(batch, start, min(batch.time_steps, start + time_steps)).to(device)
-            evaluation = evaluate_recurrent_sequence(
-                policy, chunk.observations, chunk.actions, chunk.episode_start, initial_state=state,
-                gate_temperature=1.0, action_temperature=1.0, continue_temperature=1.0, validate=False,
-                preencode_observations=True)
+            evaluation = evaluate_chunk(policy, chunk, state, fused)
             losses = imitation_loss(chunk, evaluation)
             for head in ('gate', 'candidate', 'target', 'delay'):
                 count = float(getattr(losses, f'{head}_count'))
@@ -217,6 +226,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument('--prefetch', type=int, default=1,
                         help='batches in flight per worker (each ~0.6 GB, plus ~2 GB peak while one is built)')
     parser.add_argument('--val-sides', type=int, default=32, help='held-out game sides evaluated at each checkpoint')
+    parser.add_argument('--step-eval', action='store_true',
+                        help="FirstLight's step-by-step chunk evaluation instead of il/fused.py (same numbers, slower)")
     parser.add_argument('--learning-rate', type=float, default=3e-5)
     parser.add_argument('--weight-decay', type=float, default=1e-2)
     parser.add_argument('--max-grad-norm', type=float, default=1.0)
@@ -234,7 +245,6 @@ def main(argv: list[str]) -> int:
     import il.samples  # noqa: F401  (puts the live code and its FirstLight copy on sys.path)
     from native_runner.training.v4.checkpoint import save_actor_critic_checkpoint
     from native_runner.training.v4.imitation import imitation_loss, slice_il_sequence
-    from native_runner.training.v4.learning import evaluate_recurrent_sequence
 
     if sys.platform.startswith('linux'):
         # a batch holds ~10^5 small tensors; one file descriptor each exceeds the default limit
@@ -280,7 +290,7 @@ def main(argv: list[str]) -> int:
     val_batch = batch_sequences(val_sequences, consume=True) if val_sequences else None
     if val_batch is not None:
         row = {'event': 'validation', 'update': 0, 'sides': val_batch.batch_size,
-               **evaluate(policy, val_batch, device, args.time_steps)}
+               **evaluate(policy, val_batch, device, args.time_steps, not args.step_eval)}
         print(json.dumps(row), flush=True)
         log.write(json.dumps(row) + '\n')
 
@@ -306,10 +316,7 @@ def main(argv: list[str]) -> int:
                 chunk = slice_il_sequence(batch, start, min(batch.time_steps, start + args.time_steps)).to(device)
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast):
-                    evaluation = evaluate_recurrent_sequence(
-                        policy, chunk.observations, chunk.actions, chunk.episode_start, initial_state=state,
-                        gate_temperature=1.0, action_temperature=1.0, continue_temperature=1.0,
-                        validate=False, preencode_observations=True)
+                    evaluation = evaluate_chunk(policy, chunk, state, not args.step_eval)
                     losses = imitation_loss(chunk, evaluation)
                 if not torch.isfinite(losses.total):
                     raise FloatingPointError(f'non-finite loss at epoch {epoch} group {group_index} turn {start}')
@@ -340,7 +347,7 @@ def main(argv: list[str]) -> int:
                                                            extras=args.extras))
                 if val_batch is not None:
                     row = {'event': 'validation', 'update': update,
-                           **evaluate(policy, val_batch, device, args.time_steps)}
+                           **evaluate(policy, val_batch, device, args.time_steps, not args.step_eval)}
                     print(json.dumps(row), flush=True)
                     log.write(json.dumps(row) + '\n')
             if args.smoke or (args.max_updates and update >= args.max_updates):

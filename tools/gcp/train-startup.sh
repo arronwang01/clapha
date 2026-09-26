@@ -31,6 +31,9 @@ finish() {
 }
 
 ( while true; do
+    # RAM and GPU headroom once a minute (resources.log), to tune workers and batch size from here
+    echo "$(date -u +%T) ram_used_gb=$(free -g | awk '/Mem:/{print $3"/"$2}') gpu=$(nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader 2>/dev/null)" >> /var/log/clapha-resources.log
+    gcloud storage cp /var/log/clapha-resources.log "$OUT/resources.log" -q
     gcloud storage cp /var/log/clapha-train.log "$OUT/startup.log" -q
     [ -f "$W/clapha/runs/train.log" ] && gcloud storage cp "$W/clapha/runs/train.log" "$OUT/train.log" -q
     sleep 60
