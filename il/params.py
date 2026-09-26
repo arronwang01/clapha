@@ -46,6 +46,12 @@ def command_delay(replay_tag: str, owner: int) -> int:
     return REPLAY_TICK_AFTER_ISSUE + _draw(OWN_OVERHEAD_TICKS, 'overhead', replay_tag, owner)
 
 
+def command_delay_in(replay_tag: str, owner: int, low: int, high: int) -> int:
+    """A delay drawn uniformly from [low, high] ticks for one actor in one replay (reproducible):
+    training on a wide range teaches the model to act right for whatever delay it is told."""
+    return _draw({value: 1 for value in range(int(low), int(high) + 1)}, 'delay-range', replay_tag, owner)
+
+
 def opponent_lead(replay_tag: str, source_index: int) -> int:
     """Ticks before it executes (X = L + 1) that one opponent command becomes visible to the actor."""
     return _draw(OPPONENT_LEAD_TICKS, 'lead', replay_tag, source_index)

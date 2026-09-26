@@ -39,7 +39,14 @@ if str(CLAPHA) not in sys.path:
     sys.path.insert(0, str(CLAPHA))
 
 LABELS_VERSION = 'clapha-teacher-labels.v1'
-SHIFT_TICKS = 25            # our delays are 23-27 ticks: five 5-tick decision turns; bins take the rest
+SHIFT_TICKS = 25            # the measured delays (23-27 ticks): five 5-tick decision turns; bins take the rest
+
+
+def shift_ticks(delay: int) -> int:
+    """Whole decision turns between the student's turn and the teacher's turn whose play lands in
+    the student's window: the nearest multiple of 5 to the delay (25 for the measured 23-27);
+    the delay bin takes the remaining -2..+2 ticks."""
+    return 5 * int(round(int(delay) / 5.0))
 MAX_MICRO = 2
 KEY_FIELDS = ('variant', 'native_visible_card_id', 'effective_card_vocab_id', 'effective_form',
               'ability_vocab_id', 'native_source_entity')
@@ -261,14 +268,15 @@ def student_labels(sequence, ticks, labels: dict, delay: int, stats: Counter) ->
     import torch
     from native_runner.training.v4.tensors import GATE_ACT, GATE_WAIT, TARGET_GRID, ActionSequenceV4
     index = {int(tick): position for position, tick in enumerate(labels['ticks'])}
+    shift = shift_ticks(delay)
     actions, p_target, gate_weight, cond_weight = [], [], [], []
     for observation, tick in zip(sequence.observations, ticks):
         candidates = observation.candidates
         rows, uids, cells, bins = [-1] * MAX_MICRO, [-1] * MAX_MICRO, [-1] * MAX_MICRO, [-1] * MAX_MICRO
         matched, p, has_turn = 0, 0.0, 0.0
-        position = index.get(int(tick) + SHIFT_TICKS)
+        position = index.get(int(tick) + shift)
         if position is None:
-            stats['teacher: no turn 25 ticks later'] += 1
+            stats['teacher: no turn a delay later'] += 1
         else:
             has_turn = 1.0
             p_act = float(labels['p_act'][position])
@@ -285,7 +293,7 @@ def student_labels(sequence, ticks, labels: dict, delay: int, stats: Counter) ->
                 else:
                     cell = -1
                 # same landing tick: t + delay + b = (t + 25) + b'  ->  b = b' + 25 - delay
-                shifted = min(4, max(0, int(labels['bin'][position][step]) + SHIFT_TICKS - int(delay)))
+                shifted = min(4, max(0, int(labels['bin'][position][step]) + shift - int(delay)))
                 if step:
                     shifted = max(shifted, bins[0])      # FirstLight keeps micro actions in order
                 rows[step], uids[step], cells[step], bins[step] = row, int(candidates.uid[0, row]), cell, shifted

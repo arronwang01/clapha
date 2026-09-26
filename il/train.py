@@ -114,11 +114,13 @@ class ReplaySequences(UnitsViaFile):
     """torch Dataset: one ILSequenceV4 per (replay, actor), made by the live code; with the
     teacher's labels on the same turns (il/teacher.py) when `teacher` is the frames directory."""
 
-    def __init__(self, units, max_turns: int | None = None, extras: bool = False, teacher: Path | None = None):
+    def __init__(self, units, max_turns: int | None = None, extras: bool = False, teacher: Path | None = None,
+                 delay_range: tuple[int, int] | None = None):
         self.units = list(units)
         self.max_turns = max_turns
         self.extras = extras
         self.teacher = teacher
+        self.delay_range = delay_range
 
     def __len__(self) -> int:
         return len(self.units)
@@ -131,17 +133,20 @@ class ReplaySequences(UnitsViaFile):
         stats: Counter = Counter()
         labels = None
         try:
+            from il.params import command_delay, command_delay_in
             header, frames = load_replay(Path(path))
+            # this side's delay (decision -> replay tick): the measured table, or a wide range
+            delay = (command_delay(header['replay_tag'], actor) if self.delay_range is None
+                     else command_delay_in(header['replay_tag'], actor, *self.delay_range))
             if self.teacher is None:
-                sequence = actor_sequence(header, frames, actor, stats, extras=self.extras)
+                sequence = actor_sequence(header, frames, actor, stats, delay=delay, extras=self.extras)
             else:
-                from il.params import command_delay
                 from il.teacher import label_path, load_labels, student_labels
-                sequence, ticks = actor_sequence(header, frames, actor, stats, extras=self.extras, with_ticks=True)
+                sequence, ticks = actor_sequence(header, frames, actor, stats, delay=delay, extras=self.extras,
+                                                 with_ticks=True)
                 if sequence is not None:
                     teacher = load_labels(label_path(self.teacher, path, actor))
-                    labels = student_labels(sequence, ticks, teacher, command_delay(header['replay_tag'], actor),
-                                            stats)
+                    labels = student_labels(sequence, ticks, teacher, delay, stats)
         except Exception as error:  # noqa: BLE001  (one bad replay must not stop training)
             return {'error': f'{Path(path).name} actor {actor}: {type(error).__name__}: {error}'[:300]}
         if sequence is not None and self.max_turns and sequence.time_steps > self.max_turns:
@@ -351,6 +356,9 @@ def main(argv: list[str]) -> int:
     parser.add_argument('--head-lr-mult', type=float, default=10.0, help='learning rate multiplier for the new head')
     parser.add_argument('--limit-units', type=int, default=0, help='train on the first N sides only (tests)')
     parser.add_argument('--max-updates', type=int, default=0, help='stop after N updates (tests)')
+    parser.add_argument('--delay-range', type=int, nargs=2, metavar=('LOW', 'HIGH'),
+                        help='draw each side delay (decision -> replay tick) uniformly from LOW..HIGH ticks '
+                             '(default: the measured 23-27 table)')
     parser.add_argument('--teacher', action='store_true',
                         help='self-distillation: add the no-delay teacher labels in <frames>/teacher (il/teacher.py)')
     parser.add_argument('--teacher-weight', type=float, default=1.0)
@@ -409,7 +417,8 @@ def main(argv: list[str]) -> int:
         return {**values, **(extras_payload(head) if head is not None else {})}
     autocast = device.type == 'cuda'
     max_turns = 64 if args.smoke else None
-    val_data = ReplaySequences(val_units[:args.val_sides], max_turns, args.extras, teacher_dir)
+    delay_range = tuple(args.delay_range) if args.delay_range else None
+    val_data = ReplaySequences(val_units[:args.val_sides], max_turns, args.extras, teacher_dir, delay_range)
     val_items = [item for item in (val_data[i] for i in range(len(val_data))) if item.get('sequence') is not None]
     val_batch, val_teacher = None, None
     if val_items:
@@ -431,7 +440,7 @@ def main(argv: list[str]) -> int:
         if epoch == 0 and args.skip_sides:
             order = order[args.skip_sides:]
             print(f'continuing: {args.skip_sides} sides of epoch 0 already trained, {len(order)} to go', flush=True)
-        loader = DataLoader(ReplaySequences(order, max_turns, args.extras, teacher_dir), batch_size=args.batch,
+        loader = DataLoader(ReplaySequences(order, max_turns, args.extras, teacher_dir, delay_range), batch_size=args.batch,
                             shuffle=False,
                             num_workers=args.workers, collate_fn=_collate, persistent_workers=False,
                             worker_init_fn=_one_thread,
