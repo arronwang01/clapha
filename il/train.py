@@ -33,10 +33,31 @@ if str(CLAPHA) not in sys.path:
 
 
 def select_units(frames_dir: Path, *, max_tower_error: int = 100) -> list[tuple[str, int]]:
-    """(replay file, actor) for every Hog 2.6 side of an exactly replayed game."""
+    """(replay file, actor) for every Hog 2.6 side of an exactly replayed game. Cached in
+    units.json next to the index (reading every header takes minutes), keyed by the index size."""
+    index_text = (frames_dir / 'index.jsonl').read_text()
+    cache = frames_dir / 'units.json'
+    key = [len(index_text), max_tower_error]
+    if cache.exists():
+        try:
+            saved = json.loads(cache.read_text())
+            if saved.get('key') == key:
+                return [(str(frames_dir / relative), int(actor)) for relative, actor in saved['units']]
+        except (ValueError, KeyError):
+            pass
+    selected = _select_units(frames_dir, index_text, max_tower_error)
+    try:
+        cache.write_text(json.dumps({'key': key, 'units': [[str(Path(path).relative_to(frames_dir)), actor]
+                                                           for path, actor in selected]}))
+    except OSError:
+        pass
+    return selected
+
+
+def _select_units(frames_dir: Path, index_text: str, max_tower_error: int) -> list[tuple[str, int]]:
     from il.samples import HOG26_CARDS
     units = []
-    for line in (frames_dir / 'index.jsonl').read_text().splitlines():
+    for line in index_text.splitlines():
         try:
             record = json.loads(line)
         except ValueError:
@@ -49,9 +70,9 @@ def select_units(frames_dir: Path, *, max_tower_error: int = 100) -> list[tuple[
         if path.exists():
             units.append((str(path), record['tag']))
     selected = []
-    from il.frames import load_replay
+    from il.frames import load_header
     for path, tag in units:
-        header, _frames = load_replay(Path(path), with_replay=False)
+        header = load_header(Path(path))
         for actor, deck in enumerate(header['timeline']['decks']):
             if HOG26_CARDS <= set(deck):
                 selected.append((path, actor))

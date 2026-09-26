@@ -68,3 +68,16 @@ def load_replay(path: Path, with_replay: bool = True) -> tuple[dict, list[dict]]
     if with_replay:
         header['calibrated'] = pickle.loads(base64.b64decode(encoded))
     return header, [orjson.loads(line) for line in lines[1:]]
+
+
+def load_header(path: Path) -> dict:
+    """The header line alone (streamed: the snapshots are not decompressed or parsed); without the
+    calibrated replay."""
+    import io
+    import orjson
+    import zstandard
+    with path.open('rb') as handle, zstandard.ZstdDecompressor().stream_reader(handle) as reader:
+        line = io.BufferedReader(reader, buffer_size=1 << 20).readline()
+    header = orjson.loads(line)
+    header.pop('calibrated_pickle', None)
+    return header
