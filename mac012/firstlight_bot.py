@@ -109,6 +109,7 @@ class FirstLightRunner:
         self.device = device
         self.decision_ticks = POLICY_DECISION_TICKS
         self.first_decision_tick = FIRST_POLICY_DECISION_TICK
+        self.clapha_inputs, self.has_extras, self.elixir_lead = False, False, 0
         if model is None:
             self.model = None
         else:
@@ -118,8 +119,16 @@ class FirstLightRunner:
             root = str(HERE.parent)
             if root not in sys.path:
                 sys.path.insert(0, root)
-            from il.extras import load_policy
-            self.model = load_policy(CHECKPOINTS.get(model, Path(model)), device)
+            from il.extras import checkpoint_extra, load_policy
+            path = CHECKPOINTS.get(model, Path(model))
+            self.model = load_policy(path, device)
+            # Our checkpoints (il/train.py) were trained on the screen's hand and elixir, elixir
+            # counted as of the tap, and (Stage B) the extras; the console builds their inputs
+            # that way. FirstLight's own keep today's inputs exactly.
+            recipe = str(checkpoint_extra(path).get('recipe', '')) if model not in CHECKPOINTS else ''
+            self.clapha_inputs = recipe.startswith('clapha')
+            self.has_extras = '_extras_head' in self.model.__dict__
+            self.elixir_lead = 9 if self.clapha_inputs else 0    # median tap overhead 5 + window 4
         self.sample = bool(sample)
         self.session = None
         self.actor_owner = None

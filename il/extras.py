@@ -215,3 +215,9 @@ def install_session_hook(session) -> None:
     tensorizer.tensorize = tensorize
     session.next_extras = None
     session._extras_hooked = True
+
+
+def checkpoint_extra(path: str | Path) -> dict:
+    """The `extra` payload of a checkpoint (recipe, extras head, ...); {} if it has none."""
+    payload = torch.load(Path(path), map_location='cpu', weights_only=False)
+    return dict(payload.get('extra') or {})

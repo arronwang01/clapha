@@ -471,6 +471,54 @@ class Bot:
                   f'tap sent {timing.get("send_ms", 0):.0f} ms after decision{gesture}, '
                   f'tap -> issued {ticks} ticks ({ticks * 50} ms), then 21 ticks to land')
 
+    @staticmethod
+    def _input_view(runner, frame: dict, me: dict, in_flight: list[dict]):
+        """(frame for the observation, own row to tap from, elixir reserved) for this runner.
+
+        FirstLight's checkpoints get the game state, with in-flight taps' elixir reserved -- what
+        they have always had here. Ours (il/train.py) were trained on the screen: in-flight cards
+        already out of the hand, the next card in, their cost off the elixir (il/SPEC.md), built
+        by the same firstlight_obs.screen_view as their training data; taps then find a card at
+        its screen position. If the reader's hand does not fit the in-flight list, the game state
+        is used for this frame rather than a guess."""
+        if not getattr(runner, 'clapha_inputs', False):
+            return frame, me, sum(f['cost'] for f in in_flight)
+        try:
+            view = FLO.screen_view(me, [f['card'] for f in in_flight])
+        except ValueError:
+            return frame, me, sum(f['cost'] for f in in_flight)
+        side = me.get('side')
+        players = [view if p.get('side') == side else p for p in frame['players']]
+        return {**frame, 'players': players}, view, 0.0
+
+    def _feed_extras(self, runner, frame: dict, side: int, in_flight: list[dict], queue: list,
+                     accounts, hand_forms: dict) -> None:
+        """Stage B inputs for a checkpoint with the extras head (il/extras.py), as its training
+        built them: our taps not executed yet (landing tick = tap + 21 until the queue gives the
+        issue tick), the opponent's commands now in our queue, their exact elixir, our delay."""
+        from il.extras import build_extras, install_session_hook
+        tick = int(frame['game_tick'])
+        pending = []
+        for flight in in_flight:
+            issue = flight.get('issue_tick', flight['tap_tick'])
+            column, row = (flight['target'][0] // 1000, flight['target'][1] // 1000) if flight.get('target') else (None, None)
+            pending.append((flight['card'], int(hand_forms.get(flight['card'], 0)), 0,
+                            (column, row) if column is not None else None, issue + COMMAND_AGE_TICKS - tick))
+        own_account = next((a['lo'] for a in (accounts or []) if a and a.get('side') == side), None)
+        for entry in queue or ():
+            if entry.get('account_lo') == own_account or not isinstance(entry.get('issue_tick'), int):
+                continue
+            card_id, form_code, kind = V.card_identity(entry.get('card_id'))
+            if kind != 'card' or entry.get('x') is None:
+                continue
+            pending.append((card_id, form_code, 1, (int(entry['x']) // 1000, int(entry['y']) // 1000),
+                            entry['issue_tick'] + COMMAND_AGE_TICKS - tick))
+        opponent = next((p for p in frame['players'] if p.get('side') == 1 - side), {})
+        install_session_hook(runner.session)
+        runner.session.next_extras = build_extras(
+            runner.session.tensorizer, pending, opponent_elixir=(opponent.get('elixir_raw') or 0) / 10000.0,
+            delay=COMMAND_AGE_TICKS - 1 + 5)
+
     def _try_play(self, move: dict, me: dict, deck: list, reserved: float,
                   in_flight: list[dict], accounts, side: int, frame: dict) -> bool:
         """Tap one play. True when it is done with (tapped, or refused for good); False when it
@@ -795,16 +843,16 @@ class Bot:
                 executed = list(V.STATE['plays'])
             in_flight = self._settle_in_flight(in_flight, queue, executed, local_account,
                                                side, frame['game_tick'])
-            reserved = sum(f['cost'] for f in in_flight)
+            view_frame, view_me, reserved = self._input_view(runner, frame, me, in_flight)
 
             # A tap chosen a moment before the client credits the elixir (frame age, rounding)
             # waits here, briefly, until the client can actually place it.
             deferred = [d for d in deferred if time.time() - d['since'] <= DEFER_SECONDS
                         and not latch.over]
             for move in list(deferred):
-                if self._try_play(move, me, deck, reserved, in_flight, accounts, side, frame):
+                if self._try_play(move, view_me, deck, reserved, in_flight, accounts, side, frame):
                     deferred.remove(move)
-                    reserved = sum(f['cost'] for f in in_flight)
+                    view_frame, view_me, reserved = self._input_view(runner, frame, me, in_flight)
 
             # One turn per five-tick window, and never a skipped one. decide() advances a
             # recurrent state and feeds its own chosen action into the next turn, so the
@@ -850,13 +898,17 @@ class Bot:
                         1 - side: [c for c in revealed_cards.get(1 - side, [])
                                    if c in runner.opponent_seen]}
                 observation, fl_battle = FLO.build(
-                    frame, health, episode_id=str(battle), battle=fl_battle, revealed=seen,
+                    view_frame, health, episode_id=str(battle), battle=fl_battle, revealed=seen,
                     reserved=reserved + sum(a['cost'] for a in abilities_in_flight),
                     plays=executed, decks=runner.tracked_decks(),
                     hand_forms=runner.hand_forms(deck, me.get('deck_form_flags'),
                                                  me.get('evo_progress'), self.evo_required),
                     pending_ability_sources=tuple(a['source'] for a in abilities_in_flight),
-                    evo_required=self.evo_required)
+                    evo_required=self.evo_required, elixir_lead_ticks=runner.elixir_lead)
+                if runner.has_extras:
+                    self._feed_extras(runner, frame, side, in_flight, queue, accounts,
+                                      runner.hand_forms(deck, me.get('deck_form_flags'),
+                                                        me.get('evo_progress'), self.evo_required))
                 for character in sorted(fl_battle.unresolved_abilities - reported_abilities):
                     reported_abilities.add(character)
                     self.note(f'hero controller character {character} has no single FirstLight '
@@ -961,10 +1013,10 @@ class Bot:
                                    'inference_ms': (decided - started) * 1000.0,
                                    'frame_age_ms': (started - frame_time) * 1000.0,
                                    'turn_wait_ms': turn_wait_ms}}
-                if not self._try_play(move, me, deck, reserved, in_flight, accounts, side,
+                if not self._try_play(move, view_me, deck, reserved, in_flight, accounts, side,
                                       frame):
                     deferred = [d for d in deferred if d['card'] != move['card']] + [move]
-                reserved = sum(f['cost'] for f in in_flight)
+                view_frame, view_me, reserved = self._input_view(runner, frame, me, in_flight)
             ended = time.time()
             self._prev_turn_timing = {**timing_now, 'after_ms': (ended - decided) * 1000.0,
                                       'ended': ended}
