@@ -43,15 +43,16 @@ finish() {
 for _ in $(seq 1 60); do nvidia-smi && break; sleep 10; done
 nvidia-smi || { finish "no-gpu"; exit 1; }
 
-# a Python 3.11+ that already has CUDA torch (the image's); our extra packages in a venv on top
+# a Python 3.11+ that already has CUDA torch (the image's: the system python3, whose venv module
+# is not installed); our three extra packages go straight into it -- the VM is thrown away after
 PY=""
 for candidate in /opt/conda/bin/python /usr/bin/python3 $(ls /opt/*/bin/python 2>/dev/null); do
   "$candidate" -c "import sys, torch; assert sys.version_info >= (3, 11) and torch.cuda.is_available()" && { PY=$candidate; break; }
 done
 [ -n "$PY" ] || { finish "no-python-with-cuda-torch"; exit 1; }
-"$PY" -m venv --system-site-packages /opt/clapha-venv || { finish "venv"; exit 1; }
-/opt/clapha-venv/bin/pip install -q orjson zstandard safetensors || { finish "pip"; exit 1; }
-PY=/opt/clapha-venv/bin/python
+"$PY" -m pip --version || { apt-get update -qq && apt-get install -y -qq python3-pip; } || { finish "no-pip"; exit 1; }
+"$PY" -m pip install -q --break-system-packages orjson zstandard safetensors || { finish "pip"; exit 1; }
+"$PY" -c "import torch, orjson, zstandard; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())" || { finish "imports"; exit 1; }
 
 gcloud storage cp "$B/clapha-train-code.zip" . -q && python3 -m zipfile -e clapha-train-code.zip . || { finish "code"; exit 1; }
 mkdir -p clapha/ref-firstlight/checkpoints/IL clapha/runs/conv-hog26
