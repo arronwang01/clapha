@@ -12,11 +12,11 @@ Inputs at decision tick t for actor a, each stamped with the tick it became know
   own_hand       the hand as a's screen shows it: the deal, minus every play a had already
                  issued (decided in an earlier window), each replaced by its draw
   own_pending    a's plays issued but not executed (decided < t <= lands): card, tile, ticks left
-  opp_pending    opponent commands visible at t (lands - lead <= t <= lands)
+  opp_pending    opponent commands visible at t (lands + 1 - lead <= t <= lands)
   opp_history    opponent plays known at t, in order (landed, or visible as pending)
   opp_hand       deduced from the opponent's deck and history: exact once four plays are known
                  (the last four played sit in the queue; the other four are the hand)
-  command_delay  ticks from decision to landing for this actor
+  command_delay  ticks from decision to the play's replay tick for this actor (20 + overhead)
 Labels at t: a's plays whose decision tick is t, with their offset (0-4) inside the window.
 """
 from __future__ import annotations
@@ -24,7 +24,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
-from il.params import DECISION_TICKS, FIRST_DECISION_TICK, command_delay, opponent_lead
+from il.params import DECISION_TICKS, FIRST_DECISION_TICK, command_delay, opponent_seen_tick
 
 MIRROR_CARD_ID = 28000006
 
@@ -119,7 +119,7 @@ def restricted(timeline: Timeline, actor: int, tick: int) -> Timeline:
     delay = command_delay(timeline.replay_tag, actor)
     known = tuple(p for p in timeline.plays
                   if (p.owner == actor and decision_tick(p.lands, delay) < tick)
-                  or (p.owner != actor and p.lands - opponent_lead(timeline.replay_tag, p.index) <= tick))
+                  or (p.owner != actor and opponent_seen_tick(timeline.replay_tag, p.index, p.lands) <= tick))
     return replace(timeline, plays=known, deals={actor: timeline.deals[actor]},
                    first_certain_play={}, winner=None, end_tick=0)
 
@@ -175,7 +175,7 @@ def sample_at(timeline: Timeline, actor: int, tick: int) -> Sample:
     sample.known_at['own_pending'] = max([0] + [decision_tick(p.lands, delay) for p in pending])
 
     theirs = [p for p in timeline.plays if p.owner == opponent]
-    visible = [(p, p.lands - opponent_lead(tag, p.index)) for p in theirs]
+    visible = [(p, opponent_seen_tick(tag, p.index, p.lands)) for p in theirs]
     visible = [(p, seen) for p, seen in visible if seen <= tick]
     opp_pending = [(p, seen) for p, seen in visible if p.lands >= tick]
     sample.inputs['opp_pending'] = [(p.kind, p.card_id, p.grid, p.lands - tick) for p, _ in opp_pending]

@@ -28,7 +28,7 @@ CLAPHA = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(CLAPHA / 'ref-firstlight'))
 sys.path.insert(0, str(CLAPHA))
 
-from il.params import COMMAND_AGE_TICKS, FIRST_DECISION_TICK, command_delay, opponent_lead  # noqa: E402
+from il.params import REPLAY_TICK_AFTER_ISSUE, FIRST_DECISION_TICK, command_delay, opponent_seen_tick  # noqa: E402
 from il.timeline import (_hand_after, build_timeline, decision_tick, decision_ticks,  # noqa: E402
                          restricted, sample_at)
 
@@ -96,8 +96,8 @@ def audit_timeline(timeline, stats: collections.Counter, failures: list) -> None
             if opp.get('exact'):
                 opponent = 1 - actor
                 issued = [p for p in timeline.plays if p.owner == opponent and p.kind == 'card'
-                          and p.lands - COMMAND_AGE_TICKS <= tick]
-                hidden = [p for p in issued if p.lands - opponent_lead(tag, p.index) > tick]
+                          and p.lands - REPLAY_TICK_AFTER_ISSUE <= tick]
+                hidden = [p for p in issued if opponent_seen_tick(tag, p.index, p.lands) > tick]
                 if not hidden:
                     true_hand, _ = _hand_after(timeline.deals[opponent], [p.card_id for p in issued])
                     stats['opponent hands checked'] += 1

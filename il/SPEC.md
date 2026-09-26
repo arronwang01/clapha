@@ -1,7 +1,9 @@
 # Imitation samples: timing, inputs and the rules that keep them honest
 
-Status 2026-09-25: the replay-side layer (`il/timeline.py`) and its audit (`il/audit.py`) exist.
-Board state from the engine is the next stage; the model's full input list is at the end.
+Status 2026-09-25 night: replay side (`il/timeline.py`, audited by `il/audit.py`), engine
+conversion (`il/engine_convert.py`, `il/frames.py`), samples through the live code
+(`il/samples.py`), trainer (`il/train.py`, runs on the campus 4080) and engine duels with the real
+delay (`il/duel.py`). The new inputs (pending commands etc.) are the next stage.
 
 ## Timing
 
@@ -14,11 +16,16 @@ Everything is in game ticks (20 per second).
 | opponent command visible before it executes | median 14 (p10 10, p90 19) | 1131 commands, 34 sessions |
 | decision grid | every 5 ticks from tick 90 | FirstLight's policy grid |
 
-A replay tick `L` is when a play executes (its unit is on the board from `L + 1`). The human
-decided around `L - 21`. For the bot, a play that lands at `L` must be decided on the grid tick
-at or before `L - delay`, where `delay = 21 + overhead` (24-28, drawn per actor per replay from
-the measured overhead, and given to the model as an input). The label's `offset` (0-4) is how far
-into that 5-tick window the play is sent.
+One command: issued at `I` (the tap registers), executes at `X = I + 21` (hand, elixir and the
+viewer's executed plays change at `X`; its unit is on the board from `X + 1`). A replay tick `L`
+is `X - 1`: FirstLight queues it for native execution at `L + 1`, and the engine's hand still
+holds the card in the snapshot at `L` (corrected 2026-09-25 night; it was taken as `X`, putting
+decisions one tick early). So the human tapped around `L - 20`. For the bot, a play at replay
+tick `L` must be decided on the grid tick at or before `L - delay`, where `delay = 20 + overhead`
+(23-27, drawn per actor per replay from the measured overhead, and given to the model as an
+input). The label's `offset` (0-4) is how far into that 5-tick window the play is sent.
+Executed plays are dated `L + 1`, as the viewer dates them (issue + 21), and an opponent command
+is visible from `X - lead`.
 
 FirstLight labelled each play 0-4 ticks before it lands, so its models learned to act on a board
 they would only see a second later. This is the fix.
@@ -71,7 +78,8 @@ offer that play.
 
 | rule | why |
 |---|---|
-| a play dated L executes in the step after L | the engine's hand still holds the card in the snapshot at L and not at L + 5; `plays` (executed) holds it from L + 1 |
+| a play dated L executes at L + 1 | the engine's hand still holds the card in the snapshot at L and not at L + 5; a command queued for execute tick X is out of the hand in the snapshot at X; `plays` (executed) holds it from L + 1, dated L + 1 |
+| a hand slot the engine leaves empty after a play (the next card is still being drawn: a five-card cycle) is filled with the head of the cycle | the engine shows the hole for a few ticks; the screen shows the card, and a policy may already have chosen it. The reader shows the same hole as -1, so the console fills it the same way |
 | own hand and elixir are the **screen's**: plays sent and not executed are taken out of the hand (next card in) and their cost off the elixir | the client does that at the tap; the game state ~1 s later. Humans play the card that just cycled in (Hog, then the Ice Spirit behind it); on the reader's hand the bot cannot. **The console must apply the same conversion to its in-flight taps before a model trained on it plays live** (and tap by the screen hand) |
 | the mask counts elixir as of the actor's latest tap in the window (`elixir_lead_ticks` = overhead + 4) | the game checks elixir at the tap, 3-11 ticks after the decision. Labels aligned: 87% with elixir at the decision tick, 94% with elixir at the tap |
 | hero controllers are named by FirstLight's ability id (the engine's `actionDataName`) | two-hero decks exist (Hero Musketeer + Hero Ice Golem); champions have no hero form and are skipped, as live |
@@ -94,3 +102,30 @@ abilities not ready.
   ticks, so the tail is a measurement artifact of the earlier lead table, not waiting commands.
 - The live console must build these same inputs with this same code (parity check on recorded
   matches): screen hand and elixir from in-flight taps, `elixir_lead_ticks`, and the new inputs.
+
+## What the checkpoints make of these samples (2026-09-25 night)
+
+Held-out Hog 2.6 game sides (16), inputs built by the live code, loss per head (lower is better;
+guessing among ~6 cards is 1.79, among the ~500 legal tiles ~6.3):
+
+| checkpoint | label timing | labels usable | card | target tile | timing |
+|---|---|---|---|---|---|
+| fl:il (FirstLight's imitation model) | FirstLight's (execute at decision) | 99.9% | 0.82 | 2.80 | 1.56 |
+| fl:hog2 (Hog specialist, self-play) | FirstLight's | 99.9% | 1.60 | 6.27 | 5.34 |
+| fl:hog2 | the bot's (this spec) | 93% | 1.79 | 7.61 | 5.06 |
+
+fl:il predicting humans well from our inputs is the parity check: a model trained on FirstLight's
+own engine pipeline reads the live code's observations. fl:hog2 predicts human cards at chance and
+tiles worse than uniform: self-play moved it far from human play, so imitation from fl:hog2
+changes more than timing. Both starts are trained and the duel decides.
+
+## Training and evaluation
+
+- `il/train.py`: FirstLight's IL recipe (32-turn chunks, recurrent state carried, their
+  imitation_loss with act x8, AdamW 3e-5), one sequence per Hog 2.6 side of an exact replay, 2%
+  held out by tag, samples made on the fly by DataLoader workers (no tensor cache). Value head
+  left out (FirstLight's reward; RL later). Windows: `tools/windows/` (D:\crtrain\py312 has torch).
+- `il/duel.py`: two checkpoints in the engine, both fed by the live code; `live` plays tap
+  overhead + offset after the decision, wait for elixir at the tap, execute 21 ticks after it;
+  `none` is FirstLight's sandbox (execute max(1, offset) after the decision). Hog 2.6 mirrors from
+  converted decks, sides swapped each match. Abilities are not played yet (counted).

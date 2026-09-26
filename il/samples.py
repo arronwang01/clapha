@@ -41,7 +41,7 @@ import firstlight_obs as FLO          # noqa: E402  (puts the live FirstLight co
 import firstlight_bot as FLB          # noqa: E402
 
 from il.frames import load_replay      # noqa: E402
-from il.params import COMMAND_AGE_TICKS, DECISION_TICKS, FIRST_DECISION_TICK, command_delay  # noqa: E402
+from il.params import COMMAND_AGE_TICKS, DECISION_TICKS, FIRST_DECISION_TICK, REPLAY_TICK_AFTER_ISSUE, command_delay  # noqa: E402
 from il.timeline import decision_tick, timeline_from_json  # noqa: E402
 
 TOWER_IDS = range(5000000, 5000006)
@@ -150,6 +150,11 @@ def reader_frame(frame: dict, actor: int, deck_forms: dict[int, list[int]], in_f
             for evolution in rich.get('evolutionRuntime') or ():
                 progress[int(evolution['deckSlot'])] = int(evolution.get('progress') or 0)
             elixir = int(plain['elixirRaw'])
+            # after a play executes, the engine leaves its hand slot empty for a few ticks while the
+            # next card (the head of a five-card cycle) is drawn; the screen shows it already
+            for position, slot in enumerate(hand):
+                if slot < 0 and len(cycle) > 4:
+                    hand[position] = cycle.pop(0)
             for play in in_flight:          # sent, not executed: already gone on screen
                 if play.kind == 'card':
                     slot = deck.index(play.card_id)
@@ -170,9 +175,9 @@ def reader_frame(frame: dict, actor: int, deck_forms: dict[int, list[int]], in_f
 
 
 def executed_plays(timeline, tick: int, form_at) -> list[dict]:
-    """The viewer's STATE['plays'] at `tick`: every command that has executed, both sides,
-    dated issue + 21 (as the viewer dates them). A command dated L executes in the step after
-    L: the engine's hand still holds the card in the snapshot at L and not at L + 5."""
+    """The viewer's STATE['plays'] at `tick`: every command that has executed, both sides, dated
+    as the viewer dates them, issue + 21 = its execute tick L + 1 (il/params: the engine's hand
+    still holds the card in the snapshot at L; the viewer lists the play from L + 1)."""
     from native_runner.arena import cell_to_world
     rows = []
     for p in timeline.plays:
@@ -181,9 +186,9 @@ def executed_plays(timeline, tick: int, form_at) -> list[dict]:
         x = y = None
         if p.grid is not None:
             x, y = cell_to_world(p.grid)
-        rows.append({'tick': p.lands, 'side': p.owner, 'card_id': p.card_id if p.kind == 'card' else 65535,
+        rows.append({'tick': p.lands + 1, 'side': p.owner, 'card_id': p.card_id if p.kind == 'card' else 65535,
                      'form_code': form_at(p) if p.kind == 'card' else 0, 'kind': p.kind,
-                     'x': x, 'y': y, 'seq': p.index, 'issue_tick': p.lands - COMMAND_AGE_TICKS})
+                     'x': x, 'y': y, 'seq': p.index, 'issue_tick': p.lands + 1 - COMMAND_AGE_TICKS})
     return rows
 
 
@@ -195,19 +200,23 @@ def revealed_cards(timeline, tick: int) -> dict[int, list[int]]:
     return out
 
 
-def actor_samples(header: dict, frames: list[dict], actor: int, stats: Counter, keep: bool = False) -> list:
+def actor_samples(header: dict, frames: list[dict], actor: int, stats: Counter, keep: bool = False,
+                  delay: int | None = None) -> list:
     """Replay one actor's turns; returns (tick, frame batch, action sequence, label usable)."""
+    import torch
     from native_runner.training.v4.expert import (ExpertActionAlignmentError, TimedExpertActionV4,
                                                   build_expert_action_batch, replay_expert_actions)
     timeline = timeline_from_json(header['timeline'])
     tag = timeline.replay_tag
-    delay = command_delay(tag, actor)
+    # delay None: the bot's (21 + measured overhead); 0 reproduces FirstLight's labels (execute at
+    # the decision tick), for comparison
+    delay = command_delay(tag, actor) if delay is None else int(delay)
     calibrated = header['calibrated']
     deck_forms = {side: list(timeline.form_availability[side]) for side in (0, 1)}
     own_plays = [p for p in timeline.plays if p.owner == actor]
-    # the tap goes out (delay - 21) ticks after the decision plus the play's offset in its
+    # the tap goes out (delay - 20) ticks after the decision plus the play's offset in its
     # window (0-4); the game checks elixir then, so the mask counts elixir as of the latest tap
-    send_lead = delay - COMMAND_AGE_TICKS + DECISION_TICKS - 1
+    send_lead = delay - REPLAY_TICK_AFTER_ISSUE + DECISION_TICKS - 1 if delay >= REPLAY_TICK_AFTER_ISSUE else 0
 
     # the expert's actions, re-timed: a play landing at L is decided on the grid tick at or
     # before L - delay, and FirstLight's window contract reads its offset (0-4) from the tick
@@ -289,9 +298,35 @@ def actor_samples(header: dict, frames: list[dict], actor: int, stats: Counter, 
                                                  config=tensorizer.config, validate=False)
         tensorizer.record_action(sequence, batch, row=0, validate=False)
         if keep:
-            samples.append((tick, batch.to_storage('cpu'), sequence, usable))
+            samples.append((tick, batch.to_storage('cpu', float_dtype=torch.float16), sequence, usable))
     runner.end_battle()
     return samples
+
+
+HOG26_CARDS = frozenset({26000021, 26000014, 27000000, 26000038, 26000030, 26000010, 28000000, 28000011})
+
+
+def actor_sequence(header: dict, frames: list[dict], actor: int, stats: Counter, delay: int | None = None):
+    """FirstLight's ILSequenceV4 for one actor: every decision turn from tick 90, in order.
+
+    Unusable labels (not offered by the live mask at the decision tick) keep their frame but
+    leave the gate out of the loss, FirstLight's own rule. The value head is left out
+    (value_loss_mask False): its return definition is FirstLight's reward, and RL comes later."""
+    import torch
+    from native_runner.training.v4.imitation import ILSequenceV4
+    samples = actor_samples(header, frames, actor, stats, keep=True, delay=delay)
+    if not samples:
+        return None
+    steps = len(samples)
+    return ILSequenceV4(
+        observations=tuple(storage for _tick, storage, _sequence, _usable in samples),
+        actions=tuple(sequence for _tick, _storage, sequence, _usable in samples),
+        episode_start=torch.tensor([[step == 0] for step in range(steps)], dtype=torch.bool),
+        valid_mask=torch.ones(steps, 1, dtype=torch.bool),
+        returns=torch.zeros(steps, 1, dtype=torch.float32),
+        gate_loss_mask=torch.tensor([[usable] for _t, _s, _q, usable in samples], dtype=torch.bool),
+        value_loss_mask=torch.zeros(steps, 1, dtype=torch.bool),
+        sequence_id=f"{header['replay_tag']}:owner-{actor}")
 
 
 def _reason(error, window, observation) -> str:

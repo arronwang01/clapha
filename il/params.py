@@ -1,16 +1,20 @@
 """Timing constants for imitation samples, each measured on the live game (2026-09-25).
 
-A replay tick L (RoyaleAPI data-t, FirstLight's source_command_tick) is the boundary at which a
-command executes; its unit is on the board from L + 1. Every command executes
-COMMAND_AGE_TICKS after it is issued, for humans too, so the human decided on the board at
-about L - 21. Our bot decides on a frame, issues OWN_OVERHEAD ticks later, and the play lands
-21 ticks after that: a bot sample for a play landing at L is taken at L - (21 + overhead).
+One command, live (queue probe) and in Null's engine alike: it is issued at I (the tap registers)
+and executes at X = I + COMMAND_AGE_TICKS: hand, elixir and the viewer's executed plays change at
+X, and its unit is on the board from X + 1 (the measured "queued -> unit 22 ticks"). A replay tick
+L (RoyaleAPI data-t, FirstLight's source_command_tick) is X - 1: FirstLight queues it for native
+execution at L + 1 (its native_observable_tick), and the engine's hand still holds the card in the
+snapshot at L. So L = I + 20 (REPLAY_TICK_AFTER_ISSUE). The human tapped at about L - 20; our bot
+decides on a frame d and its tap registers OWN_OVERHEAD ticks later, so a play at replay tick L is
+decided at d = L - (20 + overhead) (command_delay).
 """
 from __future__ import annotations
 
 import hashlib
 
 COMMAND_AGE_TICKS = 21          # issue -> execute, both players (queue_lead, NOTES "Delay")
+REPLAY_TICK_AFTER_ISSUE = COMMAND_AGE_TICKS - 1   # issue -> replay tick L (= execute - 1)
 DECISION_TICKS = 5              # the policy's decision grid (FirstLight POLICY_DECISION_TICKS)
 FIRST_DECISION_TICK = 90        # FirstLight FIRST_POLICY_DECISION_TICK
 
@@ -38,10 +42,15 @@ def _draw(distribution: dict[int, int], *key: object) -> int:
 
 
 def command_delay(replay_tag: str, owner: int) -> int:
-    """Ticks from the bot's decision frame to the play landing, for one actor in one replay."""
-    return COMMAND_AGE_TICKS + _draw(OWN_OVERHEAD_TICKS, 'overhead', replay_tag, owner)
+    """Ticks from the bot's decision frame to a play's replay tick L, for one actor in one replay."""
+    return REPLAY_TICK_AFTER_ISSUE + _draw(OWN_OVERHEAD_TICKS, 'overhead', replay_tag, owner)
 
 
 def opponent_lead(replay_tag: str, source_index: int) -> int:
-    """Ticks before landing that one opponent command becomes visible to the actor."""
+    """Ticks before it executes (X = L + 1) that one opponent command becomes visible to the actor."""
     return _draw(OPPONENT_LEAD_TICKS, 'lead', replay_tag, source_index)
+
+
+def opponent_seen_tick(replay_tag: str, source_index: int, lands: int) -> int:
+    """The tick an opponent command with replay tick `lands` shows in the actor's queue."""
+    return lands + 1 - opponent_lead(replay_tag, source_index)
