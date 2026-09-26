@@ -31,7 +31,7 @@ if str(CLAPHA) not in sys.path:
     sys.path.insert(0, str(CLAPHA))
 
 import il.samples as S                       # noqa: E402  (live code on sys.path first)
-from il.params import COMMAND_AGE_TICKS, DECISION_TICKS, OWN_OVERHEAD_TICKS  # noqa: E402
+from il.params import COMMAND_AGE_TICKS, DECISION_TICKS, OWN_OVERHEAD_TICKS, elixir_lead, live_delay  # noqa: E402
 
 DEFER_TICKS = 30        # a tap that cannot be afforded is dropped after this long (console: 1.5 s)
 
@@ -52,6 +52,11 @@ class Command:
     native_object_id: int | None = None      # an ability's source unit in the engine
     entity_id: int | None = None             # the same unit in the live code's ids
     hand_slot: int | None = None             # the engine hand index it was queued from
+    moment: int = 0                          # decision tick + the model's offset: the tap without delay
+
+
+def _lead_arg(value: str):
+    return 'auto' if value == 'auto' else int(value)
 
 
 def _overhead(rng: random.Random) -> int:
@@ -60,7 +65,7 @@ def _overhead(rng: random.Random) -> int:
 
 
 def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id: str, record: bool = False,
-               extra_delay: dict | None = None) -> dict:
+               extra_delay: dict | None = None, measured: dict | None = None) -> dict:
     """One battle to the end; returns the result and per-side counters.
 
     The engine is stepped to the next thing that happens: a decision turn (every 5 ticks), a tap
@@ -80,6 +85,13 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
                        'abilities': 0, 'abilities_dropped': 0} for side in (0, 1)}
     tick, ended, seq = 0, False, 0
     extra_delay = extra_delay or {0: 0, 1: 0}   # ticks added to a live side's tap (a slower pipeline)
+    # lead 'auto': as the console does, each side's delay is measured from its own plays (moment
+    # -> issue, il.params.live_delay), told to an extended model, and sets the mask's elixir lead
+    # per pipeline, kept across matches as the console keeps it across battles
+    measured = measured if measured is not None else {0: [], 1: []}
+
+    def lead_now(side: int) -> int:
+        return elixir_lead(live_delay(measured[side])) if leads[side] == 'auto' else int(leads[side])
     recorded_frames: list[dict] = []          # record=True: every decision-tick snapshot, as a conversion saves
     done: list[Command] = []                   # executed commands, for the recording
 
@@ -93,6 +105,8 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
             if screen_elixir(command.side, logic) >= command.cost - 1e-6:
                 command.execute = tick + COMMAND_AGE_TICKS
                 counters[command.side]['tapped'] += 1
+                if command.kind == 'card' and tick == command.tap:
+                    measured[command.side].append(tick - command.moment)
             elif tick - command.tap > DEFER_TICKS:
                 counters[command.side]['dropped_elixir'] += 1
                 commands.remove(command)
@@ -118,6 +132,8 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
         opponent_raw = {p['owner']: p['elixirRaw'] for p in frame['state']['players']}[1 - side]
         overhead = sum(k * v for k, v in OWN_OVERHEAD_TICKS.items()) / sum(OWN_OVERHEAD_TICKS.values())
         delay = round(COMMAND_AGE_TICKS - 1 + overhead + extra_delay[side]) if delays[side] == 'live' else 1
+        if delays[side] == 'live' and leads[side] == 'auto':
+            delay = live_delay(measured[side])
         runner.session.next_extras = build_extras(runner.session.tensorizer, pending,
                                                   opponent_elixir=opponent_raw / 10000.0, delay=delay)
 
@@ -239,7 +255,7 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
                 plays=executed_rows, decks=runner.tracked_decks(),
                 hand_forms=runner.hand_forms(me['deck_card_ids'], me['deck_form_flags'], me['evo_progress']),
                 pending_ability_sources=tuple(c.entity_id for c in commands if c.side == side and c.kind == 'ability'),
-                elixir_lead_ticks=leads[side])
+                elixir_lead_ticks=lead_now(side))
             if tick < runner.first_decision_tick:
                 runner.observe(observation)
                 continue
@@ -265,7 +281,8 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
                 elif kind == 'play_card' and target_grid is not None:
                     counters[side]['decided'] += 1
                     command = Command(side=side, card_id=int(card_id), grid=(int(target_grid[0]), int(target_grid[1])),
-                                      decided=tick, tap=tap, seq=seq, cost=S._card_cost(int(card_id)) or 0.0)
+                                      decided=tick, tap=tap, seq=seq, cost=S._card_cost(int(card_id)) or 0.0,
+                                      moment=tick + int(offset))
                 else:
                     continue
                 if delays[side] != 'live':
@@ -372,8 +389,10 @@ def main(argv: list[str]) -> int:
     parser.add_argument('--a-delay', default='live', choices=('live', 'none'))
     parser.add_argument('--b', default='fl:hog2')
     parser.add_argument('--b-delay', default='none', choices=('live', 'none'))
-    parser.add_argument('--a-lead', type=int, default=0, help="elixir_lead_ticks for a's mask (0 = live today)")
-    parser.add_argument('--b-lead', type=int, default=0)
+    parser.add_argument('--a-lead', type=_lead_arg, default=0,
+                        help="elixir_lead_ticks for a's mask (0 = FirstLight's), or auto: the console's rule "
+                             "(delay measured from this side's plays, told to an extended model, lead from it)")
+    parser.add_argument('--b-lead', type=_lead_arg, default=0)
     parser.add_argument('--matches', type=int, default=20)
     parser.add_argument('--a-extra-delay', type=int, default=0,
                         help="ticks added to a's taps (a slower pipeline); an extended model is told the true delay")
@@ -394,6 +413,7 @@ def main(argv: list[str]) -> int:
               else FLB.FirstLightRunner(args.b)}
     rng = random.Random(args.seed)
     wins = {'a': 0, 'b': 0, 'draw': 0}
+    overheads = {'a': [], 'b': []}          # each model's measured delays (lead auto), across matches
     for index, (config, forms, tag) in enumerate(hog26_matchups(args.frames, args.matches, args.seed)):
         a_side = index % 2          # sides swapped every match
         runners = {a_side: models['a'], 1 - a_side: models['b']}
@@ -403,7 +423,8 @@ def main(argv: list[str]) -> int:
         try:
             result = play_match(native, runners, delays, leads, config, forms, rng, f'{tag[:8]}-{index}',
                                 record=args.record is not None,
-                                extra_delay={a_side: args.a_extra_delay, 1 - a_side: args.b_extra_delay})
+                                extra_delay={a_side: args.a_extra_delay, 1 - a_side: args.b_extra_delay},
+                                measured={a_side: overheads['a'], 1 - a_side: overheads['b']})
         except Exception as error:  # noqa: BLE001  (one broken match must not end the set)
             print(f'match {index + 1} failed: {type(error).__name__}: {error}', flush=True)
             for runner in runners.values():

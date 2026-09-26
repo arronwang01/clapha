@@ -30,6 +30,9 @@ from cycle_tracker import Tracker, opponent_deck  # noqa: E402
 from mac_profile import ADB, SERIAL  # type: ignore  # noqa: E402
 from native_core.mumu_live_actions import ScreenLayout, send_card_taps  # noqa: E402
 from native_core.mumu_live_protocol import adb_run  # noqa: E402
+if str(Path(__file__).resolve().parents[1]) not in sys.path:
+    sys.path.append(str(Path(__file__).resolve().parents[1]))   # after mac012: shadows nothing
+from il.params import elixir_lead, live_delay  # noqa: E402  (the delay the model is told)
 
 PORT = int(os.environ.get('CR_CONSOLE_PORT', '8777'))
 LOG_FILE = Path(__file__).resolve().parents[1] / 'build' / f'bot_{PORT}.log'
@@ -214,6 +217,12 @@ class Bot:
         self.seen_plays = 0
         self.deduced = ''
         self.rtt: list[int] = []   # our taps: game ticks from tap to the command's issue tick
+        # Each play's pipeline delay: ticks from its moment (decision turn + the model's 0-4 tick
+        # offset) to its issue tick, plays held for elixir left out. The model is told the delay
+        # this gives (il.params.live_delay) and a checkpoint of ours sets its elixir lead from it;
+        # kept across battles, since it belongs to this setup rather than to a match.
+        self.overheads: list[int] = []
+        self.told_delay: int | None = None
         self.tapper = None
         self.opponent_intel = None
 
@@ -381,6 +390,9 @@ class Bot:
                 claimed.add(key)
                 self.rtt.append(max(0, entry['issue_tick'] - flight['tap_tick']))
                 del self.rtt[:-50]
+                if flight.get('turn') is not None and not flight.get('elixir_wait'):
+                    self.overheads.append(max(0, entry['issue_tick'] - flight['turn'] - flight['offset']))
+                    del self.overheads[:-50]
                 self._report_latency(flight)
                 self._report_placement(flight, entry)
                 break
@@ -492,7 +504,7 @@ class Bot:
         return {**frame, 'players': players}, view, 0.0
 
     def _feed_extras(self, runner, frame: dict, side: int, in_flight: list[dict], queue: list,
-                     accounts, hand_forms: dict) -> None:
+                     accounts, hand_forms: dict, delay: int = COMMAND_AGE_TICKS - 1 + 5) -> None:
         """Stage B inputs for a checkpoint with the extras head (il/extras.py), as its training
         built them: our taps not executed yet (landing tick = tap + 21 until the queue gives the
         issue tick), the opponent's commands now in our queue, their exact elixir, our delay."""
@@ -522,7 +534,7 @@ class Bot:
         install_session_hook(runner.session)
         runner.session.next_extras = build_extras(
             runner.session.tensorizer, pending, opponent_elixir=(opponent.get('elixir_raw') or 0) / 10000.0,
-            delay=COMMAND_AGE_TICKS - 1 + 5)
+            delay=delay)
 
     def _try_play(self, move: dict, me: dict, deck: list, reserved: float,
                   in_flight: list[dict], accounts, side: int, frame: dict) -> bool:
@@ -536,6 +548,8 @@ class Bot:
         name = V.CARDS.get(card, {}).get('name', str(card))
         if any(f['card'] == card for f in in_flight):
             return True        # already on its way; the policy's state includes it
+        if int(frame['game_tick']) < move.get('not_before', 0):
+            return False       # its moment in the turn (the model's 0-4 tick offset) has not come
         positions = [pos for pos, index in enumerate(me['hand_deck_indices'])
                      if 0 <= index < len(deck) and deck[index] == card]
         if not positions:
@@ -543,6 +557,7 @@ class Bot:
         position = positions[0]
         cost = float(V.CARDS.get(card, {}).get('elixir') or 0)
         if me['elixir_raw'] / 10000.0 - reserved < cost - 1e-6:
+            move['elixir_wait'] = True
             return False       # the client cannot place it yet
         cell = screen_cell(move['column'], move['row'], side)
         allowed, reason = scope_gate.check(accounts, side)
@@ -571,6 +586,8 @@ class Bot:
                           'form': int((getattr(self, '_hand_forms', None) or {}).get(card, 0)),
                           'cost': cost, 'tap_tick': int(frame['game_tick']),
                           'tap_time': sent, 'timing': timing,
+                          'turn': move.get('turn'), 'offset': int(move.get('offset', 0)),
+                          'elixir_wait': bool(move.get('elixir_wait')),
                           'target': (move['column'] * 1000 + 500, move['row'] * 1000 + 500)})
         self.plays += 1
         self.last_play = f'{name} at row {move["row"]} col {move["column"]}'
@@ -903,6 +920,14 @@ class Bot:
                 seen = {side: revealed_cards.get(side, []),
                         1 - side: [c for c in revealed_cards.get(1 - side, [])
                                    if c in runner.opponent_seen]}
+                delay = live_delay(self.overheads)
+                if runner.clapha_inputs:
+                    runner.elixir_lead = elixir_lead(delay)
+                if delay != self.told_delay:
+                    self.told_delay = delay
+                    self.note(f'delay {delay} ticks from decision to the play\'s replay tick '
+                              f'(median of our last {min(len(self.overheads), 9)} plays, 5-tick prior)'
+                              + (f'; elixir lead {runner.elixir_lead}' if runner.clapha_inputs else ''))
                 observation, fl_battle = FLO.build(
                     view_frame, health, episode_id=str(battle), battle=fl_battle, revealed=seen,
                     reserved=reserved + sum(a['cost'] for a in abilities_in_flight),
@@ -914,7 +939,8 @@ class Bot:
                 self._hand_forms = runner.hand_forms(deck, me.get('deck_form_flags'),
                                                      me.get('evo_progress'), self.evo_required)
                 if runner.has_extras:
-                    self._feed_extras(runner, frame, side, in_flight, queue, accounts, self._hand_forms)
+                    self._feed_extras(runner, frame, side, in_flight, queue, accounts, self._hand_forms,
+                                      delay=delay)
                 for character in sorted(fl_battle.unresolved_abilities - reported_abilities):
                     reported_abilities.add(character)
                     self.note(f'hero controller character {character} has no single FirstLight '
@@ -1004,7 +1030,7 @@ class Bot:
                 if str(getattr(move[0], 'value', move[0])) == 'activate_ability':
                     self._try_ability(move, observation, me, abilities_in_flight, accounts,
                                       side, frame)
-            for kind, _hand_slot, card_id, target_grid, _offset in moves:
+            for kind, _hand_slot, card_id, target_grid, offset in moves:
                 if str(getattr(kind, 'value', kind)) != 'play_card' or target_grid is None:
                     continue
                 # FirstLight decodes to a NATIVE grid point [x, y] (perspective already
@@ -1013,8 +1039,11 @@ class Bot:
                 column, row = int(target_grid[0]), int(target_grid[1])
                 if not (0 <= column < X_TILES and 0 <= row < Y_TILES):
                     continue
+                # tapped at its moment in the turn, as il.duel and training time it: the turn's
+                # tick plus the model's offset (0-4), then the pipeline's own delay
                 move = {'card': int(card_id), 'row': row, 'column': column,
-                        'since': decided,
+                        'since': decided, 'turn': turn, 'offset': int(offset or 0),
+                        'not_before': turn + int(offset or 0),
                         'timing': {'decided': decided,
                                    'inference_ms': (decided - started) * 1000.0,
                                    'frame_age_ms': (started - frame_time) * 1000.0,
