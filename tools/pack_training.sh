@@ -5,18 +5,33 @@
 #
 #   tools/pack_training.sh [OUT_DIR]      -> OUT_DIR/clapha-train-code.zip, OUT_DIR/conv-hog26.zip
 #   tools/pack_training.sh --code-only [OUT_DIR]
+#   tools/pack_training.sh --update [OUT_DIR]   -> OUT_DIR/clapha-code-update.zip: only our code (il/,
+#       the two live modules, the card catalog), a few hundred KB, for a PC that already has the
+#       full pack; unzip it over the clapha-train folder (python -m zipfile -e clapha-code-update.zip .)
 # On the PC (Python 3.12 + torch cu124 already there):
 #   py -3.12 -m pip install orjson zstandard
 #   py -3.12 -m il.train --smoke            (from the unzipped clapha folder)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 code_only=0
+update=0
 [ "${1:-}" = "--code-only" ] && { code_only=1; shift; }
+[ "${1:-}" = "--update" ] && { update=1; shift; }
 OUT="${1:-$ROOT/build/train-pack}"
 mkdir -p "$OUT"
 OUT="$(cd "$OUT" && pwd)"
 STAGE="$(mktemp -d "$OUT/stage.XXXX")"
 trap 'rm -rf "$STAGE"' EXIT
+
+if [ "$update" = 1 ]; then
+  mkdir -p "$STAGE/clapha/il" "$STAGE/clapha/mac012"
+  cp "$ROOT"/il/*.py "$ROOT/il/SPEC.md" "$STAGE/clapha/il/"
+  cp "$ROOT/mac012/firstlight_obs.py" "$ROOT/mac012/firstlight_bot.py" "$STAGE/clapha/mac012/"
+  cp "$ROOT/live_card_catalog.json" "$STAGE/clapha/"
+  (cd "$STAGE" && rm -f "$OUT/clapha-code-update.zip" && zip -qr "$OUT/clapha-code-update.zip" clapha)
+  ls -l "$OUT/clapha-code-update.zip"
+  exit 0
+fi
 
 mkdir -p "$STAGE/clapha/il" "$STAGE/clapha/mac012" "$STAGE/clapha/ref-firstlight/checkpoints/2_6hog_expert"
 cp "$ROOT"/il/*.py "$ROOT/il/SPEC.md" "$STAGE/clapha/il/"
