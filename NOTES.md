@@ -1382,3 +1382,35 @@ Facts the new model must be built around:
   tapped when affordable + 21). ~9% of plays look tapped short of elixir; unexplained (SPEC).
 - Windows PC: not needed for Hog 2.6 conversion. For converting the other ~238k games or RL later
   it needs an Android 12 MuMu instance (one GUI step, the user's); training needs no MuMu.
+
+## Night of 2026-09-25/26: training pipeline end to end (morning report)
+
+- **Timing corrected by one tick.** A replay tick L is execute - 1 (FirstLight queues it at L + 1;
+  the engine still has the card in hand at L; live, a command executes exactly issue + 21, elixir
+  included). So a tap is at L - 20 and the bot decides at L - (20 + overhead). Executed plays are
+  dated L + 1 as the viewer dates them (issue + 21); at L one in five fell outside the tensorizer's
+  "this turn" event window. il/params REPLAY_TICK_AFTER_ISSUE; audit passes (266k samples).
+- **Input parity confirmed.** FirstLight's own IL checkpoint predicts human play well from our
+  live-code inputs (card 0.82, tile 2.80 against chance 1.79 / ~6.3). fl:hog2 is far from human
+  play (card 1.60, tile 6.27): its self-play moved it away, so imitating humans from fl:hog2
+  changes more than its timing. Both starting points get trained; duels decide.
+- **Trainer (il/train.py)** runs on the campus 4080 (D:\crtrain\py312 has torch 2.5.1 cu124; the
+  system Python312 has no torch). Code in Desktop\arron\clapha-train (tools/windows/*.cmd). Run A
+  (fl:il, one pass over the first 2,046 games = 1,517 Hog 2.6 sides) started ~22:45 with the code
+  from before the one-tick fix: treat it as a first signal. Corrected code (with Stage B) is staged
+  in ~/crtrain-stage/train2 to send and restart.
+- **Stage B (il/extras.py):** pending commands both sides (own sent plays; opponent's visible in the
+  queue) through the model's own card encoder, the opponent's exact elixir and the command delay;
+  a gated head starting at zero (extended model = its base exactly, tested), kept out of the
+  state_dict (checkpoints stay strict FirstLight ones). il/train.py --extras.
+- **Duels (il/duel.py):** both sides fed by the live code, real delay (tap after the measured
+  overhead, elixir checked at the tap, execute 21 ticks later) or FirstLight's no-delay sandbox,
+  abilities included. Queued to run on the Mac when the conversion ends: fl:hog2 delayed vs
+  fl:hog2 no-delay (what the delay costs), fl:il vs fl:hog2 both delayed (20 matches each,
+  runs/duels.jsonl, runs/duel-*.log).
+- **Console:** opt-in path for our checkpoints only (screen hand/elixir via the same
+  firstlight_obs.screen_view as training, elixir at the tap, Stage B inputs). FirstLight's models
+  unchanged. Needs one device check before a live match.
+- **Blocked overnight:** the Mac's screen locked (~22:50), so ToDesk (the only way to the 4080 PC)
+  could not be driven: restarting run A on the corrected code and sending more data wait for the
+  Mac to be unlocked. The conversion and the duels run without it.

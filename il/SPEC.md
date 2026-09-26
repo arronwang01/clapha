@@ -97,7 +97,9 @@ abilities not ready.
   fixed 21-tick age does not allow. Live recordings (1,830 commands, both sides) show every
   command issued with enough elixir and 20-21 ticks in the queue, so it is not early placement.
   Engine elixir is right (starts at 6.0, 178.6 raw per tick at 1x as live, charges exactly each
-  card's cost). Unexplained; those labels are masked.
+  card's cost). Also ruled out: regen lost while a card waits at 10 elixir. Live, a tap at 10
+  keeps elixir at exactly 10.0 for 21 ticks and then drops by the cost (67 of 71 such taps in the
+  recorded friendlies), as in the engine. Unexplained; those labels are masked.
 - Opponent command leads above 21 ticks: the live queue shows no command staying more than 20
   ticks, so the tail is a measurement artifact of the earlier lead table, not waiting commands.
 - The live console must build these same inputs with this same code (parity check on recorded
