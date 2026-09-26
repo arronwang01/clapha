@@ -1417,13 +1417,14 @@ Facts the new model must be built around:
 - **Training routes (either finishes the job; everything is staged):**
   - *4080 PC (free):* needs the Mac unlocked (ToDesk). Send ~/crtrain-stage/train2/
     clapha-train-code.zip and conv-hog26-002.zip (~2 GB, ~1 h at ToDesk's ~0.5 MB/s), unpack into
-    Desktop\arron\clapha-train, then `start-train.cmd fl:il train-b --extras --save-every 100`.
+    Desktop\arron\clapha-train, then `start-train.cmd fl:hog2 train-hog2-b --extras --save-every 100`
+    (fl:hog2 first: fl:il lost its first four duels to fl:hog2 with both delayed; fl:il second).
     Expected ~2 h (data workers are the limit).
   - *GCP (~$5 of the $20 credit):* everything is in gs://clapha-train-aa479a94. The VM cannot read
     the bucket because the project's default compute service account has no roles. The owner
     would grant it on this bucket only:
     `gcloud storage buckets add-iam-policy-binding gs://clapha-train-aa479a94 --member=serviceAccount:719595020568-compute@developer.gserviceaccount.com --role=roles/storage.objectAdmin`
-    then `tools/gcp/launch.sh clapha-train-b full g2-standard-32 4 "--init fl:il --extras --workers 30 --save-every 100"`
+    then `tools/gcp/launch.sh clapha-train-b full g2-standard-32 4 "--init fl:hog2 --extras --workers 30 --save-every 100"`
     and `tools/gcp/watch.sh clapha-train-b <zone>`. The VM deletes itself at 4 h at the latest.
   - A 15-minute smoke VM (g2-standard-4) was created and deleted while finding this; under $1.
 - **Conversion finished 03:42:** all 14,040 Hog 2.6 games tried; 13,830 converted, 210 refused by
