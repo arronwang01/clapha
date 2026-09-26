@@ -1448,3 +1448,59 @@ Facts the new model must be built around:
   the board ~1 s earlier, what the teacher then played) would keep the specialist's strength while
   teaching it to act ahead. Needs engine self-play data: ~2 min per match on the one Mac engine, so
   the Windows MuMu cluster (Android 12 step) would be the way to make hundreds of games.
+
+## 2026-09-26 day: faster training, self-distillation from no-delay hog2, the benchmark
+
+**Goals (the user, 2026-09-26):** fix the delay and the pending cards -- "98% of the improvement";
+the extra inputs (opponent's exact elixir, revealed / API-pulled deck as a reference, tower troop)
+wait. **Benchmark ("true-power 2.6"):** engine duels through the live input path, real delay.
+Main: the candidate against today's live fl:hog2 (both delayed) should do about as well as fl:hog2
+with no delay does against it (17-0). Upper-bound reference: the candidate against no-delay
+fl:hog2 (50% may be out of reach for any model: the no-delay bot reacts ~0.5 s sooner than the
+real game allows, even after the ~0.7 s pending-card warning).
+
+**Compute, from FirstLight's own records** (docs/training_history.md, checkpoint metadata): each
+PPO update = 1,528 concurrent matches x 40 game-seconds (~17 game-hours); fl:hog1 192 updates,
+fl:hog2 616 (~10,500 game-hours, ~190k games), on ~190 engines (8 battles each) and 8 GPUs;
+fl:il 29,396 imitation updates. Adapting hog2 by RL under the real delay: rough guess 10-50% of
+hog2's run (2,000-10,000 game-hours ~ 120-600 CPU-hours + 16-80 GPU-hours) -- not reachable on the
+Mac's single engine; the imitation / distillation stage costs a few GPU hours.
+
+**Trainer speed (il/fused.py, il/pack.py):** FirstLight's IL evaluation runs 32 LSTMCell steps and
+32 decoder calls per chunk: 1.75 s per update at 8 sides on an L4 (24 h per pass). il/fused.py does
+what their PPO path does -- one LSTM kernel over the chunk, heads once over all T x B rows --
+with the dense decoder the imitation loss needs. Checked against the step path: losses equal to
+1e-6, final states identical, gradients equal (max abs diff 1.5e-5 of 12.7 M parameters); on
+CUDA the validation numbers are identical to 4 decimals. Batches cross processes as one packed
+buffer (il/pack.py: 122,114 tensors bit-identical; 1.3 s instead of 6.7 s in the training process).
+A name clash (the batch loop variable shadowed payload()) would have crashed the first checkpoint
+save of every run since the pickled-batch commit; fixed. **Memory:** a worker collating 32 sides
+peaks at ~8 GB and all workers peak together: the first batch-32 cloud run was OOM-killed (52 ->
+116 of 125 GB in a minute). Workers now build 8-16 sides and the trainer joins groups (--merge).
+
+**Self-distillation (il/teacher.py), the main route for delay + pending:** no-delay fl:hog2 labels
+every turn of the 10,535 converted game sides in its own timing (act probability + its greedy play
+given that it acts: FirstLight's act-after-preselected-act decode). The student's turn at tick t
+gets the teacher's turn at t + 25, matched to the student's candidates by card identity, the delay
+bin re-timed for the side's 23-27 tick delay. The student sees the board at t plus both sides'
+pending commands; the teacher sees them landed at t + 25 -- that pairing is the pending-card
+signal human replays cannot give. On 3 sides: 74-96% of turns get a matched teacher play; the
+teacher "acts" on ~15% of turns (humans ~5%): on human games it keeps wanting a play the human
+delayed (off-policy; a DAgger round on the student's own games would fix what is left). Loss:
+cross-entropy of the student's act probability against the teacher's + card / cell / delay terms
+weighted by it, plus the human replay loss at 0.25. Before any training fl:hog2 already predicts
+its own shifted plays well (card NLL 0.37, cell 0.66) against 1.8 / 7.6 on the human plays.
+
+**Runs:** clapha-train-c (per-step path, batch 8) stopped after 875 updates (2% of a pass: too
+slow); clapha-train-d (batch 32, fused) OOM-killed before its first update; clapha-distill-1
+(labels, then fused training at 32 sides per update from fl:hog2) started 11:26.
+
+**Engine (CR_4k) after a restart:** the emulator boots from its quick-boot snapshot and
+-no-snapshot-save never updates it, so the disk comes back as it was: the probe reverts to the old
+build (no run-lean). After every restart: install runs/libcrprobe_run.so into Null's lib dir
+(md5 d59657b8...) and run cr-engine-extraction/macos-port/start_offline.sh (firewall first).
+
+**4080 PC:** restarted by its owner at 21:14 China time; 64 GB RAM, 20 threads, 16 GB VRAM. Last
+night's "killed" run had left its 14 workers alive (~35 GB): `taskkill /T` reported success but
+they stayed; with a new run on top the PC stopped answering. Check with Get-CimInstance
+Win32_Process before starting anything there.
