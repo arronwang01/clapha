@@ -93,6 +93,13 @@ def _keep(items):
     return items
 
 
+def _one_thread(_worker: int) -> None:
+    """Each DataLoader worker tensorizes on one CPU thread: thirty workers each opening a
+    full-width torch thread pool would oversubscribe the machine."""
+    import torch
+    torch.set_num_threads(1)
+
+
 def _rows(collection) -> int:
     from dataclasses import fields
     for item in fields(collection):
@@ -223,6 +230,7 @@ def main(argv: list[str]) -> int:
         random.Random(args.seed + epoch).shuffle(order)
         loader = DataLoader(ReplaySequences(order, max_turns, args.extras), batch_size=args.batch, shuffle=False,
                             num_workers=args.workers, collate_fn=_keep, persistent_workers=False,
+                            worker_init_fn=_one_thread,
                             prefetch_factor=2 if args.workers else None)
         for group_index, items in enumerate(loader):
             for item in items:
