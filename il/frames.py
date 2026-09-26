@@ -57,16 +57,37 @@ def save_replay(out: Path, result: dict, every: int) -> int:
     return len(data)
 
 
+def save_recorded(out: Path, header: dict, frames: list[dict]) -> int:
+    """A match played in the engine (il/duel.py --record), in the same format: the header carries
+    the timeline and the actors' plays as FirstLight expert actions (expert_actions_pickle) where a
+    conversion carries the calibrated replay they would be extracted from."""
+    import orjson
+    import zstandard
+    body = b'\n'.join([orjson.dumps(header, option=orjson.OPT_NON_STR_KEYS)] + [orjson.dumps(frame) for frame in frames])
+    data = zstandard.ZstdCompressor(level=9).compress(body)
+    path = frame_path(out, header['replay_tag'])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix('.part')
+    temporary.write_bytes(data)
+    os.replace(temporary, path)
+    return len(data)
+
+
 def load_replay(path: Path, with_replay: bool = True) -> tuple[dict, list[dict]]:
     """(header, snapshots) of one saved replay; header['calibrated'] is FirstLight's calibrated
-    replay (needs FirstLight's native_runner importable; with_replay=False skips it)."""
+    replay, or for a played match header['expert_actions'] its timed plays (both need
+    FirstLight's native_runner importable; with_replay=False skips them)."""
     import orjson
     import zstandard
     lines = zstandard.ZstdDecompressor().decompress(path.read_bytes(), max_output_size=1 << 31).split(b'\n')
     header = orjson.loads(lines[0])
-    encoded = header.pop('calibrated_pickle')
+    encoded = header.pop('calibrated_pickle', None)
+    expert = header.pop('expert_actions_pickle', None)
     if with_replay:
-        header['calibrated'] = pickle.loads(base64.b64decode(encoded))
+        if encoded is not None:
+            header['calibrated'] = pickle.loads(base64.b64decode(encoded))
+        if expert is not None:
+            header['expert_actions'] = pickle.loads(base64.b64decode(expert))
     return header, [orjson.loads(line) for line in lines[1:]]
 
 
@@ -80,4 +101,5 @@ def load_header(path: Path) -> dict:
         line = io.BufferedReader(reader, buffer_size=1 << 20).readline()
     header = orjson.loads(line)
     header.pop('calibrated_pickle', None)
+    header.pop('expert_actions_pickle', None)
     return header

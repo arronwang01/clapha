@@ -51,6 +51,7 @@ class Command:
     cost: float = 0.0
     native_object_id: int | None = None      # an ability's source unit in the engine
     entity_id: int | None = None             # the same unit in the live code's ids
+    hand_slot: int | None = None             # the engine hand index it was queued from
 
 
 def _overhead(rng: random.Random) -> int:
@@ -58,7 +59,7 @@ def _overhead(rng: random.Random) -> int:
     return rng.choices(values, weights)[0]
 
 
-def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id: str) -> dict:
+def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id: str, record: bool = False) -> dict:
     """One battle to the end; returns the result and per-side counters.
 
     The engine is stepped to the next thing that happens: a decision turn (every 5 ticks), a tap
@@ -77,6 +78,8 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
     counters = {side: {'decided': 0, 'tapped': 0, 'executed': 0, 'dropped_elixir': 0, 'dropped_hand': 0,
                        'abilities': 0, 'abilities_dropped': 0} for side in (0, 1)}
     tick, ended, seq = 0, False, 0
+    recorded_frames: list[dict] = []          # record=True: every decision-tick snapshot, as a conversion saves
+    done: list[Command] = []                   # executed commands, for the recording
 
     def screen_elixir(side: int, logic_raw: int) -> float:
         in_flight = [c for c in commands if c.side == side and c.execute is not None]
@@ -152,6 +155,7 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
             x, y = cell_to_world(command.grid)
             native.queue_hand_action_at(HandAction(command.side, slot, x, y), execute_tick=command.execute)
             command.injected = True
+            command.hand_slot = int(slot)
 
     while True:
         waiting = any(c.execute is None and c.tap <= tick for c in commands)
@@ -162,6 +166,8 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
         if waiting:
             candidates.append(tick + 1)
         frames, tick, ended = run_lean(native, min(candidates))
+        if record:
+            recorded_frames.extend(frames)
         if ended:
             break
         decision = tick % DECISION_TICKS == 0 and frames
@@ -189,6 +195,7 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
                                       'issue_tick': command.execute - COMMAND_AGE_TICKS})
             counters[command.side]['executed'] += 1
             commands.remove(command)
+            done.append(command)
         for row in executed_rows:
             # training recomputes every executed play's form each turn (il/samples.executed_plays)
             if row['kind'] == 'card':
@@ -270,8 +277,57 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
     final = native.observe()
     for runner in runners.values():
         runner.end_battle()
-    return {'winner': final.get('winner'), 'crowns': final.get('crownsRaw'), 'tick': final.get('tick'),
-            'counters': counters}
+    result = {'winner': final.get('winner'), 'crowns': final.get('crownsRaw'), 'tick': final.get('tick'),
+              'counters': counters}
+    if record and recorded_frames:
+        result['recording'] = _recording(recorded_frames, done, deck_forms, final)
+    return result
+
+
+def _recording(frames: list[dict], done: list[Command], deck_forms: dict, final: dict) -> dict:
+    """A played match in the conversion's format (il/frames.save_recorded): the timeline of what
+    executed and each card play as a FirstLight expert action (the tick before it executed, the
+    hand slot it was queued from), so il/samples and il/teacher treat it like a replay."""
+    import base64
+    import pickle
+    import uuid
+    from il.frames import FRAME_FORMAT
+    from il.timeline import Play, Timeline, timeline_to_json
+    from native_runner.contracts import ActionKind, ActionV1, TargetKind
+    from native_runner.training.v4.expert import TimedExpertActionV4
+    tag = f'd{uuid.uuid4().hex}'
+    first = {p['owner']: p for p in frames[0]['state']['players']}
+    decks, deals = [], {}
+    for owner in (0, 1):
+        state = first[owner]
+        decks.append(tuple(d['cardId'] for d in sorted(state['deck'], key=lambda d: d['deckSlot'])))
+        deals[owner] = (tuple(h['cardId'] for h in sorted(state['hand'], key=lambda h: h['handIndex'])),
+                        tuple(c['cardId'] for c in sorted(state['cycle'], key=lambda c: c['cycleIndex'])))
+    executed = sorted(done, key=lambda c: (c.execute, c.seq))
+    plays = tuple(Play(owner=c.side, kind=c.kind, card_id=c.card_id if c.kind == 'card' else None,
+                       grid=tuple(c.grid) if c.kind == 'card' else None, lands=c.execute - 1, index=c.seq)
+                  for c in executed)
+    end_tick = int(final.get('tick') or frames[-1]['tick'])
+    timeline = Timeline(replay_tag=tag, decks=(decks[0], decks[1]),
+                        form_availability=(tuple(deck_forms[0]), tuple(deck_forms[1])), tower_troops=(None, None),
+                        deals=deals, first_certain_play={0: 0, 1: 0}, plays=plays, end_tick=end_tick,
+                        winner=final.get('winner'))
+    expert = [TimedExpertActionV4(
+        source_tick=c.execute - 1, source_index=c.seq,
+        action=ActionV1(owner=c.side, kind=ActionKind.PLAY_CARD, hand_slot=c.hand_slot, card_id=c.card_id,
+                        target_kind=TargetKind.GRID, target_grid=tuple(c.grid), subcell_offset=(0.0, 0.0),
+                        execute_offset_ticks=1, next_decision_ticks=1, action_id=f'{tag}-{c.seq}',
+                        metadata={'source': 'clapha-duel', 'replay_tag': tag, 'source_index': c.seq,
+                                  'source_event_index': c.seq, 'source_command_tick': c.execute - 1,
+                                  'native_observable_tick': c.execute}))
+              for c in executed if c.kind == 'card' and c.hand_slot is not None]
+    header = {'format': FRAME_FORMAT, 'replay_tag': tag, 'end_tick': end_tick, 'ended_at': end_tick, 'every': DECISION_TICKS,
+              'frames': len(frames), 'first_tick': frames[0]['tick'], 'commands': len(executed), 'queued': len(executed),
+              'failures': [], 'fidelity': {'source': 'played', 'tower_hp_error': 0, 'winner_match': True,
+                                           'crowns_match': True},
+              'timeline': timeline_to_json(timeline),
+              'expert_actions_pickle': base64.b64encode(pickle.dumps(expert, protocol=5)).decode()}
+    return {'header': header, 'frames': frames}
 
 
 @dataclass
@@ -321,6 +377,9 @@ def main(argv: list[str]) -> int:
     parser.add_argument('--out', type=Path, default=CLAPHA / 'runs/duels.jsonl')
     parser.add_argument('--port', type=int, default=26789)
     parser.add_argument('--seed', type=int, default=7)
+    parser.add_argument('--record', type=Path, help='save every match here in the conversion format (DAgger data)')
+    parser.add_argument('--record-sides', choices=('a', 'b', 'both'), default='a',
+                        help="whose side is training data (index.jsonl train_sides)")
     args = parser.parse_args(argv)
     import firstlight_bot as FLB
     from il.engine_convert import connect
@@ -337,7 +396,8 @@ def main(argv: list[str]) -> int:
         leads = {a_side: args.a_lead, 1 - a_side: args.b_lead}
         started = time.time()
         try:
-            result = play_match(native, runners, delays, leads, config, forms, rng, f'{tag[:8]}-{index}')
+            result = play_match(native, runners, delays, leads, config, forms, rng, f'{tag[:8]}-{index}',
+                                record=args.record is not None)
         except Exception as error:  # noqa: BLE001  (one broken match must not end the set)
             print(f'match {index + 1} failed: {type(error).__name__}: {error}', flush=True)
             for runner in runners.values():
@@ -354,6 +414,16 @@ def main(argv: list[str]) -> int:
                'counters': result['counters'], 'seconds': round(time.time() - started)}
         with args.out.open('a') as handle:
             handle.write(json.dumps(row) + '\n')
+        if 'recording' in result:
+            from il.frames import save_recorded
+            header = result['recording']['header']
+            header['played'] = {k: v for k, v in row.items() if k not in ('counters',)}
+            save_recorded(args.record, header, result['recording']['frames'])
+            sides = {'a': [a_side], 'b': [1 - a_side], 'both': [0, 1]}[args.record_sides]
+            with (args.record / 'index.jsonl').open('a') as handle:
+                handle.write(json.dumps({'tag': header['replay_tag'], 'ok': True, 'tower_hp_error': 0,
+                                         'ended_at': header['ended_at'], 'end_tick': header['end_tick'],
+                                         'train_sides': sides, 'played': header['played']}) + '\n')
         print(f"match {index + 1}: {label} (crowns {result['crowns']}, a on side {a_side}); "
               f"running score a {wins['a']} - b {wins['b']} ({wins['draw']} draws); {row['seconds']} s", flush=True)
     return 0

@@ -68,13 +68,14 @@ def _select_units(frames_dir: Path, index_text: str, max_tower_error: int) -> li
             continue
         path = frames_dir / 'frames' / record['tag'][:2] / f"{record['tag']}.jsonl.zst"
         if path.exists():
-            units.append((str(path), record['tag']))
+            units.append((str(path), record.get('train_sides')))
     selected = []
     from il.frames import load_header
-    for path, tag in units:
+    for path, sides in units:
         header = load_header(Path(path))
         for actor, deck in enumerate(header['timeline']['decks']):
-            if HOG26_CARDS <= set(deck):
+            # a played match (il/duel.py --record) lists the sides to learn from (the student's)
+            if HOG26_CARDS <= set(deck) and (sides is None or actor in sides):
                 selected.append((path, actor))
     return selected
 

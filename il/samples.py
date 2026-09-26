@@ -202,7 +202,6 @@ def actor_samples(header: dict, frames: list[dict], actor: int, stats: Counter, 
     # delay None: the bot's (21 + measured overhead); 0 reproduces FirstLight's labels (execute at
     # the decision tick), for comparison
     delay = command_delay(tag, actor) if delay is None else int(delay)
-    calibrated = header['calibrated']
     deck_forms = {side: list(timeline.form_availability[side]) for side in (0, 1)}
     own_plays = [p for p in timeline.plays if p.owner == actor]
     # the tap goes out (delay - 20) ticks after the decision plus the play's offset in its
@@ -213,7 +212,10 @@ def actor_samples(header: dict, frames: list[dict], actor: int, stats: Counter, 
     # before L - delay, and FirstLight's window contract reads its offset (0-4) from the tick
     # given here, so it is L - delay rather than L
     windows: dict[int, list] = {}
-    for timed in replay_expert_actions(calibrated.replay):
+    # a converted replay: extracted from FirstLight's calibrated replay; a played match
+    # (il/duel.py --record): stored as they were executed
+    expert = header['expert_actions'] if 'expert_actions' in header else replay_expert_actions(header['calibrated'].replay)
+    for timed in expert:
         if timed.owner != actor:
             continue
         turn = decision_tick(timed.source_tick, delay)
