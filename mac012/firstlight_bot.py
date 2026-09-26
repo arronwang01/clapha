@@ -62,6 +62,9 @@ CHECKPOINTS = {
     'fl:hog2': FIRSTLIGHT / 'checkpoints/2_6hog_expert/hog26-specialist2.pt',
     'fl:il': FIRSTLIGHT / 'checkpoints/IL/checkpoint-step-00029396.pt',
     'fl:active-il': FIRSTLIGHT / 'checkpoints/active IL/checkpoint-step-00000030.pt',
+    # ours (il/train.py): fl:hog2 taught by its own no-delay play (il/teacher.py), with pending
+    # cards; 1280 sides. Engine duels 2026-09-26: 17-3 vs live fl:hog2, 19-1 vs fl:hog2 with lead 9
+    'clapha:distill-1520': HERE.parent / 'runs/pc/distill-t0-1520.pt',
 }
 
 
@@ -127,7 +130,7 @@ class FirstLightRunner:
             # Our checkpoints (il/train.py) were trained on the screen's hand and elixir, elixir
             # counted as of the tap, and (Stage B) the extras; the console builds their inputs
             # that way. FirstLight's own keep today's inputs exactly.
-            recipe = str(checkpoint_extra(path).get('recipe', '')) if model not in CHECKPOINTS else ''
+            recipe = '' if str(model).startswith('fl:') else str(checkpoint_extra(path).get('recipe', ''))
             self.clapha_inputs = recipe.startswith('clapha')
             self.has_extras = '_extras_head' in self.model.__dict__
             self.elixir_lead = 9 if self.clapha_inputs else 0    # median tap overhead 5 + window 4

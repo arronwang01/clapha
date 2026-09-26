@@ -52,6 +52,25 @@ def command_delay_in(replay_tag: str, owner: int, low: int, high: int) -> int:
     return _draw({value: 1 for value in range(int(low), int(high) + 1)}, 'delay-range', replay_tag, owner)
 
 
+def elixir_lead(delay: int) -> int:
+    """Decision -> the latest tap of its five-tick window: the action mask counts elixir as of then
+    (the game checks it at the tap). il/samples builds training masks with it."""
+    return delay - REPLAY_TICK_AFTER_ISSUE + DECISION_TICKS - 1 if delay >= REPLAY_TICK_AFTER_ISSUE else 0
+
+
+def live_delay(overheads: list[int], window: int = 9, low: int = 20, high: int = 32) -> int:
+    """The delay to tell a model live, from the bot's own recent plays: each one's ticks from its
+    moment (decision turn + the model's offset) to the issue tick the queue shows. The median of the
+    last `window`, with the measured median (5) standing in for missing plays at the start; clamped
+    to what training covered (--delay-range 20 32). The console and il.duel both use this."""
+    recent = list(overheads[-window:])
+    recent += [5] * max(0, 3 - len(recent))
+    recent.sort()
+    middle = len(recent) // 2
+    overhead = recent[middle] if len(recent) % 2 else (recent[middle - 1] + recent[middle]) / 2
+    return int(min(high, max(low, round(REPLAY_TICK_AFTER_ISSUE + overhead))))
+
+
 def opponent_lead(replay_tag: str, source_index: int) -> int:
     """Ticks before it executes (X = L + 1) that one opponent command becomes visible to the actor."""
     return _draw(OPPONENT_LEAD_TICKS, 'lead', replay_tag, source_index)

@@ -41,7 +41,7 @@ import firstlight_obs as FLO          # noqa: E402  (puts the live FirstLight co
 import firstlight_bot as FLB          # noqa: E402
 
 from il.frames import load_replay      # noqa: E402
-from il.params import COMMAND_AGE_TICKS, DECISION_TICKS, FIRST_DECISION_TICK, REPLAY_TICK_AFTER_ISSUE, command_delay  # noqa: E402
+from il.params import COMMAND_AGE_TICKS, DECISION_TICKS, FIRST_DECISION_TICK, REPLAY_TICK_AFTER_ISSUE, command_delay, elixir_lead  # noqa: E402
 from il.timeline import decision_tick, timeline_from_json  # noqa: E402
 
 TOWER_IDS = range(5000000, 5000006)
@@ -206,7 +206,7 @@ def actor_samples(header: dict, frames: list[dict], actor: int, stats: Counter, 
     own_plays = [p for p in timeline.plays if p.owner == actor]
     # the tap goes out (delay - 20) ticks after the decision plus the play's offset in its
     # window (0-4); the game checks elixir then, so the mask counts elixir as of the latest tap
-    send_lead = delay - REPLAY_TICK_AFTER_ISSUE + DECISION_TICKS - 1 if delay >= REPLAY_TICK_AFTER_ISSUE else 0
+    send_lead = elixir_lead(delay)
 
     # the expert's actions, re-timed: a play landing at L is decided on the grid tick at or
     # before L - delay, and FirstLight's window contract reads its offset (0-4) from the tick

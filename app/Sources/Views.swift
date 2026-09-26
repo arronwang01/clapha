@@ -6,6 +6,7 @@ let modelNames: [String: String] = [
     "fl:il": "FirstLight · Imitation (29k steps)",
     "fl:active-il": "FirstLight · Active imitation",
     "fl:general": "FirstLight · General",
+    "clapha:distill-1520": "Clapha · 2.6 Hog, no-delay distilled + pending cards",
     "14k": "Own sim model · 14k",
     "40k": "Own sim model · 40k",
     "100k": "Own sim model · 100k",
@@ -228,11 +229,12 @@ struct DevicePanel: View {
         }
     }
 
-    /// FirstLight models first; the old simulator models only if nothing else is available.
+    /// FirstLight models first, then ours (il/train.py); the old simulator models only if
+    /// nothing else is available.
     private var orderedModels: [String] {
         let all = sum.models.isEmpty ? Array(modelNames.keys) : sum.models
-        let firstLight = all.filter { $0.hasPrefix("fl:") }.sorted()
-        var list = firstLight.isEmpty ? all.sorted() : firstLight
+        let current = all.filter { $0.hasPrefix("fl:") }.sorted() + all.filter { $0.hasPrefix("clapha:") }.sorted()
+        var list = current.isEmpty ? all.sorted() : current
         if !list.contains(chosenModel) { list.append(chosenModel) }
         return list
     }
