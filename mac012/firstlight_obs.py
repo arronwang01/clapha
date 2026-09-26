@@ -602,6 +602,41 @@ def own_runtime_states(player: dict, entities, side: int, tick: int, battle,
     return tuple(abilities), tuple(evolutions)
 
 
+def screen_view(player: dict, sent_cards) -> dict:
+    """The actor's own player row as its screen shows it (a copy; the reader row is left alone).
+
+    The client takes a card out of the hand and its cost off the elixir bar at the tap; the game
+    state does that ~1 s later, when the command executes, and the reader reads the game state.
+    Two steps, in order:
+      * a hand slot the game leaves empty after a play executes (-1 while the next card is drawn:
+        the cycle then holds five cards) gets the head of the cycle, as the screen already shows;
+      * each card sent and not executed yet (`sent_cards`, in the order sent) leaves its slot to
+        the next card and its cost (FirstLight's card spec, as the action mask uses) off the elixir.
+    Training (il/samples.py) builds its inputs with this function, so a model trained on them
+    must get them from it live too: the console passes its in-flight taps.
+    Raises ValueError if a sent card is not in the hand (the caller's in-flight list is wrong).
+    """
+    from native_runner.training.v4.factory import production_semantic_bundle
+
+    specs = production_semantic_bundle().card_specs
+    deck = list(player.get('deck_card_ids') or [])
+    hand = list(player.get('hand_deck_indices') or [])
+    cycle = list(player.get('cycle_deck_indices') or [])
+    elixir = int(player.get('elixir_raw') or 0)
+    for position, slot in enumerate(hand):
+        if slot < 0 and len(cycle) > 4:
+            hand[position] = cycle.pop(0)
+    for card in sent_cards:
+        slot = deck.index(int(card))
+        position = hand.index(slot)
+        hand[position] = cycle.pop(0)
+        cycle.append(slot)
+        spec = specs.get(int(card))
+        elixir -= int(round(float(getattr(spec, 'elixir_cost', 0) or 0) * 10000))
+    return {**player, 'hand_deck_indices': hand, 'cycle_deck_indices': cycle,
+            'next_deck_index': cycle[0] if cycle else -1, 'elixir_raw': max(0, elixir)}
+
+
 def legal_ability_sources(abilities, elixir: float, pending=()) -> tuple[int, ...]:
     """BattleEnvV1._ability_action_candidates' rule, verbatim in effect: Ready and available,
     no cooldown, charges left (or unlimited), an exact cost we can pay, a live source unit, and

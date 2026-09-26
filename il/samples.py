@@ -149,22 +149,11 @@ def reader_frame(frame: dict, actor: int, deck_forms: dict[int, list[int]], in_f
             progress = [0] * len(deck)
             for evolution in rich.get('evolutionRuntime') or ():
                 progress[int(evolution['deckSlot'])] = int(evolution.get('progress') or 0)
-            elixir = int(plain['elixirRaw'])
-            # after a play executes, the engine leaves its hand slot empty for a few ticks while the
-            # next card (the head of a five-card cycle) is drawn; the screen shows it already
-            for position, slot in enumerate(hand):
-                if slot < 0 and len(cycle) > 4:
-                    hand[position] = cycle.pop(0)
-            for play in in_flight:          # sent, not executed: already gone on screen
-                if play.kind == 'card':
-                    slot = deck.index(play.card_id)
-                    position = hand.index(slot)
-                    hand[position] = cycle.pop(0)
-                    cycle.append(slot)
-                    elixir -= int(round((_card_cost(play.card_id) or 0) * 10000))
             row.update({'next_deck_index': cycle[0] if cycle else -1, 'hand_deck_indices': hand,
                         'cycle_deck_indices': cycle, 'deck_card_ids': deck, 'deck_form_flags': forms,
-                        'evo_progress': progress, 'elixir_raw': max(0, elixir)})
+                        'evo_progress': progress})
+            # as the screen shows it: drawn card in, sent cards out (the console does the same)
+            row = FLO.screen_view(row, [p.card_id for p in in_flight if p.kind == 'card'])
         else:
             row.update({'next_deck_index': -1, 'hand_deck_indices': [-1, -1, -1, -1],
                         'cycle_deck_indices': [], 'deck_card_ids': [], 'deck_form_flags': [],
