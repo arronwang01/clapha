@@ -7,7 +7,8 @@
 # it); the project's default compute account has no roles here unless granted.
 # Instance metadata: clapha-bucket, clapha-mode (smoke | full), clapha-args (il.train flags), and
 # optionally clapha-prep: a module and flags run first (e.g. "il.teacher --workers 28"); the teacher
-# labels it writes go to the bucket (conv-hog26/teacher) as they are made, so a later VM reuses them.
+# labels it writes go to the bucket (conv-hog26/teacher) as they are made, so a later VM reuses them;
+# and optionally clapha-init: a gs:// checkpoint copied to runs/init.pt (pass --init runs/init.pt).
 # the log goes to the serial console too: readable with get-serial-port-output even when the VM
 # cannot reach the bucket
 exec > >(tee -a /var/log/clapha-train.log > /dev/ttyS0) 2>&1
@@ -17,6 +18,7 @@ B=$(meta attributes/clapha-bucket)
 MODE=$(meta attributes/clapha-mode)
 ARGS=$(meta attributes/clapha-args)
 PREP=$(meta attributes/clapha-prep)
+INIT_URL=$(meta attributes/clapha-init)
 NAME=$(meta name)
 ZONE=$(meta zone | awk -F/ '{print $NF}')
 OUT="$B/out/$NAME"
@@ -67,6 +69,9 @@ mkdir -p clapha/ref-firstlight/checkpoints/IL clapha/runs/conv-hog26
 gcloud storage cp "$B/ckpt/IL/checkpoint-step-00029396.pt" clapha/ref-firstlight/checkpoints/IL/ -q
 gcloud storage rsync -r "$B/conv-hog26" clapha/runs/conv-hog26 -q || { finish "data"; exit 1; }
 cd clapha
+if [ -n "$INIT_URL" ] && [ "$INIT_URL" != "none" ]; then
+  gcloud storage cp "$INIT_URL" runs/init.pt -q || { finish "init-checkpoint"; exit 1; }
+fi
 if [ -n "$PREP" ] && [ "$PREP" != "none" ]; then
   # metadata values are not shell code: only "module flags...", run with the training Python
   read -r -a PREP_WORDS <<< "$PREP"
