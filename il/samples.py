@@ -130,6 +130,30 @@ def reader_abilities(lean_player: dict) -> list[dict]:
     return rows
 
 
+def ability_rows(frame: dict, actor: int, clock, tick: int) -> list[tuple]:
+    """Both players' hero and champion controllers in an engine snapshot (the lean players'
+    abilityRuntime; the engine names each by FirstLight's ability id, joined to its card), the
+    actor's first, as il.extras.build_extras takes them. The live console reads the same state
+    from memory (firstlight_obs.ability_card_by_character)."""
+    global _CARD_BY_ABILITY
+    if _CARD_BY_ABILITY is None:
+        _CARD_BY_ABILITY = {ability_id: card for card, (ability_id, _spec) in FLO.ability_by_card().items()}
+    lean = {p['owner']: p for p in frame.get('players') or ()}
+    rows = []
+    for owner in (actor, 1 - actor):
+        for controller in (lean.get(owner) or {}).get('abilityRuntime') or ():
+            card = _CARD_BY_ABILITY.get(str(controller.get('actionDataName') or ''))
+            if card is None:
+                continue
+            button = int(controller.get('buttonState', 0))
+            remaining = int(controller.get('remainingCooldownMs') or 0)
+            charges = int(controller.get('remainingChargesRaw', -1))
+            since = clock.update((owner, int(controller.get('controllerSlot', 0))), tick, button, remaining, charges)
+            rows.append((card, 2 if hero_character(card) is not None else 0, 0 if owner == actor else 1, button,
+                         remaining, int(controller.get('configuredCooldownMs') or 0), charges, since))
+    return rows
+
+
 def reader_frame(frame: dict, actor: int, deck_forms: dict[int, list[int]], in_flight: list,
                  strict: bool = True) -> dict:
     """The frame the reader would give at this tick, own hand and elixir as the screen shows."""
@@ -237,6 +261,10 @@ def actor_samples(header: dict, frames: list[dict], actor: int, stats: Counter, 
     runner = FLB.FirstLightRunner(None)
     battle = None
     samples = []
+    ability_clock = None
+    if extras:
+        from il.extras import AbilityClock
+        ability_clock = AbilityClock()
     for frame in frames:
         tick = int(frame['tick'])
         for player in frame['players']:
@@ -294,12 +322,17 @@ def actor_samples(header: dict, frames: list[dict], actor: int, stats: Counter, 
             storage = batch.to_storage('cpu', float_dtype=torch.float16)
             if extras:
                 from il.extras import build_extras, extend_batch
-                pending = [(p.card_id, form_at(p), 0, p.grid, p.lands + 1 - tick) for p in in_flight if p.kind == 'card']
-                pending += [(p.card_id, form_at(p), 1, p.grid, p.lands + 1 - tick) for p in timeline.plays
+                from il.flight import flight_ticks
+                pending = [(p.card_id, form_at(p), 0, p.grid, p.lands + 1 - tick,
+                            p.lands + 1 - tick + flight_ticks(p.card_id, p.owner, p.grid))
+                           for p in in_flight if p.kind == 'card']
+                pending += [(p.card_id, form_at(p), 1, p.grid, p.lands + 1 - tick,
+                             p.lands + 1 - tick + flight_ticks(p.card_id, p.owner, p.grid)) for p in timeline.plays
                             if p.owner != actor and p.kind == 'card' and p.lands >= tick
                             and opponent_seen_tick(tag, p.index, p.lands) <= tick]
                 opponent_raw = {q['owner']: q['elixirRaw'] for q in frame['state']['players']}[1 - actor]
-                built = build_extras(tensorizer, pending, opponent_elixir=opponent_raw / 10000.0, delay=delay)
+                built = build_extras(tensorizer, pending, opponent_elixir=opponent_raw / 10000.0, delay=delay,
+                                     abilities=ability_rows(frame, actor, ability_clock, tick))
                 storage = extend_batch(storage, built.to_storage('cpu', float_dtype=torch.float16))
             samples.append((tick, storage, sequence, usable))
     runner.end_battle()

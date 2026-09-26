@@ -116,6 +116,7 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
         (execute time estimated as tap + 21 until tapped), the opponent's once visible in the queue
         (issue + 21 - lead, lead drawn per command from the measured table), exact opponent elixir."""
         from il.extras import build_extras, install_session_hook
+        from il.flight import flight_ticks
         from il.params import OPPONENT_LEAD_TICKS, OWN_OVERHEAD_TICKS
         install_session_hook(runner.session)
         pending = []
@@ -123,21 +124,25 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
             if c.kind != 'card':
                 continue
             execute = c.execute if c.execute is not None else c.tap + COMMAND_AGE_TICKS
+            arrival = execute - tick + flight_ticks(c.card_id, c.side, c.grid)
             if c.side == side:
-                pending.append((c.card_id, form_now(c.side, c.card_id), 0, c.grid, execute - tick))
+                pending.append((c.card_id, form_now(c.side, c.card_id), 0, c.grid, execute - tick, arrival))
             elif c.execute is not None:
                 lead = leads_drawn.setdefault(c.seq, rng.choices(*zip(*sorted(OPPONENT_LEAD_TICKS.items())))[0])
                 if c.execute - lead <= tick < c.execute:
-                    pending.append((c.card_id, form_now(c.side, c.card_id), 1, c.grid, c.execute - tick))
+                    pending.append((c.card_id, form_now(c.side, c.card_id), 1, c.grid, c.execute - tick, arrival))
         opponent_raw = {p['owner']: p['elixirRaw'] for p in frame['state']['players']}[1 - side]
         overhead = sum(k * v for k, v in OWN_OVERHEAD_TICKS.items()) / sum(OWN_OVERHEAD_TICKS.values())
         delay = round(COMMAND_AGE_TICKS - 1 + overhead + extra_delay[side]) if delays[side] == 'live' else 1
         if delays[side] == 'live' and leads[side] == 'auto':
             delay = live_delay(measured[side])
         runner.session.next_extras = build_extras(runner.session.tensorizer, pending,
-                                                  opponent_elixir=opponent_raw / 10000.0, delay=delay)
+                                                  opponent_elixir=opponent_raw / 10000.0, delay=delay,
+                                                  abilities=S.ability_rows(frame, side, ability_clocks[side], tick))
 
     leads_drawn: dict[int, int] = {}
+    from il.extras import AbilityClock
+    ability_clocks = {0: AbilityClock(), 1: AbilityClock()}
     evolution_ready: dict[tuple[int, int], bool] = {}
     last_players: list = []
 

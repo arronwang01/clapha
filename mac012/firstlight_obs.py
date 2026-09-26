@@ -480,6 +480,26 @@ def hero_card_by_character() -> dict[int, int]:
     return _HERO_CARD_BY_CHARACTER
 
 
+_ABILITY_CARD_BY_CHARACTER: dict[int, tuple[int, int]] | None = None
+
+
+def ability_card_by_character() -> dict[int, tuple[int, int]]:
+    """controller character (the unit's data global id, as the reader names it) -> (card, form):
+    a hero's base card in form 2 (hero_card_by_character), a champion's own card in form 0 -- any
+    card with exactly one ability, by its unit's archetype id. The model's ability inputs (il/extras)
+    take both players' controllers this way; training joins the engine's ability id to the same card."""
+    global _ABILITY_CARD_BY_CHARACTER
+    if _ABILITY_CARD_BY_CHARACTER is None:
+        table = {character: (card, 2) for character, card in hero_card_by_character().items()}
+        archetypes = archetype_by_card()
+        for card in ability_by_card():
+            found = archetypes.get(card)
+            if found is not None:
+                table.setdefault(int(found[0]) & 0xFFFFFFFF, (int(card), 0))
+        _ABILITY_CARD_BY_CHARACTER = table
+    return _ABILITY_CARD_BY_CHARACTER
+
+
 def ability_by_card() -> dict[int, tuple[str, object]]:
     """base card -> (ability id, AbilitySpec), only where the card has exactly one ability --
     the same unique catalog join their adapter requires before it emits an ability state."""

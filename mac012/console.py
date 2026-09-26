@@ -507,8 +507,10 @@ class Bot:
                      accounts, hand_forms: dict, delay: int = COMMAND_AGE_TICKS - 1 + 5) -> None:
         """Stage B inputs for a checkpoint with the extras head (il/extras.py), as its training
         built them: our taps not executed yet (landing tick = tap + 21 until the queue gives the
-        issue tick), the opponent's commands now in our queue, their exact elixir, our delay."""
-        from il.extras import build_extras, install_session_hook
+        issue tick), the opponent's commands now in our queue, their exact elixir, our delay; each
+        pending card's arrival (il/flight.py) and both players' hero and champion controllers."""
+        from il.extras import AbilityClock, build_extras, install_session_hook
+        from il.flight import flight_ticks
         tick = int(frame['game_tick'])
         pending = []
         for flight in in_flight:
@@ -517,8 +519,9 @@ class Bot:
             # the form it was tapped in: once sent, the card is no longer in the hand to ask
             # (a hero read as 0 here would contradict training, which gives heroes 2)
             form = flight['form'] if 'form' in flight else int(hand_forms.get(flight['card'], 0))
-            pending.append((flight['card'], int(form), 0,
-                            (column, row) if column is not None else None, issue + COMMAND_AGE_TICKS - tick))
+            tile = (column, row) if column is not None else None
+            pending.append((flight['card'], int(form), 0, tile, issue + COMMAND_AGE_TICKS - tick,
+                            issue + COMMAND_AGE_TICKS - tick + flight_ticks(flight['card'], side, tile)))
         own_account = next((a['lo'] for a in (accounts or []) if a and a.get('side') == side), None)
         for entry in queue or ():
             if entry.get('account_lo') == own_account or not isinstance(entry.get('issue_tick'), int):
@@ -528,13 +531,32 @@ class Bot:
                 continue
             if entry['issue_tick'] + COMMAND_AGE_TICKS - tick <= 0:
                 continue       # executed already: the queue keeps landed commands for a while
-            pending.append((card_id, form_code, 1, (int(entry['x']) // 1000, int(entry['y']) // 1000),
-                            entry['issue_tick'] + COMMAND_AGE_TICKS - tick))
+            tile = (int(entry['x']) // 1000, int(entry['y']) // 1000)
+            pending.append((card_id, form_code, 1, tile, entry['issue_tick'] + COMMAND_AGE_TICKS - tick,
+                            entry['issue_tick'] + COMMAND_AGE_TICKS - tick + flight_ticks(card_id, 1 - side, tile)))
         opponent = next((p for p in frame['players'] if p.get('side') == 1 - side), {})
+        # the controllers, ours first; the clock lives with the battle's session
+        clock = getattr(runner.session, '_ability_clock', None)
+        if clock is None:
+            clock = AbilityClock()
+            runner.session._ability_clock = clock
+        by_character = FLO.ability_card_by_character()
+        abilities = []
+        for player in sorted(frame['players'], key=lambda q: q.get('side') != side):
+            for controller in player.get('abilities') or ():
+                joined = by_character.get(int(controller.get('character_id') or 0) & 0xFFFFFFFF)
+                if joined is None:
+                    continue
+                button, remaining = int(controller.get('button', 0)), int(controller.get('cooldown_ms') or 0)
+                charges = int(controller.get('charges', -1))
+                since = clock.update((player.get('side'), int(controller.get('controller_slot', 0))), tick,
+                                     button, remaining, charges)
+                abilities.append((joined[0], joined[1], 0 if player.get('side') == side else 1, button, remaining,
+                                  int(controller.get('configured_ms') or 0), charges, since))
         install_session_hook(runner.session)
         runner.session.next_extras = build_extras(
             runner.session.tensorizer, pending, opponent_elixir=(opponent.get('elixir_raw') or 0) / 10000.0,
-            delay=delay)
+            delay=delay, abilities=abilities)
 
     def _try_play(self, move: dict, me: dict, deck: list, reserved: float,
                   in_flight: list[dict], accounts, side: int, frame: dict) -> bool:
