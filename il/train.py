@@ -306,6 +306,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument('--batch', type=int, default=8, help='sequences per update group')
     parser.add_argument('--time-steps', type=int, default=32)
     parser.add_argument('--workers', type=int, default=8)
+    parser.add_argument('--skip-sides', type=int, default=0,
+                        help='continuing a run: skip this many sides of the first epoch (the same seeded order)')
     parser.add_argument('--merge', type=int, default=1,
                         help='worker groups joined per update batch (updates see batch x merge sides)')
     parser.add_argument('--prefetch', type=int, default=1,
@@ -400,6 +402,9 @@ def main(argv: list[str]) -> int:
     for epoch in range(args.epochs):
         order = list(train_units)
         random.Random(args.seed + epoch).shuffle(order)
+        if epoch == 0 and args.skip_sides:
+            order = order[args.skip_sides:]
+            print(f'continuing: {args.skip_sides} sides of epoch 0 already trained, {len(order)} to go', flush=True)
         loader = DataLoader(ReplaySequences(order, max_turns, args.extras, teacher_dir), batch_size=args.batch,
                             shuffle=False,
                             num_workers=args.workers, collate_fn=_collate, persistent_workers=False,
