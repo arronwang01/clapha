@@ -32,3 +32,7 @@ sandbox/loadprobe/debug.keystore
 
 # local IL conversion runs (game-derived data)
 runs/
+
+# game APK splits (user-supplied, never committed)
+*.apk
+*.xapk
