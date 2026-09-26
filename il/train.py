@@ -84,12 +84,14 @@ def held_out(path: str) -> bool:
 
 
 class ReplaySequences:
-    """torch Dataset: one ILSequenceV4 per (replay, actor), made by the live code."""
+    """torch Dataset: one ILSequenceV4 per (replay, actor), made by the live code; with the
+    teacher's labels on the same turns (il/teacher.py) when `teacher` is the frames directory."""
 
-    def __init__(self, units, max_turns: int | None = None, extras: bool = False):
+    def __init__(self, units, max_turns: int | None = None, extras: bool = False, teacher: Path | None = None):
         self.units = list(units)
         self.max_turns = max_turns
         self.extras = extras
+        self.teacher = teacher
 
     def __len__(self) -> int:
         return len(self.units)
@@ -100,14 +102,29 @@ class ReplaySequences:
         from native_runner.training.v4.imitation import slice_il_sequence
         path, actor = self.units[index]
         stats: Counter = Counter()
+        labels = None
         try:
             header, frames = load_replay(Path(path))
-            sequence = actor_sequence(header, frames, actor, stats, extras=self.extras)
+            if self.teacher is None:
+                sequence = actor_sequence(header, frames, actor, stats, extras=self.extras)
+            else:
+                from il.params import command_delay
+                from il.teacher import label_path, load_labels, student_labels
+                sequence, ticks = actor_sequence(header, frames, actor, stats, extras=self.extras, with_ticks=True)
+                if sequence is not None:
+                    teacher = load_labels(label_path(self.teacher, path, actor))
+                    labels = student_labels(sequence, ticks, teacher, command_delay(header['replay_tag'], actor),
+                                            stats)
         except Exception as error:  # noqa: BLE001  (one bad replay must not stop training)
             return {'error': f'{Path(path).name} actor {actor}: {type(error).__name__}: {error}'[:300]}
         if sequence is not None and self.max_turns and sequence.time_steps > self.max_turns:
             sequence = slice_il_sequence(sequence, 0, self.max_turns)
-        return {'sequence': sequence, 'stats': dict(stats)}
+            if labels is not None:
+                labels = labels.slice(0, self.max_turns)
+        item = {'sequence': sequence, 'stats': dict(stats)}
+        if labels is not None:
+            item['teacher'] = labels
+        return item
 
 
 def _keep(items):
@@ -123,12 +140,20 @@ def _collate(items):
     -> (packed batch or None, errors, sequence count)."""
     from il.pack import pack
     errors = [item['error'] for item in items if 'error' in item]
-    sequences = [item.pop('sequence') for item in items if item.get('sequence') is not None]
-    count = len(sequences)
-    if not sequences:
+    good = [item for item in items if item.get('sequence') is not None]
+    count = len(good)
+    if not good:
         return None, errors, 0
-    batch = batch_sequences(sequences, consume=True)
-    packed = pack(batch)
+    steps = max(item['sequence'].time_steps for item in good)
+    labels = [item.pop('teacher') for item in good if 'teacher' in item]
+    batch = batch_sequences([item.pop('sequence') for item in good], consume=True)
+    if labels:
+        from il.teacher import collate_labels
+        if len(labels) != count:
+            raise ValueError('teacher labels missing for part of a batch')
+        packed = pack((batch, collate_labels(labels, steps)))
+    else:
+        packed = pack(batch)
     del batch
     return packed, errors, count
 
@@ -193,8 +218,9 @@ def evaluate_chunk(policy, chunk, state, fused: bool):
                                        continue_temperature=1.0, validate=False, preencode_observations=True)
 
 
-def evaluate(policy, batch, device, time_steps: int, fused: bool = True) -> dict:
-    """Held-out losses per head, no gradient. batch: the collated validation sequences."""
+def evaluate(policy, batch, device, time_steps: int, fused: bool = True, teacher=None) -> dict:
+    """Held-out losses per head, no gradient. batch: the collated validation sequences; teacher:
+    their teacher labels (il/teacher.py), reported as t_gate, t_candidate, t_target, t_delay."""
     import torch
     from native_runner.training.v4.imitation import imitation_loss, slice_il_sequence
     totals, counts = Counter(), Counter()
@@ -202,8 +228,18 @@ def evaluate(policy, batch, device, time_steps: int, fused: bool = True) -> dict
     with torch.no_grad():
         state = policy.initial_state(batch.batch_size, device=device)
         for start in range(0, batch.time_steps, time_steps):
-            chunk = slice_il_sequence(batch, start, min(batch.time_steps, start + time_steps)).to(device)
-            evaluation = evaluate_chunk(policy, chunk, state, fused)
+            stop = min(batch.time_steps, start + time_steps)
+            chunk = slice_il_sequence(batch, start, stop).to(device)
+            if teacher is None:
+                evaluation = evaluate_chunk(policy, chunk, state, fused)
+            else:
+                from il.fused import evaluate_forced, fused_context
+                from il.teacher import teacher_loss
+                context = fused_context(policy, chunk.observations, chunk.episode_start, initial_state=state)
+                evaluation = evaluate_forced(policy, context, chunk.actions)
+                labels = teacher.slice(start, stop).to(device)
+                taught = teacher_loss(labels, evaluate_forced(policy, context, labels.actions))
+                _add_teacher_metrics(totals, counts, taught)
             losses = imitation_loss(chunk, evaluation)
             for head in ('gate', 'candidate', 'target', 'delay'):
                 count = float(getattr(losses, f'{head}_count'))
@@ -212,6 +248,15 @@ def evaluate(policy, batch, device, time_steps: int, fused: bool = True) -> dict
             state = evaluation.final_state
     policy.train()
     return {head: round(totals[head] / counts[head], 4) if counts[head] else None for head in totals}
+
+
+def _add_teacher_metrics(totals: Counter, counts: Counter, taught: dict) -> None:
+    gate_count, cond_weight = float(taught['gate_count']), float(taught['cond_weight'])
+    totals['t_gate'] += float(taught['gate'].detach()) * gate_count
+    counts['t_gate'] += gate_count
+    for head in ('candidate', 'target', 'delay'):
+        totals[f't_{head}'] += float(taught[head].detach()) * cond_weight
+        counts[f't_{head}'] += cond_weight
 
 
 def main(argv: list[str]) -> int:
@@ -238,7 +283,13 @@ def main(argv: list[str]) -> int:
     parser.add_argument('--head-lr-mult', type=float, default=10.0, help='learning rate multiplier for the new head')
     parser.add_argument('--limit-units', type=int, default=0, help='train on the first N sides only (tests)')
     parser.add_argument('--max-updates', type=int, default=0, help='stop after N updates (tests)')
+    parser.add_argument('--teacher', action='store_true',
+                        help='self-distillation: add the no-delay teacher labels in <frames>/teacher (il/teacher.py)')
+    parser.add_argument('--teacher-weight', type=float, default=1.0)
+    parser.add_argument('--human-weight', type=float, default=1.0, help='weight of the replay (human) labels')
     args = parser.parse_args(argv)
+    if args.teacher and args.step_eval:
+        raise SystemExit('--teacher needs the fused evaluation (drop --step-eval)')
 
     import torch
     from torch.utils.data import DataLoader
@@ -257,6 +308,12 @@ def main(argv: list[str]) -> int:
     log = (args.out / 'train-metrics.jsonl').open('a')
 
     units = select_units(args.frames)
+    if args.teacher:
+        from il.teacher import label_path
+        labelled = [u for u in units if label_path(args.frames, u[0], u[1]).exists()]
+        print(f'teacher labels for {len(labelled)} of {len(units)} sides', flush=True)
+        units = labelled
+    teacher_dir = args.frames if args.teacher else None
     train_units = [u for u in units if not held_out(u[0])]
     val_units = [u for u in units if held_out(u[0])]
     if args.smoke:
@@ -284,13 +341,18 @@ def main(argv: list[str]) -> int:
         return {**values, **(extras_payload(head) if head is not None else {})}
     autocast = device.type == 'cuda'
     max_turns = 64 if args.smoke else None
-    val_data = ReplaySequences(val_units[:args.val_sides], max_turns, args.extras)
-    val_sequences = [item['sequence'] for item in (val_data[i] for i in range(len(val_data)))
-                     if item.get('sequence') is not None]
-    val_batch = batch_sequences(val_sequences, consume=True) if val_sequences else None
+    val_data = ReplaySequences(val_units[:args.val_sides], max_turns, args.extras, teacher_dir)
+    val_items = [item for item in (val_data[i] for i in range(len(val_data))) if item.get('sequence') is not None]
+    val_batch, val_teacher = None, None
+    if val_items:
+        steps = max(item['sequence'].time_steps for item in val_items)
+        if teacher_dir is not None:
+            from il.teacher import collate_labels
+            val_teacher = collate_labels([item.pop('teacher') for item in val_items], steps)
+        val_batch = batch_sequences([item.pop('sequence') for item in val_items], consume=True)
     if val_batch is not None:
         row = {'event': 'validation', 'update': 0, 'sides': val_batch.batch_size,
-               **evaluate(policy, val_batch, device, args.time_steps, not args.step_eval)}
+               **evaluate(policy, val_batch, device, args.time_steps, not args.step_eval, val_teacher)}
         print(json.dumps(row), flush=True)
         log.write(json.dumps(row) + '\n')
 
@@ -298,7 +360,8 @@ def main(argv: list[str]) -> int:
     for epoch in range(args.epochs):
         order = list(train_units)
         random.Random(args.seed + epoch).shuffle(order)
-        loader = DataLoader(ReplaySequences(order, max_turns, args.extras), batch_size=args.batch, shuffle=False,
+        loader = DataLoader(ReplaySequences(order, max_turns, args.extras, teacher_dir), batch_size=args.batch,
+                            shuffle=False,
                             num_workers=args.workers, collate_fn=_collate, persistent_workers=False,
                             worker_init_fn=_one_thread,
                             prefetch_factor=args.prefetch if args.workers else None)
@@ -310,17 +373,33 @@ def main(argv: list[str]) -> int:
             from il.pack import unpack
             batch = unpack(packed)
             del packed
+            teacher = None
+            if isinstance(batch, tuple):
+                batch, teacher = batch
             state = policy.initial_state(batch.batch_size, device=device)
-            metrics = Counter()
+            metrics, metrics_counts = Counter(), Counter()
             for start in range(0, batch.time_steps, args.time_steps):
-                chunk = slice_il_sequence(batch, start, min(batch.time_steps, start + args.time_steps)).to(device)
+                stop = min(batch.time_steps, start + args.time_steps)
+                chunk = slice_il_sequence(batch, start, stop).to(device)
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast):
-                    evaluation = evaluate_chunk(policy, chunk, state, not args.step_eval)
-                    losses = imitation_loss(chunk, evaluation)
-                if not torch.isfinite(losses.total):
+                    if teacher is None:
+                        evaluation = evaluate_chunk(policy, chunk, state, not args.step_eval)
+                        losses = imitation_loss(chunk, evaluation)
+                        total = args.human_weight * losses.total
+                    else:
+                        from il.fused import evaluate_forced, fused_context
+                        from il.teacher import teacher_loss
+                        context = fused_context(policy, chunk.observations, chunk.episode_start, initial_state=state)
+                        evaluation = evaluate_forced(policy, context, chunk.actions)
+                        losses = imitation_loss(chunk, evaluation)
+                        labels = teacher.slice(start, stop).to(device)
+                        taught = teacher_loss(labels, evaluate_forced(policy, context, labels.actions))
+                        total = args.human_weight * losses.total + args.teacher_weight * taught['total']
+                        _add_teacher_metrics(metrics, metrics_counts, taught)
+                if not torch.isfinite(total):
                     raise FloatingPointError(f'non-finite loss at epoch {epoch} group {group_index} turn {start}')
-                losses.total.backward()
+                total.backward()
                 torch.nn.utils.clip_grad_norm_(all_parameters, args.max_grad_norm)
                 optimizer.step()
                 state = evaluation.final_state.detach()
@@ -334,7 +413,9 @@ def main(argv: list[str]) -> int:
             row = {'event': 'group', 'epoch': epoch, 'group': group_index, 'update': update,
                    'sequences': sequence_count, 'turns': batch.time_steps, 'elapsed_s': round(time.time() - started),
                    **{h: round(metrics[h] / metrics[f'{h}_count'], 4) for h in ('gate', 'candidate', 'target', 'delay')
-                      if metrics[f'{h}_count']}}
+                      if metrics[f'{h}_count']},
+                   **{h: round(metrics[h] / metrics_counts[h], 4) for h in ('t_gate', 't_candidate', 't_target', 't_delay')
+                      if metrics_counts[h]}}
             print(json.dumps(row), flush=True)
             log.write(json.dumps(row) + '\n')
             log.flush()
@@ -344,10 +425,12 @@ def main(argv: list[str]) -> int:
                                              training_stage='imitation', gamma_per_decision=0.997,
                                              extra=payload(init=args.init, epoch=epoch, group=group_index,
                                                            recipe='clapha il.train: live-code samples, bot timing',
-                                                           extras=args.extras))
+                                                           extras=args.extras, teacher=args.teacher,
+                                                           teacher_weight=args.teacher_weight,
+                                                           human_weight=args.human_weight))
                 if val_batch is not None:
                     row = {'event': 'validation', 'update': update,
-                           **evaluate(policy, val_batch, device, args.time_steps, not args.step_eval)}
+                           **evaluate(policy, val_batch, device, args.time_steps, not args.step_eval, val_teacher)}
                     print(json.dumps(row), flush=True)
                     log.write(json.dumps(row) + '\n')
             if args.smoke or (args.max_updates and update >= args.max_updates):

@@ -308,7 +308,7 @@ HOG26_CARDS = frozenset({26000021, 26000014, 27000000, 26000038, 26000030, 26000
 
 
 def actor_sequence(header: dict, frames: list[dict], actor: int, stats: Counter, delay: int | None = None,
-                   extras: bool = False):
+                   extras: bool = False, with_ticks: bool = False):
     """FirstLight's ILSequenceV4 for one actor: every decision turn from tick 90, in order.
 
     Unusable labels (not offered by the live mask at the decision tick) keep their frame but
@@ -318,9 +318,9 @@ def actor_sequence(header: dict, frames: list[dict], actor: int, stats: Counter,
     from native_runner.training.v4.imitation import ILSequenceV4
     samples = actor_samples(header, frames, actor, stats, keep=True, delay=delay, extras=extras)
     if not samples:
-        return None
+        return (None, []) if with_ticks else None
     steps = len(samples)
-    return ILSequenceV4(
+    sequence = ILSequenceV4(
         observations=tuple(storage for _tick, storage, _sequence, _usable in samples),
         actions=tuple(sequence for _tick, _storage, sequence, _usable in samples),
         episode_start=torch.tensor([[step == 0] for step in range(steps)], dtype=torch.bool),
@@ -329,6 +329,8 @@ def actor_sequence(header: dict, frames: list[dict], actor: int, stats: Counter,
         gate_loss_mask=torch.tensor([[usable] for _t, _s, _q, usable in samples], dtype=torch.bool),
         value_loss_mask=torch.zeros(steps, 1, dtype=torch.bool),
         sequence_id=f"{header['replay_tag']}:owner-{actor}")
+    # with_ticks: also the engine tick of every turn (il/teacher.py lines two views up by tick)
+    return (sequence, [tick for tick, _s, _q, _u in samples]) if with_ticks else sequence
 
 
 def _reason(error, window, observation) -> str:

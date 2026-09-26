@@ -5,7 +5,9 @@
 # VM. The VM is also created with a hard max-run-duration, so a hang cannot keep billing.
 # Needs the VM's service account to read and write the bucket (roles/storage.objectAdmin on
 # it); the project's default compute account has no roles here unless granted.
-# Instance metadata: clapha-bucket, clapha-mode (smoke | full), clapha-args (il.train flags).
+# Instance metadata: clapha-bucket, clapha-mode (smoke | full), clapha-args (il.train flags), and
+# optionally clapha-prep: a module and flags run first (e.g. "il.teacher --workers 28"); the teacher
+# labels it writes go to the bucket (conv-hog26/teacher) as they are made, so a later VM reuses them.
 # the log goes to the serial console too: readable with get-serial-port-output even when the VM
 # cannot reach the bucket
 exec > >(tee -a /var/log/clapha-train.log > /dev/ttyS0) 2>&1
@@ -14,6 +16,7 @@ meta() { curl -s -H 'Metadata-Flavor: Google' "http://metadata.google.internal/c
 B=$(meta attributes/clapha-bucket)
 MODE=$(meta attributes/clapha-mode)
 ARGS=$(meta attributes/clapha-args)
+PREP=$(meta attributes/clapha-prep)
 NAME=$(meta name)
 ZONE=$(meta zone | awk -F/ '{print $NF}')
 OUT="$B/out/$NAME"
@@ -41,6 +44,8 @@ finish() {
 ( while true; do
     sleep 300
     [ -d "$W/clapha/runs/train" ] && gcloud storage rsync -r "$W/clapha/runs/train" "$OUT/train" -q
+    [ -d "$W/clapha/runs/conv-hog26/teacher" ] && gcloud storage rsync -r "$W/clapha/runs/conv-hog26/teacher" "$B/conv-hog26/teacher" -q
+    [ -f "$W/clapha/runs/prep.log" ] && gcloud storage cp "$W/clapha/runs/prep.log" "$OUT/prep.log" -q
   done ) &
 
 for _ in $(seq 1 60); do nvidia-smi && break; sleep 10; done
@@ -62,6 +67,15 @@ mkdir -p clapha/ref-firstlight/checkpoints/IL clapha/runs/conv-hog26
 gcloud storage cp "$B/ckpt/IL/checkpoint-step-00029396.pt" clapha/ref-firstlight/checkpoints/IL/ -q
 gcloud storage rsync -r "$B/conv-hog26" clapha/runs/conv-hog26 -q || { finish "data"; exit 1; }
 cd clapha
+if [ -n "$PREP" ] && [ "$PREP" != "none" ]; then
+  # metadata values are not shell code: only "module flags...", run with the training Python
+  read -r -a PREP_WORDS <<< "$PREP"
+  "$PY" -m "${PREP_WORDS[@]}" > runs/prep.log 2>&1
+  prep_status=$?
+  gcloud storage cp runs/prep.log "$OUT/prep.log" -q
+  [ -d runs/conv-hog26/teacher ] && gcloud storage rsync -r runs/conv-hog26/teacher "$B/conv-hog26/teacher" -q
+  [ "$prep_status" = 0 ] || { finish "prep-exit-$prep_status"; exit 1; }
+fi
 if [ "$MODE" = smoke ]; then
   "$PY" -m il.train --frames runs/conv-hog26 --out runs/train --smoke $ARGS > runs/train.log 2>&1
 else
