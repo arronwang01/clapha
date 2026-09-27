@@ -318,8 +318,14 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
     for runner in runners.values():
         if runner is not None:
             runner.end_battle()
+    # each side's standing tower health at the end (a destroyed tower is gone): with a replay
+    # opponent, wins alone saturate, and what a model loses to real pushes is the finer measure
+    tower_hp = {0: 0, 1: 0}
+    for o in final.get('objects') or ():
+        if 5000000 <= int(o.get('nativeObjectId', 0)) <= 5000005 and o.get('hp') is not None:
+            tower_hp[int(o['owner'])] += int(o['hp'])
     result = {'winner': final.get('winner'), 'crowns': final.get('crownsRaw'), 'tick': final.get('tick'),
-              'counters': counters}
+              'counters': counters, 'tower_hp': tower_hp}
     if record and recorded_frames:
         result['recording'] = _recording(recorded_frames, done, deck_forms, final)
     return result
@@ -500,6 +506,7 @@ def main(argv: list[str]) -> int:
                'a_lead': args.a_lead, 'b_lead': args.b_lead, 'a_extra_delay': args.a_extra_delay,
                'b_extra_delay': args.b_extra_delay,
                'a_side': a_side, 'result': label, 'crowns': result['crowns'], 'end_tick': result['tick'],
+               'tower_hp': result['tower_hp'],
                'counters': result['counters'], 'seconds': round(time.time() - started)}
         with args.out.open('a') as handle:
             handle.write(json.dumps(row) + '\n')

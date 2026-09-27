@@ -1584,3 +1584,30 @@ says otherwise; improving on the teacher needs the RL stage.
 **distill-d1 (4080):** from t0b @1520, --delay-range 20 32 (per side, told to the model), the other
 9,677 sides; ~16.5 s per 16 sides; first checkpoint (update 1522 of this run) downloaded to
 ~/crtrain-stage/train2/; validation t_gate 0.386 -> 0.368, t_candidate 0.464 -> 0.450. ETA ~20:45.
+
+**Later that evening:**
+- **Do not SIGSTOP the CR_4k emulator:** it exited on SIGCONT (after ~50 min stopped). To free the
+  Mac for a live test, stop the duel and leave the emulator running, or shut it down
+  (`adb -s emulator-5554 emu kill`) and restart it later. Restart order used (no online window
+  for Null's): boot (`emulator -avd CR_4k -no-snapshot-save -no-boot-anim -dns-server
+  1.1.1.1,8.8.8.8 -grpc 8554 -grpc-use-token`), `adb root`, `am force-stop nullsroyale.rel.free`,
+  `start_offline.sh --prepare-only` (firewall), push runs/libcrprobe_run.so into Null's lib dir
+  (md5 d59657b8...), `start_offline.sh`.
+- **Flight times measured** (il/flight.py FLIGHT; runs/flight-measure*.jsonl): linear in tiles from
+  the caster's King Tower -- Goblin Barrel goblins -0.97 + 2.515/tile (57 ticks to a princess
+  tower), Fireball -0.48 + 1.681, Rocket -0.77 + 2.881, Snowball -1.01 + 1.268, Arrows -2.34 +
+  0.975, Miner -4.19 + 1.706 (underground), Goblin Drill -10.9 + 4.04; Log / Barbarian Barrel 8
+  ticks then roll; Freeze, Lightning, Zap, Poison, Graveyard, Tornado, Earthquake, Void, Goblin
+  Curse, Vines on the tile at once. Royal Delivery not timed (left at the default).
+- **Upper bound final: distill-t0b @1520 vs no-delay fl:hog2 7-13** (5-4 in the first 9, 2-9 in
+  the 11 after the pause, seed 1314).
+- **Replay opponents (il.duel --b replay):** real games' decks, deal and the real player's plays at
+  their ticks, not reactive -- a model can 3-crown one in 78 s, so wins saturate; tower HP lost to
+  real pushes is the finer measure (duel rows now carry `tower_hp`). Comparison queued: today's
+  live fl:hog2 and distill-t0b @1520 against the same 30 real opponents (seed 5050).
+- **Correction round (DAgger) pipeline:** `il.duel --a STUDENT --a-lead auto --b replay --record
+  runs/dagger-N`; `il.teacher --frames runs/dagger-N`; `il.train --frames runs/conv-hog26
+  runs/dagger-N:5 ...` (a folder's sides repeated; each side's labels in its own folder).
+- The user's view after the live test: much better with the delay fixed, still weak overall, and a
+  lower win rate in their friendlies than they expected (few games; their battles stay private).
+  Strategy beyond hog2 needs RL; RL needs engine capacity (~1 game/min per Mac engine).
