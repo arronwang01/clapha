@@ -1611,3 +1611,31 @@ says otherwise; improving on the teacher needs the RL stage.
 - The user's view after the live test: much better with the delay fixed, still weak overall, and a
   lower win rate in their friendlies than they expected (few games; their battles stay private).
   Strategy beyond hog2 needs RL; RL needs engine capacity (~1 game/min per Mac engine).
+
+## 2026-09-27 morning: v2 done, the random-delay run's result, the Windows engine blocker
+
+- **distill-d1 final** (all 10,317 sides, --delay-range 20 32): vs no-delay fl:hog2 **7-11 over 18,
+  identical to distill-t0b @1520 on the same 18 deals**. Imitation metrics kept improving (card /
+  tile vs the teacher) with no gain in results; act/wait (t_gate) flat ~0.35-0.37 in every run.
+- **distill-v2** (from d1 final, consistent per-side delay 23-27, extras v2: arrival + hero /
+  champion controllers, measured flight table; 645 batches, done 01:05 Mac time): validation vs the
+  teacher start -> end: gate 0.356 -> 0.353, card 0.313 -> 0.278, tile 1.267 -> 1.192, **timing
+  0.988 -> 0.682 (-31%)** -- the consistent delay is what the in-turn timing needed. Stripped copy:
+  runs/pc/distill-v2-final.pt. Engine benchmark queued (same deals as 1520 / d1; then v2 vs 1520).
+- Reading: the delay fix came in the first 640 games; more distillation moves imitation numbers
+  but not results against no-delay hog2 (~35-40%, bounded by the information gap and the teacher).
+  Beyond the teacher = RL.
+- **Windows engine: MuMu's Android 15 image cannot run the offline engine** (found 2026-09-18/19 in
+  ~/Documents/GitHub/clash-royale-simulator-trial, DECISIONS D-064..D-068: eglMakeCurrent
+  EGL_BAD_MATCH in libg's asset loader thread, then a .sc loader null-stream crash; content never
+  loads, coldReady never true). Fix = an **Android 12 MuMu instance**, which only MuMu's window can
+  create (新建模拟器 -> Android 12); MuMuManager `create -ver 12` fails without the engine image.
+  MuMu 6.0.1 (core 6.7.0.0) at C:\Program Files\Netease\MuMu\nx_main\MuMuManager.exe; VM 0
+  `crtrain` (Android 15, adb 127.0.0.1:16384, houdini). D:\crtrain holds that attempt's setup
+  (adbw.cmd wrapper for `svc power stayon`, FirstLight_CR, platform-tools); D:\stage5.ps1 ran
+  FirstLight's PPO (their timing and reward) -- reuse only its engine steps, with our collector.
+- **The PC is shared:** 2026-09-27 a `yolov8` conda env ran 13 python processes (GPU ~21%, 3.5 GB).
+  Check before starting anything heavy; leave them room.
+- Only the APK and /data/data/nullsroyale.rel.free/update (152 MB) are needed on a new device
+  (FirstLight's offline_install checks update/); shared_prefs (account/device ids) are not copied.
+  Staged on the Mac: ~/crtrain-stage/engine (nulls-offline.apk, nulls-update.tar, probe).
