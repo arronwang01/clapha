@@ -32,7 +32,7 @@ from native_core.mumu_live_actions import ScreenLayout, send_card_taps  # noqa: 
 from native_core.mumu_live_protocol import adb_run  # noqa: E402
 if str(Path(__file__).resolve().parents[1]) not in sys.path:
     sys.path.append(str(Path(__file__).resolve().parents[1]))   # after mac012: shadows nothing
-from il.params import elixir_lead, live_delay  # noqa: E402  (the delay the model is told)
+from il.params import elixir_lead  # noqa: E402  (the elixir lead follows the delay the model is told)
 
 PORT = int(os.environ.get('CR_CONSOLE_PORT', '8777'))
 LOG_FILE = Path(__file__).resolve().parents[1] / 'build' / f'bot_{PORT}.log'
@@ -42,8 +42,15 @@ X_TILES, Y_TILES = 18, 32
 COMMAND_AGE_TICKS = 21
 # A tap that never reaches the queue (missed, or refused by the client) is given up on.
 IN_FLIGHT_SECONDS = 3.0
-# How long a play chosen against elixir the client has not credited yet may wait for it.
-DEFER_SECONDS = 0.5
+# How long a play chosen against elixir the client has not credited yet may wait for it (and for
+# its moment: a play is held until it will land TARGET_DELAY ticks after its decision).
+DEFER_SECONDS = 0.8
+# Every play lands this many ticks after its moment (decision turn + the model's offset), counted
+# to its replay tick (issue + 20): the tap is held until then, less the measured tap -> issue lag,
+# so the landing does not wander with the pipeline's timing (the game is precise; the user,
+# 2026-09-26). 26 = the command's 20 + up to 6 ticks of our own reading, deciding and tapping; a
+# slower play lands late and is counted. The model is told this delay; training covered 23-27.
+TARGET_DELAY = int(os.environ.get('CR_TARGET_DELAY', '26'))
 
 # The deck the Hog 2.6 specialists trained on (FirstLight checkpoints/README.md), with the
 # forms their interface sets explicitly: 1 = evolution, 2 = hero.
@@ -218,13 +225,19 @@ class Bot:
         self.deduced = ''
         self.rtt: list[int] = []   # our taps: game ticks from tap to the command's issue tick
         # Each play's pipeline delay: ticks from its moment (decision turn + the model's 0-4 tick
-        # offset) to its issue tick, plays held for elixir left out. The model is told the delay
-        # this gives (il.params.live_delay) and a checkpoint of ours sets its elixir lead from it;
-        # kept across battles, since it belongs to this setup rather than to a match.
+        # offset) to its issue tick, plays held for elixir left out -- the record of how often a
+        # play missed its TARGET_DELAY landing; kept across battles (it belongs to this setup).
         self.overheads: list[int] = []
         self.told_delay: int | None = None
+        self.late_plays = 0
         self.tapper = None
         self.opponent_intel = None
+
+    def _tap_lag(self) -> int:
+        """Ticks from our tap (the frame we tapped on) to the game's issue tick: median of the last 9
+        (self.rtt), 2 before any; the hold sends each tap this much before its landing target."""
+        recent = sorted(self.rtt[-9:])
+        return min(6, recent[len(recent) // 2]) if recent else 2
 
     def note(self, line: str) -> None:
         """Log a line on the page and to a file.
@@ -391,8 +404,14 @@ class Bot:
                 self.rtt.append(max(0, entry['issue_tick'] - flight['tap_tick']))
                 del self.rtt[:-50]
                 if flight.get('turn') is not None and not flight.get('elixir_wait'):
-                    self.overheads.append(max(0, entry['issue_tick'] - flight['turn'] - flight['offset']))
+                    overhead = max(0, entry['issue_tick'] - flight['turn'] - flight['offset'])
+                    self.overheads.append(overhead)
                     del self.overheads[:-50]
+                    late = overhead - (TARGET_DELAY - COMMAND_AGE_TICKS + 1)
+                    if late > 0:
+                        self.late_plays += 1
+                        self.note(f'late play: landed {late} tick(s) after its target '
+                                  f'({self.late_plays} late so far)')
                 self._report_latency(flight)
                 self._report_placement(flight, entry)
                 break
@@ -942,14 +961,14 @@ class Bot:
                 seen = {side: revealed_cards.get(side, []),
                         1 - side: [c for c in revealed_cards.get(1 - side, [])
                                    if c in runner.opponent_seen]}
-                delay = live_delay(self.overheads)
+                delay = TARGET_DELAY
                 if runner.clapha_inputs:
                     runner.elixir_lead = elixir_lead(delay)
                 if delay != self.told_delay:
                     self.told_delay = delay
-                    self.note(f'delay {delay} ticks from decision to the play\'s replay tick '
-                              f'(median of our last {min(len(self.overheads), 9)} plays, 5-tick prior)'
-                              + (f'; elixir lead {runner.elixir_lead}' if runner.clapha_inputs else ''))
+                    self.note(f'plays land {delay} ticks after their moment (held to it; tap lag '
+                              f'{self._tap_lag()} ticks)' + (f'; elixir lead {runner.elixir_lead}'
+                                                               if runner.clapha_inputs else ''))
                 observation, fl_battle = FLO.build(
                     view_frame, health, episode_id=str(battle), battle=fl_battle, revealed=seen,
                     reserved=reserved + sum(a['cost'] for a in abilities_in_flight),
@@ -1065,7 +1084,8 @@ class Bot:
                 # tick plus the model's offset (0-4), then the pipeline's own delay
                 move = {'card': int(card_id), 'row': row, 'column': column,
                         'since': decided, 'turn': turn, 'offset': int(offset or 0),
-                        'not_before': turn + int(offset or 0),
+                        'not_before': turn + int(offset or 0) + TARGET_DELAY - COMMAND_AGE_TICKS + 1
+                                      - self._tap_lag(),
                         'timing': {'decided': decided,
                                    'inference_ms': (decided - started) * 1000.0,
                                    'frame_age_ms': (started - frame_time) * 1000.0,

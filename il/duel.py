@@ -31,7 +31,8 @@ if str(CLAPHA) not in sys.path:
     sys.path.insert(0, str(CLAPHA))
 
 import il.samples as S                       # noqa: E402  (live code on sys.path first)
-from il.params import COMMAND_AGE_TICKS, DECISION_TICKS, OWN_OVERHEAD_TICKS, elixir_lead, live_delay  # noqa: E402
+from il.params import (COMMAND_AGE_TICKS, DECISION_TICKS, OWN_OVERHEAD_TICKS, REPLAY_TICK_AFTER_ISSUE,  # noqa: E402
+                       elixir_lead, live_delay)
 
 DEFER_TICKS = 30        # a tap that cannot be afforded is dropped after this long (console: 1.5 s)
 
@@ -67,7 +68,7 @@ def _overhead(rng: random.Random) -> int:
 
 def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id: str, record: bool = False,
                extra_delay: dict | None = None, measured: dict | None = None,
-               script: dict[int, list[dict]] | None = None) -> dict:
+               script: dict[int, list[dict]] | None = None, target_delay: int | None = None) -> dict:
     """One battle to the end; returns the result and per-side counters.
 
     The engine is stepped to the next thing that happens: a decision turn (every 5 ticks), a tap
@@ -104,8 +105,12 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
     # per pipeline, kept across matches as the console keeps it across battles
     measured = measured if measured is not None else {0: [], 1: []}
 
+    def told_delay(side: int) -> int:
+        # target_delay: the console's held landing (TARGET_DELAY); otherwise the measured rule
+        return int(target_delay) if target_delay else live_delay(measured[side])
+
     def lead_now(side: int) -> int:
-        return elixir_lead(live_delay(measured[side])) if leads[side] == 'auto' else int(leads[side])
+        return elixir_lead(told_delay(side)) if leads[side] == 'auto' else int(leads[side])
     recorded_frames: list[dict] = []          # record=True: every decision-tick snapshot, as a conversion saves
     done: list[Command] = []                   # executed commands, for the recording
 
@@ -149,7 +154,7 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
         overhead = sum(k * v for k, v in OWN_OVERHEAD_TICKS.items()) / sum(OWN_OVERHEAD_TICKS.values())
         delay = round(COMMAND_AGE_TICKS - 1 + overhead + extra_delay[side]) if delays[side] == 'live' else 1
         if delays[side] == 'live' and leads[side] == 'auto':
-            delay = live_delay(measured[side])
+            delay = told_delay(side)
         runner.session.next_extras = build_extras(runner.session.tensorizer, pending,
                                                   opponent_elixir=opponent_raw / 10000.0, delay=delay,
                                                   abilities=S.ability_rows(frame, side, ability_clocks[side], tick))
@@ -285,7 +290,13 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
             for move in runner.decide(observation):
                 kind, _slot, card_id, target_grid, offset = move
                 kind = str(getattr(kind, 'value', kind))
-                tap = tick + int(offset) + (_overhead(rng) + extra_delay[side] if delays[side] == 'live' else 0)
+                if delays[side] == 'live':
+                    # the pipeline's own time, or held to the target landing when it is quicker
+                    pipeline = _overhead(rng) + extra_delay[side]
+                    hold = int(target_delay) - REPLAY_TICK_AFTER_ISSUE if target_delay else 0
+                    tap = tick + int(offset) + max(pipeline, hold)
+                else:
+                    tap = tick + int(offset)
                 seq += 1
                 if kind == 'activate_ability':
                     entity = getattr(move, 'source_entity', None)
@@ -455,6 +466,10 @@ def main(argv: list[str]) -> int:
     parser.add_argument('--a-extra-delay', type=int, default=0,
                         help="ticks added to a's taps (a slower pipeline); an extended model is told the true delay")
     parser.add_argument('--b-extra-delay', type=int, default=0)
+    parser.add_argument('--target-delay', type=int,
+                        help="live sides' plays land this many ticks after their moment (the console's held "
+                             "landing, TARGET_DELAY), later only when the drawn pipeline time is longer; "
+                             "a side with lead auto is told it")
     parser.add_argument('--frames', type=Path, default=CLAPHA / 'runs/conv-hog26')
     parser.add_argument('--out', type=Path, default=CLAPHA / 'runs/duels.jsonl')
     parser.add_argument('--port', type=int, default=26789)
@@ -489,7 +504,8 @@ def main(argv: list[str]) -> int:
                                 record=args.record is not None,
                                 extra_delay={a_side: args.a_extra_delay, 1 - a_side: args.b_extra_delay},
                                 measured={a_side: overheads['a'], 1 - a_side: overheads['b']},
-                                script={1 - a_side: script_plays} if script_plays is not None else None)
+                                script={1 - a_side: script_plays} if script_plays is not None else None,
+                                target_delay=args.target_delay)
         except Exception as error:  # noqa: BLE001  (one broken match must not end the set)
             print(f'match {index + 1} failed: {type(error).__name__}: {error}', flush=True)
             for runner in runners.values():
@@ -504,7 +520,7 @@ def main(argv: list[str]) -> int:
         wins[label] += 1
         row = {'a': args.a, 'a_delay': args.a_delay, 'b': args.b, 'b_delay': args.b_delay, 'deck_from': tag,
                'a_lead': args.a_lead, 'b_lead': args.b_lead, 'a_extra_delay': args.a_extra_delay,
-               'b_extra_delay': args.b_extra_delay,
+               'b_extra_delay': args.b_extra_delay, 'target_delay': args.target_delay,
                'a_side': a_side, 'result': label, 'crowns': result['crowns'], 'end_tick': result['tick'],
                'tower_hp': result['tower_hp'],
                'counters': result['counters'], 'seconds': round(time.time() - started)}
