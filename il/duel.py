@@ -68,7 +68,8 @@ def _overhead(rng: random.Random) -> int:
 
 def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id: str, record: bool = False,
                extra_delay: dict | None = None, measured: dict | None = None,
-               script: dict[int, list[dict]] | None = None, target_delay: int | None = None) -> dict:
+               script: dict[int, list[dict]] | None = None, target_delay: int | None = None,
+               decide_many=None) -> dict:
     """One battle to the end; returns the result and per-side counters.
 
     The engine is stepped to the next thing that happens: a decision turn (every 5 ticks), a tap
@@ -246,10 +247,10 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
         for row in executed_rows:
             if row['card_id'] not in revealed[row['side']]:
                 revealed[row['side']].append(row['card_id'])
-        for side in (0, 1):
+        def prepare(side):
             runner = runners[side]
             if runner is None:
-                continue        # a replay opponent: its plays are scripted
+                return None     # a replay opponent: its plays are scripted
             # every play this side has decided and that has not executed is gone from its screen
             # hand, tapped or not: the console taps within the turn, and training counts a play as
             # sent from the turn after its decision (il/samples in_flight)
@@ -284,10 +285,14 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
                 elixir_lead_ticks=lead_now(side))
             if tick < runner.first_decision_tick:
                 runner.observe(observation)
-                continue
+                return None
             if runner.model is not None and '_extras_head' in runner.model.__dict__:
                 session_extras(runner, side, tick, frame)
-            for move in runner.decide(observation):
+            return runner, observation
+
+        def apply(side, runner, moves):
+            nonlocal seq
+            for move in moves:
                 kind, _slot, card_id, target_grid, offset = move
                 kind = str(getattr(kind, 'value', kind))
                 if delays[side] == 'live':
@@ -322,6 +327,23 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
                     command.execute = tick + max(1, int(offset))
                     counters[side]['tapped'] += 1
                 commands.append(command)
+        if decide_many is None:
+            # one side after the other: side 1 is prepared after side 0's plays of this turn exist
+            for side in (0, 1):
+                prepared = prepare(side)
+                if prepared is not None:
+                    apply(side, prepared[0], prepared[0].decide(prepared[1]))
+        else:
+            # both sides prepared from the same state, then decided together (il/rl_serve.py)
+            ready = []
+            for side in (0, 1):
+                prepared = prepare(side)
+                if prepared is not None:
+                    ready.append((side, *prepared))
+            if ready:
+                decided = decide_many(ready)
+                for side, runner, _observation in ready:
+                    apply(side, runner, decided[side])
         # a tap due right now (no-delay side, offset 0) goes out this tick
         process_taps(frame['state']['players'])
         inject_due()
@@ -422,7 +444,7 @@ def hog26_matchups(frames_dir: Path, count: int, seed: int):
     return out
 
 
-def replay_matchups(frames_dir: Path, count: int, seed: int):
+def replay_matchups(frames_dir: Path, count: int, seed: int, opponent_has: set[int] | None = None):
     """Real games with one Hog 2.6 side: (match config with both real decks and the deal, deck
     forms, tag, the Hog side, the other side's recorded card plays). The Hog side is the model's;
     the other is played back as the real player played it (a replay opponent: real decks and real
@@ -441,6 +463,8 @@ def replay_matchups(frames_dir: Path, count: int, seed: int):
         if len(sides) != 1:
             continue
         hog = sides[0]
+        if opponent_has and not opponent_has & set(timeline['decks'][1 - hog]):
+            continue
         replay = header['calibrated'].replay
         plays = [c for c in replay_commands(replay) if c['owner'] == 1 - hog and c['kind'] == 'card']
         forms = {side: list(timeline['form_availability'][side]) for side in (0, 1)}
@@ -463,6 +487,11 @@ def main(argv: list[str]) -> int:
                              "(delay measured from this side's plays, told to an extended model, lead from it)")
     parser.add_argument('--b-lead', type=_lead_arg, default=0)
     parser.add_argument('--matches', type=int, default=20)
+    parser.add_argument('--opponent-has', help="with --real-decks: only real games whose opponent deck has one of "
+                        "these card ids (comma-separated), e.g. 26000046 (Bandit)")
+    parser.add_argument('--real-decks', action='store_true',
+                        help="real games' decks and deals instead of Hog 2.6 mirrors: a on the Hog side, b (a model, "
+                             "e.g. fl:general) on the other player's real deck")
     parser.add_argument('--a-extra-delay', type=int, default=0,
                         help="ticks added to a's taps (a slower pipeline); an extended model is told the true delay")
     parser.add_argument('--b-extra-delay', type=int, default=0)
@@ -480,6 +509,8 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     import firstlight_bot as FLB
     from il.engine_convert import connect
+    from il.speed import install
+    install()           # identical results, less Python per decision (il/speed.py)
     native = connect(args.port)
     native.wait_ready(timeout=60.0)
     replay = args.b == 'replay'
@@ -491,6 +522,11 @@ def main(argv: list[str]) -> int:
     if replay:
         matchups = [(config, forms, tag, hog, plays)
                     for config, forms, tag, hog, plays in replay_matchups(args.frames, args.matches, args.seed)]
+    elif args.real_decks:
+        # real games' decks and deals, both sides played by models: a on the Hog 2.6 side
+        wanted = {int(card) for card in args.opponent_has.split(',')} if args.opponent_has else None
+        matchups = [(config, forms, tag, hog, None) for config, forms, tag, hog, _plays
+                    in replay_matchups(args.frames, args.matches, args.seed, opponent_has=wanted)]
     else:
         matchups = [(config, forms, tag, index % 2, None)          # sides swapped every match
                     for index, (config, forms, tag) in enumerate(hog26_matchups(args.frames, args.matches, args.seed))]

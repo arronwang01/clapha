@@ -33,6 +33,8 @@ from native_core.mumu_live_protocol import adb_run  # noqa: E402
 if str(Path(__file__).resolve().parents[1]) not in sys.path:
     sys.path.append(str(Path(__file__).resolve().parents[1]))   # after mac012: shadows nothing
 from il.params import elixir_lead  # noqa: E402  (the elixir lead follows the delay the model is told)
+from il.speed import install as _faster_contracts  # noqa: E402
+_faster_contracts()     # FirstLight's contract freezing, same results, ~2x less time per observation
 
 PORT = int(os.environ.get('CR_CONSOLE_PORT', '8777'))
 LOG_FILE = Path(__file__).resolve().parents[1] / 'build' / f'bot_{PORT}.log'

@@ -28,7 +28,8 @@ if [ "$update" = 1 ]; then
   cp "$ROOT"/il/*.py "$ROOT/il/SPEC.md" "$STAGE/clapha/il/"
   cp "$ROOT/mac012/firstlight_obs.py" "$ROOT/mac012/firstlight_bot.py" "$STAGE/clapha/mac012/"
   cp "$ROOT/live_card_catalog.json" "$STAGE/clapha/"
-  (cd "$STAGE" && rm -f "$OUT/clapha-code-update.zip" && zip -qr "$OUT/clapha-code-update.zip" clapha)
+  cp "$ROOT"/tools/windows/*.cmd "$ROOT"/tools/windows/*.ps1 "$STAGE/"      # the launchers, next to clapha/
+  (cd "$STAGE" && rm -f "$OUT/clapha-code-update.zip" && zip -qr "$OUT/clapha-code-update.zip" .)
   ls -l "$OUT/clapha-code-update.zip"
   exit 0
 fi

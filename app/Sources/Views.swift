@@ -6,7 +6,7 @@ let modelNames: [String: String] = [
     "fl:il": "FirstLight · Imitation (29k steps)",
     "fl:active-il": "FirstLight · Active imitation",
     "fl:general": "FirstLight · General",
-    "clapha:distill-1520": "Clapha · 2.6 Hog, no-delay distilled + pending cards",
+    "clapha:v2": "Clapha · 2.6 Hog v2: no-delay distilled, pending cards, hero states",
     "14k": "Own sim model · 14k",
     "40k": "Own sim model · 40k",
     "100k": "Own sim model · 100k",

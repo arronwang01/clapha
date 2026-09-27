@@ -165,7 +165,14 @@ def save_policy(path: Path, policy, head, update_index: int, args) -> None:
                                  gamma_per_decision=args.gamma,
                                  extra={'recipe': 'clapha il.rl_learn: self-play, live path, our reward',
                                         'init': args.init, 'update': update_index, **extras_payload(head)})
-    temporary.replace(path)
+    for attempt in range(40):
+        try:
+            temporary.replace(path)
+            return
+        except PermissionError:
+            # Windows: a collector is reading the old latest.pt right now
+            time.sleep(0.25)
+    raise RuntimeError(f'could not replace {path}')
 
 
 def main(argv: list[str]) -> int:
@@ -174,12 +181,15 @@ def main(argv: list[str]) -> int:
     parser.add_argument('--init', required=True, help='the starting policy (our extended checkpoint)')
     parser.add_argument('--games', required=True, type=Path, help='the collectors\' lane folder')
     parser.add_argument('--out', required=True, type=Path)
-    parser.add_argument('--lanes', type=int, default=64, help='new lanes per update')
+    # 32 lanes of 2 per minibatch: next to the other user's job on the PC, 64 lanes took 8.7 GB of RAM
+    # and 8 per minibatch ran the GPU out of memory (2026-09-27)
+    parser.add_argument('--lanes', type=int, default=32, help='new lanes per update')
     parser.add_argument('--max-age', type=int, default=2, help='use lanes from at most this many updates back')
     parser.add_argument('--updates', type=int, default=0, help='stop after this many (0: run until stopped)')
     parser.add_argument('--value-warmup', type=int, default=4)
-    parser.add_argument('--epochs', type=int, default=2)
-    parser.add_argument('--minibatch', type=int, default=8, help='lanes per minibatch')
+    # one pass: on the shared GPU the learner is the slow part and games are plentiful (2026-09-27)
+    parser.add_argument('--epochs', type=int, default=1)
+    parser.add_argument('--minibatch', type=int, default=2, help='lanes per minibatch')
     parser.add_argument('--time-steps', type=int, default=32)
     parser.add_argument('--learning-rate', type=float, default=1e-5)
     parser.add_argument('--gamma', type=float, default=0.999)
@@ -192,11 +202,22 @@ def main(argv: list[str]) -> int:
     parser.add_argument('--max-grad-norm', type=float, default=1.0)
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--once', action='store_true', help='one update on the lanes present, then stop (tests)')
+    parser.add_argument('--keep-lanes', action='store_true',
+                        help='keep lanes once used (by default they are deleted: ~4 MB per side per game)')
+    parser.add_argument('--save-every', type=int, default=10,
+                        help='keep policy-NNNN.pt every N updates (the league\'s snapshots are every 10)')
+    parser.add_argument('--min-free-gb', type=float, default=5.0,
+                        help='the GPU is shared: update only when this much GPU memory is free (0: always)')
     args = parser.parse_args(argv)
+    import firstlight_bot  # noqa: F401  (puts FirstLight's native_runner on the path)
+    from il.extras import checkpoint_extra
     from il.train import load_policy
     device = torch.device(args.device)
     args.out.mkdir(parents=True, exist_ok=True)
-    policy = load_policy(args.init, device)
+    # a restarted run continues from its latest update; the KL anchor stays --init
+    latest = args.out / 'latest.pt'
+    resumed = int(checkpoint_extra(latest).get('update', 0)) if latest.is_file() else 0
+    policy = load_policy(str(latest) if resumed else args.init, device)
     reference = load_policy(args.init, device)
     reference.eval()
     for parameter in reference.parameters():
@@ -213,8 +234,10 @@ def main(argv: list[str]) -> int:
     value_parameters = [p for name, p in policy.named_parameters() if name.startswith(VALUE_PREFIXES)]
     log = (args.out / 'learn.jsonl').open('a')
     seen: set[str] = set()
-    update_index = 0
-    optimizer = torch.optim.AdamW(value_parameters, lr=args.learning_rate * 10) if args.value_warmup else None
+    update_index = resumed
+    if resumed:
+        print(f'resuming at update {resumed} from {latest}', flush=True)
+    optimizer, optimizing = None, None
     while not args.updates or update_index < args.updates:
         fresh = sorted(p for p in args.games.glob('*.lane') if p.name not in seen)
         if len(fresh) < args.lanes and not (args.once and fresh):
@@ -222,28 +245,68 @@ def main(argv: list[str]) -> int:
             continue
         picked = fresh[:args.lanes]
         seen.update(p.name for p in picked)
+        stale = [p for p in picked if update_index - _version(p) > args.max_age]
         picked = [p for p in picked if update_index - _version(p) <= args.max_age]
+        if not args.keep_lanes:
+            for path in stale:
+                path.unlink(missing_ok=True)
         if not picked:
             continue
+        # the 4080 is shared (another user's jobs): take turns -- wait while it is busy, give the memory
+        # back after every update
+        waited = 0
+        while device.type == 'cuda' and args.min_free_gb > 0:
+            free, _total = torch.cuda.mem_get_info(device)
+            if free >= args.min_free_gb * 2 ** 30:
+                break
+            if waited % 600 == 0:
+                print(f'waiting for GPU memory: {free / 2 ** 30:.1f} GB free, need {args.min_free_gb:.1f}', flush=True)
+            time.sleep(30)
+            waited += 30
         started = time.time()
         sequences, extras = lane_sequences(picked, args.gamma, args.gae_lambda)
         value_only = update_index < args.value_warmup
-        if value_only:
-            parameters = value_parameters
-        else:
-            if optimizer is None or update_index == args.value_warmup:
-                optimizer = torch.optim.AdamW(everything, lr=args.learning_rate)
-            parameters = everything
-        stats = update(policy, reference, optimizer, parameters, sequences, extras, args, device, value_only)
+        if optimizing != ('value' if value_only else 'all'):
+            optimizing = 'value' if value_only else 'all'
+            optimizer = (torch.optim.AdamW(value_parameters, lr=args.learning_rate * 10) if value_only
+                         else torch.optim.AdamW(everything, lr=args.learning_rate))
+        parameters = value_parameters if value_only else everything
+        stats = None
+        for attempt in range(6):
+            try:
+                stats = update(policy, reference, optimizer, parameters, sequences, extras, args, device, value_only)
+                break
+            except torch.OutOfMemoryError:
+                pass
+            # the shared GPU filled up (the other user's job grew): let go of everything, wait, try again
+            # (outside the except block, so the traceback no longer holds the update's tensors)
+            optimizer.zero_grad(set_to_none=True)
+            torch.cuda.empty_cache()
+            print(f'GPU out of memory during update {update_index + 1}: try {attempt + 2} of 6 in 60 s', flush=True)
+            time.sleep(60)
+        if stats is None:
+            del sequences
+            for path in picked:
+                path.unlink(missing_ok=True)
+            continue
         update_index += 1
+        del sequences
+        if not args.keep_lanes and not args.once:
+            for path in picked:
+                path.unlink(missing_ok=True)
         wins = sum(1 for row in extras if row['winner'] == row['side'])
         row = {'update': update_index, 'value_only': value_only, 'lanes': len(picked), 'seconds': round(time.time() - started),
+               'waited_s': waited,
                'mean_return': round(sum(r['return'] for r in extras) / len(extras), 4), 'lane_wins': wins, **stats}
         print(json.dumps(row), flush=True)
         log.write(json.dumps(row) + '\n')
         log.flush()
-        save_policy(args.out / f'policy-{update_index:04d}.pt', policy, head, update_index, args)
+        if args.save_every and update_index % args.save_every == 0:
+            # the league's snapshots (il/rl.py --snapshot-every) and the run's history; ~50 MB each
+            save_policy(args.out / f'policy-{update_index:04d}.pt', policy, head, update_index, args)
         save_policy(args.out / 'latest.pt', policy, head, update_index, args)
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
         if args.once:
             break
     return 0

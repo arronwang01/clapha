@@ -1639,3 +1639,65 @@ says otherwise; improving on the teacher needs the RL stage.
 - Only the APK and /data/data/nullsroyale.rel.free/update (152 MB) are needed on a new device
   (FirstLight's offline_install checks update/); shared_prefs (account/device ids) are not copied.
   Staged on the Mac: ~/crtrain-stage/engine (nulls-offline.apk, nulls-update.tar, probe).
+
+## 2026-09-27 day: v2 in the console, the RL loop checked end to end, the 8-engine cluster
+
+- **v2 vs distill-t0-1520: 15-5** (10 deals x both sides, both told delay 25 / lead 9; v2 swept 6
+  deals, 1520 swept 1, 3 split; nearly every game went to overtime and was decided by tower
+  health). With v2 vs no-delay fl:hog2 at 8-12 (1520: 7-13), **v2 replaces 1520 in the console as
+  `clapha:v2`** (mac012/firstlight_bot.py CHECKPOINTS; the app label "Clapha · 2.6 Hog v2").
+  Consoles restarted idle 2026-09-27 ~09:55 (MuMu instances stopped), so the console code with
+  held landing (TARGET_DELAY 26) and extras v2 (arrival, both players' hero/champion controllers)
+  is what runs from the next battle. The console's extras path was checked offline (pending rows
+  from taps + the opponent's queue, ability rows from reader-shaped controllers, clock).
+- **RL loop, end to end on the Mac engine** (a code check, not training): il.rl collect 2 games
+  (1,210 decisions per side, lanes ~3.9 MB each, rewards zero-sum +-1.10), il.rl_learn --once:
+  PPO update, saves, **resume** from latest.pt (continues the update count; KL anchor stays --init).
+  **At the collection weights the learner reproduces the recorded log-probs to 1e-5 and the values
+  to 3e-5 (ratio exactly 1.000 on 256 steps)**, so the collector and learner agree.
+  Learner changes: used lanes are deleted (--keep-lanes to keep), latest.pt replace retries on
+  Windows file locks, optimizer switches cleanly between value warm-up and full updates on resume.
+- **Where a self-play game's time goes** (Mac CPU, cProfile): model forward 49% (25 ms per call,
+  2,412 calls), FLO.build 20% -- mostly FirstLight's contracts._freeze deep-freezing the action
+  mask's placement grids three times per decision -- tensorize 8%, the engine ~6%.
+  **il/speed.py**: an exact drop-in for _freeze (exact-type fast paths, everything else to the
+  original; 3,000 random nested values agree) -> 108 s -> 82 s per game; FLO.build 25 -> 14 s,
+  action_mask 12.8 -> 2.8 s. Installed by il.duel and il.rl (not yet the console).
+  On the PC the forward goes to the GPU (batch 1, no CUDA graph: FirstLight graphs only `act`).
+- **Why only 1 of 8 engines started** (stage6, our probe; stage6b retried with FirstLight's probe):
+  FirstLight's MuMu cluster script starts all 8 EngineNApp activities back to back, but their own
+  guest setup (native_runner/training/v4/configure_emulator_engine_guests.py) does two things the
+  script skips: **cached_apps_freezer disabled** ("otherwise suspends all but the most recently
+  launched engine process") and **cold-start one engine at a time**, attesting each before the next
+  ("libndk_translation can race while several ARM64 processes build their first translation caches
+  in one x86_64 guest"), then taskset-pins each to its vCPU. Engines 0,2-6 sat at ~130 MB with no
+  probe log: never got past the translation layer. **stage6c.ps1** (staged in ~/crtrain-stage/engine)
+  does their sequence with our run-lean probe; not run yet (needs the Mac's screen for ToDesk).
+- **PC RL launcher**: tools/windows/rl.ps1 (in the code update zip, lands next to clapha/):
+  `-Run NAME` starts il.rl_learn + one collector per engine port (cuda), `-Anchor 2` of them play
+  latest vs the fixed v2 (the running score against v2), the rest self-play; `-Stop` ends them.
+
+## 2026-09-27 evening: pilot1 left running unattended (the user away ~4 days)
+
+- pilot1 had played 0 games in 194 minutes: the YOLO job on the shared 4080 trained all day. It
+  cycles ~18 min at ~3 GB of GPU memory (~67% of the GPU) and ~5 min at ~12 GB. The user chose to
+  share at full speed: `--others-gb 7 --calm 2` (our run backs off during their 12 GB stretch).
+- The keeper (il/rl_turns.py) now restarts broken parts, the engines, or the VM and firewall
+  (stage6c / stage7); guards the disk; writes runs/rl/pilot1/status.txt every 10 min.
+  start-training.cmd / stop-training.cmd are in clapha-train. The Startup folder entry brings it
+  back after a reboot (the user's OK). Details: TRAINING.md, "Unattended".
+- Collectors exit after 5 failed games in a row (was: spin forever on a dead engine). The learner
+  keeps every 10th policy file (was: 50 MB per update, ~100 GB in 4 days). Fresh collector seeds
+  per start.
+- To read when back: status.txt (the "vs v2 (anchor)" column is the evidence question: does the
+  score against the starting model rise above 50% as games accumulate?).
+- First hour next to the other job: 64-lane updates ran the GPU out of memory and the PC out of RAM
+  (commit; collectors died of MemoryError); the keeper caught it, restarted the engines (none
+  answered after the crash) and the run by itself. Now 12 engines, 32 lanes, 2 per minibatch, one
+  epoch, backlog 64: first update (value only) 199 s. Baseline in status.txt before any update
+  (140 games, sampled play): vs v2 15-14, vs hog2 no-delay 7-10, vs General on real decks 7-19.
+- Attack survey refined per the user's review (il/attacks.py): a crossing counts as an attack only
+  with >= 400 troop health on our half at once or >= 50 tower damage (3,898 of 28,595 dropped),
+  defense only within 8 tiles of an attacking troop (12,105 of 83,969 plays dropped). Weak spot:
+  low-health but high-damage leftovers (two Elite Barbarians at 387) are dropped too; a damage-rate
+  rule from the unit tables would fix it. Viewer: runs/attacks/attack_viewer.html.

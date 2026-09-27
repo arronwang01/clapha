@@ -53,15 +53,25 @@ def _snapshot_at(frames: list[dict], tick: int) -> dict | None:
 def classify(path: Path, flying: set[int], building_only: set[int]) -> list[tuple[str, str, str]]:
     """(model label, card, verdict) per Log / Ice Golem play in one recording."""
     from il.frames import load_replay
-    from il.samples import TOWER_IDS
     from il.timeline import timeline_from_json
     header, frames = load_replay(path, with_replay=False)
     played = header.get('played') or {}
     timeline = timeline_from_json(header['timeline'])
     a_side = played.get('a_side')
     label = {a_side: f"a={played.get('a')}", 1 - a_side: f"b={played.get('b')}"} if a_side in (0, 1) else {}
+    return [(label.get(owner, f'side {owner}'), card, verdict)
+            for owner, card, verdict in classify_plays(frames, timeline.plays, flying, building_only)]
+
+
+def classify_plays(frames: list[dict], plays, flying: set[int], building_only: set[int]) -> list[tuple[int, str, str]]:
+    """(owner, card, verdict) per Log / Ice Golem play: frames every few ticks, plays with owner,
+    kind, card_id, grid, lands (il.timeline.Play or its JSON dict)."""
+    from il.samples import TOWER_IDS
     rows = []
-    for play in timeline.plays:
+    for play in plays:
+        if isinstance(play, dict):
+            from types import SimpleNamespace
+            play = SimpleNamespace(**play)
         if play.kind != 'card' or play.card_id not in (LOG, ICE_GOLEM) or play.grid is None:
             continue
         snapshot = _snapshot_at(frames, play.lands + 1)
@@ -71,7 +81,7 @@ def classify(path: Path, flying: set[int], building_only: set[int]) -> list[tupl
         enemies = [o for o in snapshot.get('objects') or () if int(o['owner']) != play.owner and o.get('hp') is not None]
         towers = [o for o in enemies if int(o['nativeObjectId']) in TOWER_IDS]
         units = [o for o in enemies if int(o['nativeObjectId']) not in TOWER_IDS]
-        who = label.get(play.owner, f'side {play.owner}')
+        who = play.owner
         if play.card_id == LOG:
             direction = 1 if play.owner == 0 else -1
 
@@ -101,10 +111,34 @@ def classify(path: Path, flying: set[int], building_only: set[int]) -> list[tupl
     return rows
 
 
+_FACTS = None
+
+
+def behaviour(frames: list[dict], plays: list[dict], side: int) -> dict:
+    """One side's habits in one game, for the RL game log: Log targets, Ice Golem use, seconds spent
+    at full elixir (leaked), and how often each card was played."""
+    global _FACTS
+    if _FACTS is None:
+        _FACTS = _unit_facts()
+    flying, building_only = _FACTS
+    verdicts = Counter(f'{card}: {verdict}' for owner, card, verdict in classify_plays(frames, plays, flying, building_only)
+                       if owner == side)
+    full, last = 0, None
+    for frame in frames:
+        state = next((p for p in (frame.get('state') or {}).get('players') or () if p['owner'] == side), None)
+        tick = int(frame['tick'])
+        if state is not None and int(state.get('elixirRaw') or 0) >= 100000 and last is not None:
+            full += tick - last
+        last = tick
+    cards = Counter(str(p['card_id']) for p in plays if p.get('owner') == side and p.get('kind') == 'card')
+    return {'habits': dict(verdicts), 'full_elixir_s': round(full / 20.0, 1), 'cards': dict(cards)}
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument('dirs', nargs='+', type=Path)
     args = parser.parse_args(argv)
+    import firstlight_bot  # noqa: F401  (puts FirstLight's native_runner on the path)
     flying, building_only = _unit_facts()
     counts: dict[tuple[str, str], Counter] = defaultdict(Counter)
     for directory in args.dirs:

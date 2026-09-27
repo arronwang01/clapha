@@ -63,8 +63,10 @@ CHECKPOINTS = {
     'fl:il': FIRSTLIGHT / 'checkpoints/IL/checkpoint-step-00029396.pt',
     'fl:active-il': FIRSTLIGHT / 'checkpoints/active IL/checkpoint-step-00000030.pt',
     # ours (il/train.py): fl:hog2 taught by its own no-delay play (il/teacher.py), with pending
-    # cards; 1280 sides. Engine duels 2026-09-26: 17-3 vs live fl:hog2, 19-1 vs fl:hog2 with lead 9
-    'clapha:distill-1520': HERE.parent / 'runs/pc/distill-t0-1520.pt',
+    # cards and their arrival (il/flight.py) and both players' hero/champion states (extras v2).
+    # Engine duels 2026-09-27: 15-5 vs the previous one (distill-t0-1520: 17-3 vs live fl:hog2),
+    # 8-12 vs fl:hog2 playing with no delay at all
+    'clapha:v2': HERE.parent / 'runs/pc/distill-v2-final.pt',
 }
 
 
