@@ -53,6 +53,7 @@ class Command:
     entity_id: int | None = None             # the same unit in the live code's ids
     hand_slot: int | None = None             # the engine hand index it was queued from
     moment: int = 0                          # decision tick + the model's offset: the tap without delay
+    native_xy: tuple[int, int] | None = None  # a replayed play's exact point (tile centre otherwise)
 
 
 def _lead_arg(value: str):
@@ -65,7 +66,8 @@ def _overhead(rng: random.Random) -> int:
 
 
 def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id: str, record: bool = False,
-               extra_delay: dict | None = None, measured: dict | None = None) -> dict:
+               extra_delay: dict | None = None, measured: dict | None = None,
+               script: dict[int, list[dict]] | None = None) -> dict:
     """One battle to the end; returns the result and per-side counters.
 
     The engine is stepped to the next thing that happens: a decision turn (every 5 ticks), a tap
@@ -84,6 +86,18 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
     counters = {side: {'decided': 0, 'tapped': 0, 'executed': 0, 'dropped_elixir': 0, 'dropped_hand': 0,
                        'abilities': 0, 'abilities_dropped': 0} for side in (0, 1)}
     tick, ended, seq = 0, False, 0
+    # a replay opponent (script: side -> il.engine_convert.replay_commands card plays): the real
+    # player's plays go in at their recorded ticks, as the conversion queues them; they sit in the
+    # command list like anyone's, so the other side sees them pending and executed
+    for scripted_side, plays in (script or {}).items():
+        for play in plays:
+            seq += 1
+            issue = int(play['tick']) - COMMAND_AGE_TICKS
+            commands.append(Command(side=scripted_side, card_id=int(play['card_id']),
+                                    grid=(int(play['x']) // 1000, int(play['y']) // 1000), decided=issue, tap=issue,
+                                    execute=int(play['tick']), seq=seq, cost=S._card_cost(int(play['card_id'])) or 0.0,
+                                    moment=issue, native_xy=(int(play['x']), int(play['y']))))
+            counters[scripted_side]['tapped'] += 1
     extra_delay = extra_delay or {0: 0, 1: 0}   # ticks added to a live side's tap (a slower pipeline)
     # lead 'auto': as the console does, each side's delay is measured from its own plays (moment
     # -> issue, il.params.live_delay), told to an extended model, and sets the mask's elixir lead
@@ -175,7 +189,7 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
                 counters[command.side]['dropped_hand'] += 1
                 commands.remove(command)
                 continue
-            x, y = cell_to_world(command.grid)
+            x, y = command.native_xy or cell_to_world(command.grid)
             native.queue_hand_action_at(HandAction(command.side, slot, x, y), execute_tick=command.execute)
             command.injected = True
             command.hand_slot = int(slot)
@@ -229,6 +243,8 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
                 revealed[row['side']].append(row['card_id'])
         for side in (0, 1):
             runner = runners[side]
+            if runner is None:
+                continue        # a replay opponent: its plays are scripted
             # every play this side has decided and that has not executed is gone from its screen
             # hand, tapped or not: the console taps within the turn, and training counts a play as
             # sent from the turn after its decision (il/samples in_flight)
@@ -300,7 +316,8 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
         inject_due()
     final = native.observe()
     for runner in runners.values():
-        runner.end_battle()
+        if runner is not None:
+            runner.end_battle()
     result = {'winner': final.get('winner'), 'crowns': final.get('crownsRaw'), 'tick': final.get('tick'),
               'counters': counters}
     if record and recorded_frames:
@@ -388,11 +405,41 @@ def hog26_matchups(frames_dir: Path, count: int, seed: int):
     return out
 
 
+def replay_matchups(frames_dir: Path, count: int, seed: int):
+    """Real games with one Hog 2.6 side: (match config with both real decks and the deal, deck
+    forms, tag, the Hog side, the other side's recorded card plays). The Hog side is the model's;
+    the other is played back as the real player played it (a replay opponent: real decks and real
+    habits, not reactive -- it does what it did against the original Hog player)."""
+    from il.engine_convert import replay_commands
+    from il.frames import load_replay
+    from native_runner.royaleapi_replay import _episode_match_config
+    rng = random.Random(seed)
+    paths = sorted((frames_dir / 'frames').glob('*/*.jsonl.zst'))
+    rng.shuffle(paths)
+    out = []
+    for path in paths:
+        header, _frames = load_replay(path)
+        timeline = header['timeline']
+        sides = [i for i, deck in enumerate(timeline['decks']) if S.HOG26_CARDS <= set(deck)]
+        if len(sides) != 1:
+            continue
+        hog = sides[0]
+        replay = header['calibrated'].replay
+        plays = [c for c in replay_commands(replay) if c['owner'] == 1 - hog and c['kind'] == 'card']
+        forms = {side: list(timeline['form_availability'][side]) for side in (0, 1)}
+        out.append((_episode_match_config(replay.episode_config), forms, header['replay_tag'], hog, plays))
+        if len(out) >= count:
+            break
+    return out
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument('--a', default='fl:hog2')
     parser.add_argument('--a-delay', default='live', choices=('live', 'none'))
-    parser.add_argument('--b', default='fl:hog2')
+    parser.add_argument('--b', default='fl:hog2',
+                        help="a checkpoint, or replay: real games' opponents played back (a takes the Hog 2.6 side "
+                             "of each game, the real opponent's deck and deal; their recorded plays at their ticks)")
     parser.add_argument('--b-delay', default='none', choices=('live', 'none'))
     parser.add_argument('--a-lead', type=_lead_arg, default=0,
                         help="elixir_lead_ticks for a's mask (0 = FirstLight's), or auto: the console's rule "
@@ -414,13 +461,19 @@ def main(argv: list[str]) -> int:
     from il.engine_convert import connect
     native = connect(args.port)
     native.wait_ready(timeout=60.0)
-    models = {'a': FLB.FirstLightRunner(args.a), 'b': FLB.FirstLightRunner(args.b) if args.b != args.a
-              else FLB.FirstLightRunner(args.b)}
+    replay = args.b == 'replay'
+    models = {'a': FLB.FirstLightRunner(args.a),
+              'b': None if replay else FLB.FirstLightRunner(args.b)}
     rng = random.Random(args.seed)
     wins = {'a': 0, 'b': 0, 'draw': 0}
     overheads = {'a': [], 'b': []}          # each model's measured delays (lead auto), across matches
-    for index, (config, forms, tag) in enumerate(hog26_matchups(args.frames, args.matches, args.seed)):
-        a_side = index % 2          # sides swapped every match
+    if replay:
+        matchups = [(config, forms, tag, hog, plays)
+                    for config, forms, tag, hog, plays in replay_matchups(args.frames, args.matches, args.seed)]
+    else:
+        matchups = [(config, forms, tag, index % 2, None)          # sides swapped every match
+                    for index, (config, forms, tag) in enumerate(hog26_matchups(args.frames, args.matches, args.seed))]
+    for index, (config, forms, tag, a_side, script_plays) in enumerate(matchups):
         runners = {a_side: models['a'], 1 - a_side: models['b']}
         delays = {a_side: args.a_delay, 1 - a_side: args.b_delay}
         leads = {a_side: args.a_lead, 1 - a_side: args.b_lead}
@@ -429,12 +482,14 @@ def main(argv: list[str]) -> int:
             result = play_match(native, runners, delays, leads, config, forms, rng, f'{tag[:8]}-{index}',
                                 record=args.record is not None,
                                 extra_delay={a_side: args.a_extra_delay, 1 - a_side: args.b_extra_delay},
-                                measured={a_side: overheads['a'], 1 - a_side: overheads['b']})
+                                measured={a_side: overheads['a'], 1 - a_side: overheads['b']},
+                                script={1 - a_side: script_plays} if script_plays is not None else None)
         except Exception as error:  # noqa: BLE001  (one broken match must not end the set)
             print(f'match {index + 1} failed: {type(error).__name__}: {error}', flush=True)
             for runner in runners.values():
                 try:
-                    runner.end_battle()
+                    if runner is not None:
+                        runner.end_battle()
                 except Exception:  # noqa: BLE001
                     pass
             continue

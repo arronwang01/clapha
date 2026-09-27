@@ -112,7 +112,8 @@ class UnitsViaFile:
 
 class ReplaySequences(UnitsViaFile):
     """torch Dataset: one ILSequenceV4 per (replay, actor), made by the live code; with the
-    teacher's labels on the same turns (il/teacher.py) when `teacher` is the frames directory."""
+    teacher's labels on the same turns (il/teacher.py) when `teacher` is set: each side's are in its
+    own folder's teacher/ (frames/<xx>/<tag>.jsonl.zst -> <folder>/teacher/<xx>/<tag>-<actor>.npz)."""
 
     def __init__(self, units, max_turns: int | None = None, extras: bool = False, teacher: Path | None = None,
                  delay_range: tuple[int, int] | None = None):
@@ -145,7 +146,7 @@ class ReplaySequences(UnitsViaFile):
                 sequence, ticks = actor_sequence(header, frames, actor, stats, delay=delay, extras=self.extras,
                                                  with_ticks=True)
                 if sequence is not None:
-                    teacher = load_labels(label_path(self.teacher, path, actor))
+                    teacher = load_labels(label_path(Path(path).parents[2], path, actor))
                     labels = student_labels(sequence, ticks, teacher, delay, stats)
         except Exception as error:  # noqa: BLE001  (one bad replay must not stop training)
             return {'error': f'{Path(path).name} actor {actor}: {type(error).__name__}: {error}'[:300]}
@@ -330,7 +331,9 @@ def _add_teacher_metrics(totals: Counter, counts: Counter, taught: dict) -> None
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument('--frames', type=Path, default=CLAPHA / 'runs/conv-hog26')
+    parser.add_argument('--frames', nargs='+', default=[str(CLAPHA / 'runs/conv-hog26')],
+                        help='conversion / recording folders; DIR:N repeats a folder\'s training sides N times '
+                             '(a correction round\'s few recorded games next to thousands of replays)')
     parser.add_argument('--init', default='fl:hog2')
     parser.add_argument('--out', type=Path, default=CLAPHA / 'runs/train-hog26')
     parser.add_argument('--epochs', type=int, default=1)
@@ -383,21 +386,28 @@ def main(argv: list[str]) -> int:
     args.out.mkdir(parents=True, exist_ok=True)
     log = (args.out / 'train-metrics.jsonl').open('a')
 
-    units = select_units(args.frames)
-    if args.teacher:
-        import os
-        from il.teacher import label_path
-        # one listing per directory, not one existence check per side: on the 4080 PC every file
-        # check goes through the security suite's filter and 10,535 of them took ~25 minutes
-        present = set()
-        root = args.frames / 'teacher'
-        for sub in (os.scandir(root) if root.exists() else ()):
-            if sub.is_dir():
-                present.update(entry.name for entry in os.scandir(sub.path))
-        labelled = [u for u in units if label_path(args.frames, u[0], u[1]).name in present]
-        print(f'teacher labels for {len(labelled)} of {len(units)} sides', flush=True)
-        units = labelled
-    teacher_dir = args.frames if args.teacher else None
+    units, repeats = [], {}
+    for value in args.frames:
+        folder, _sep, count = value.rpartition(':') if value.rpartition(':')[2].isdigit() else (value, '', '1')
+        frames_dir = Path(folder)
+        found = select_units(frames_dir)
+        if args.teacher:
+            import os
+            from il.teacher import label_path
+            # one listing per directory, not one existence check per side: on the 4080 PC every file
+            # check goes through the security suite's filter and 10,535 of them took ~25 minutes
+            present = set()
+            root = frames_dir / 'teacher'
+            for sub in (os.scandir(root) if root.exists() else ()):
+                if sub.is_dir():
+                    present.update(entry.name for entry in os.scandir(sub.path))
+            labelled = [u for u in found if label_path(frames_dir, u[0], u[1]).name in present]
+            print(f'{frames_dir.name}: teacher labels for {len(labelled)} of {len(found)} sides', flush=True)
+            found = labelled
+        units += found
+        repeats.update({unit: int(count) for unit in found})
+    # a side's labels are in its own folder's teacher/ (the folder two levels above its file)
+    teacher_dir = True if args.teacher else None
     train_units = [u for u in units if not held_out(u[0])]
     val_units = [u for u in units if held_out(u[0])]
     if args.smoke:
@@ -443,7 +453,7 @@ def main(argv: list[str]) -> int:
 
     update, started = 0, time.time()
     for epoch in range(args.epochs):
-        order = list(train_units)
+        order = [unit for unit in train_units for _copy in range(repeats.get(unit, 1))]
         random.Random(args.seed + epoch).shuffle(order)
         if epoch == 0 and args.skip_sides:
             order = order[args.skip_sides:]
