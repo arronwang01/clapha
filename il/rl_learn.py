@@ -367,6 +367,16 @@ def main(argv: list[str]) -> int:
                 break
             except torch.OutOfMemoryError:
                 pass
+            except Exception:
+                # not memory: set these lanes aside before ending, or every restart picks the same
+                # lanes and fails the same way (pilot2: 27 restarts on one mixed batch)
+                aside = args.games / 'failed'
+                aside.mkdir(exist_ok=True)
+                for path in picked:
+                    if path.exists():
+                        path.replace(aside / path.name)
+                print(f'update {update_index + 1} failed: its {len(picked)} lanes moved to {aside}', flush=True)
+                raise
             # the shared GPU filled up (the other user's job grew): let go of everything, wait, try again
             # (outside the except block, so the traceback no longer holds the update's tensors)
             optimizer.zero_grad(set_to_none=True)

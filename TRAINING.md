@@ -241,6 +241,17 @@ Per run folder `runs/rl/<run>/` on the PC:
   learner's checkpoints say extras, `_recipe` also reads extras_version, the learner skips lanes
   played without extras. pilot2 is abandoned (its value head saw blind lanes); **pilot3** starts
   from v2 with this and the one-step-per-update learner (start-training.cmd default).
+  Also: the inference server now tells each collector whether the served model has the extras head,
+  and the collector follows the model, not the recipe (this class of bug cannot recur silently); a
+  learner update that fails for a reason other than memory moves its lanes to games/failed before
+  ending, so a restart cannot loop on the same lanes. Checked in the same pass, no problem found:
+  plays land TARGET_DELAY 26 after their moment for every live side (learner, self, snapshots, v2);
+  both sides decide on every 5-tick turn from tick 90, so the rewards' decision ticks line up with
+  the recorded snapshots; the learner's fused evaluation goes through the extras head; the anchor
+  checkpoint (runs/distill-v2/checkpoint-00024489.pt) carries extras=.
+  Expected in pilot3: vs v2 near 50% through the 16 value-only updates (the learner *is* v2 then);
+  after that, grad agree above 0 before any rise; King activations down first (the easiest term).
+
 
 - **2026-09-29** **Why pilot1 got worse: steps, not reward.** The learner/collector agreement holds
   on the PC (clip fraction ~0.0002 in value-only updates). The first policy update alone moved the

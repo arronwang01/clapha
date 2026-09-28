@@ -331,7 +331,8 @@ class Server:
             model.sessions += 1
             module = model.module
             connection.send(('ok', model.version, (float(module.ppo_gate_temperature), float(module.ppo_action_temperature),
-                                                   float(module.ppo_continue_temperature))))
+                                                   float(module.ppo_continue_temperature)),
+                             '_extras_head' in module.__dict__))
         elif kind == 'decide':
             _, sid, payload = message
             pending.append({'sid': sid, 'connection': connection, 'payload': payload})
@@ -428,11 +429,12 @@ class Client:
             raise RuntimeError(f'inference server: {reply[1]}')
         return reply[1:]
 
-    def open(self, key: str) -> tuple[str, int, tuple]:
-        """-> session id, the weights' update number, the sampling temperatures (for the lane)."""
+    def open(self, key: str) -> tuple[str, int, tuple, bool | None]:
+        """-> session id, the weights' update number, the sampling temperatures (for the lane), whether
+        the served model has the extras head (None from an older server)."""
         sid = f'{os.getpid()}-{id(self)}-{next(self._ids)}'
-        version, temperatures = self._call(('open', sid, key))
-        return sid, int(version), tuple(temperatures)
+        version, temperatures, *rest = self._call(('open', sid, key))
+        return sid, int(version), tuple(temperatures), (bool(rest[0]) if rest else None)
 
     def decide(self, sid: str, payload: tuple) -> tuple:
         """payload: _wire()'s second part."""
@@ -456,7 +458,7 @@ class RemoteSession:
         self.tensorizer = tensorizer
         self.client, self.key = client, key
         self.next_extras = None
-        self.sid, self.version, self.temperatures = client.open(key)
+        self.sid, self.version, self.temperatures, self.model_has_extras = client.open(key)
         self.steps: list[dict] = []
 
     def end_episode(self) -> None:
@@ -542,6 +544,14 @@ def remote_runner(client: Client, key: str, checkpoint: str | None = None):
                 self.model = model
             self.session = RemoteSession(self.session.tensorizer, client, key)
             self.version, self.temperatures = self.session.version, self.session.temperatures
+            served = self.session.model_has_extras
+            if served is not None and served != self.has_extras:
+                # the served weights decide: a model with the head gets its extras inputs (pilot1's
+                # learner played without them because its checkpoints' recipe did not say so)
+                print(f'{key}: the served model {"has" if served else "has no"} extras head, the recipe said '
+                      f'{self.has_extras}: following the model', flush=True)
+                self.has_extras = served
+                self.model = types.SimpleNamespace(**({'_extras_head': True} if served else {}))
             self.last_steps = []
 
         def end_battle(self) -> None:
