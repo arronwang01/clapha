@@ -78,12 +78,18 @@ def report(run: Path, every: int) -> str:
             f"{100 * habits.get('Ice Golem: building-targeters only', 0) / max(1, golems):.0f}% of {golems} |")
     if updates:
         out.append('')
-        out.append('| update | value only | lanes | s | mean return | policy loss | value loss | entropy | KL to start | clip frac |')
-        out.append('|' + '---|' * 10)
+        out.append('| update | value only | lanes | s | mean return | policy loss | value loss | entropy | KL to start | clip frac | steps | grad agree |')
+        out.append('|' + '---|' * 12)
         for row in updates[-12:]:
             out.append(f"| {row['update']} | {row['value_only']} | {row['lanes']} | {row['seconds']} | "
                        f"{row['mean_return']:+.3f} | {row['policy_loss']:+.4f} | {row['value_loss']:.4f} | "
-                       f"{row['entropy']:.3f} | {row['kl_ref']:.4f} | {row['clip_fraction']:.3f} |")
+                       f"{row['entropy']:.3f} | {row['kl_ref']:.4f} | {row['clip_fraction']:.3f} | "
+                       f"{row.get('optimizer_steps', '-')} | "
+                       f"{'-' if row.get('grad_cos') is None else format(row['grad_cos'], '+.3f')} |")
+    if any(row.get('grad_cos') is not None for row in updates):
+        out.append('')
+        out.append('grad agree: cosine between the gradients of the two halves of an update\'s games. Near 0: the '
+                   'update is noise; clearly above 0: the games agree on a direction.')
     return '\n'.join(out)
 
 

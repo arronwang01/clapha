@@ -4,8 +4,8 @@ FirstLight's update rule -- clipped probability ratio, clipped value error, entr
 (native_runner.training.v4.learning) -- applied to our model (the extended policy: pending cards,
 arrival, exact elixir, hero states) on games played through our live path, with our reward (il/rl.py).
 Each lane is one side of one game, evaluated from its first decision in recurrent chunks through
-il/fused.py at the temperatures it was sampled with; the optimizer steps after every chunk, as the
-imitation trainer does.
+il/fused.py at the temperatures it was sampled with; one optimizer step per update's lanes (see
+update()).
 
   value warm-up  the first --value-warmup updates move only the value estimate: FirstLight's value
                  head learned its own shaped reward, and advantages are only as good as it is
@@ -71,8 +71,21 @@ def _padded(rows: list, name: str, steps: int):
     return out
 
 
+def _flat_grad(parameters):
+    import torch
+    return torch.cat([(p.grad if p.grad is not None else torch.zeros_like(p)).reshape(-1).float() for p in parameters])
+
+
 def update(policy, reference, optimizer, parameters, sequences, extras, args, device, value_only: bool) -> dict:
-    """One pass of PPO over these lanes (minibatches of whole lanes, chunked in time)."""
+    """One pass of PPO over these lanes (minibatches of whole lanes, chunked in time).
+
+    Policy updates take one optimizer step per --step-lanes lanes (0: all of this update's lanes),
+    the gradient averaged over every decision in them: pilot1 stepped after every 32-decision chunk
+    of 2 lanes (~600 Adam steps per 16 games), and with a signal that weak each step was mostly noise
+    that Adam still turned into a full-size move -- the model random-walked away from v2 (46% -> 32%).
+    Value-only updates step per minibatch (a supervised target, many small steps are fine).
+    grad_cos: cosine between the gradients of the first and second half of the step's lanes -- about
+    0 means the step is noise, clearly above 0 means the games agree on a direction."""
     import torch
     from il.fused import evaluate_forced, fused_context
     from il.train import batch_sequences
@@ -81,82 +94,97 @@ def update(policy, reference, optimizer, parameters, sequences, extras, args, de
     if len(temperatures) != 1:
         raise ValueError(f'lanes sampled at different temperatures: {temperatures}')
     gate_t, action_t, continue_t = temperatures.pop()
+    # advantages normalized over the whole update (was: per 2-lane minibatch, which forced every
+    # pair of games to half-good, half-bad whatever happened in them)
+    every = torch.cat([row['advantage'] for row in extras])
+    adv_mean, adv_std = float(every.mean()), float(every.std())
     order = list(range(len(sequences)))
+    step_lanes = args.minibatch if value_only else (args.step_lanes or len(order))
     stats = {'policy_loss': 0.0, 'value_loss': 0.0, 'entropy': 0.0, 'kl_ref': 0.0, 'clip_fraction': 0.0,
              'approx_kl': 0.0, 'chunks': 0}
+    cosines, norms = [], []
     for _epoch in range(args.epochs):
         random.shuffle(order)
-        for first in range(0, len(order), args.minibatch):
-            picked = order[first:first + args.minibatch]
-            batch = batch_sequences([sequences[i] for i in picked])
-            rows = [extras[i] for i in picked]
-            steps = batch.time_steps
-            old_log_prob = _padded(rows, 'old_log_prob', steps)
-            old_value = _padded(rows, 'old_value', steps)
-            advantage = _padded(rows, 'advantage', steps)
-            valid = batch.valid_mask.float()
-            mean = (advantage * valid).sum() / valid.sum()
-            spread = (((advantage - mean) ** 2) * valid).sum() / valid.sum()
-            advantage = (advantage - mean) / (spread.sqrt() + 1e-8)
-            state = policy.initial_state(batch.batch_size, device=device)
-            reference_state = reference.initial_state(batch.batch_size, device=device)
+        for group_first in range(0, len(order), step_lanes):
+            group = order[group_first:group_first + step_lanes]
+            decisions = float(sum(len(extras[i]['advantage']) for i in group))
+            # the half-way point for grad_cos, on a minibatch boundary
+            split = (len(group) // 2 // args.minibatch) * args.minibatch if len(group) >= 2 * args.minibatch else 0
+            first_half = None
             optimizer.zero_grad(set_to_none=True)
-            pending = 0
-            for start in range(0, steps, args.time_steps):
-                stop = min(steps, start + args.time_steps)
-                chunk = slice_il_sequence(batch, start, stop).to(device)
-                mask = chunk.valid_mask.float()
-                count = mask.sum().clamp_min(1.0)
-                with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == 'cuda'):
-                    context = fused_context(policy, chunk.observations, chunk.episode_start, initial_state=state)
-                    evaluation = evaluate_forced(policy, context, chunk.actions, gate_temperature=gate_t,
-                                                 action_temperature=action_t, continue_temperature=continue_t)
+            for first in range(0, len(group), args.minibatch):
+                picked = group[first:first + args.minibatch]
+                batch = batch_sequences([sequences[i] for i in picked])
+                rows = [extras[i] for i in picked]
+                steps = batch.time_steps
+                old_log_prob = _padded(rows, 'old_log_prob', steps)
+                old_value = _padded(rows, 'old_value', steps)
+                advantage = (_padded(rows, 'advantage', steps) - adv_mean) / (adv_std + 1e-8)
+                state = policy.initial_state(batch.batch_size, device=device)
+                reference_state = reference.initial_state(batch.batch_size, device=device)
+                for start in range(0, steps, args.time_steps):
+                    stop = min(steps, start + args.time_steps)
+                    chunk = slice_il_sequence(batch, start, stop).to(device)
+                    mask = chunk.valid_mask.float()
+                    count = mask.sum().clamp_min(1.0)
+                    with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == 'cuda'):
+                        context = fused_context(policy, chunk.observations, chunk.episode_start, initial_state=state)
+                        evaluation = evaluate_forced(policy, context, chunk.actions, gate_temperature=gate_t,
+                                                     action_temperature=action_t, continue_temperature=continue_t)
+                        with torch.no_grad():
+                            reference_context = fused_context(reference, chunk.observations, chunk.episode_start,
+                                                              initial_state=reference_state)
+                            reference_eval = evaluate_forced(reference, reference_context, chunk.actions,
+                                                             gate_temperature=gate_t, action_temperature=action_t,
+                                                             continue_temperature=continue_t)
+                    log_prob = evaluation.log_prob.float()
+                    value = evaluation.value.float()
+                    returns = chunk.returns.float()
+                    old_lp = old_log_prob[start:stop].to(device)
+                    old_v = old_value[start:stop].to(device)
+                    adv = advantage[start:stop].to(device)
+                    ratio = torch.exp(log_prob - old_lp)
+                    clipped = torch.clamp(ratio, 1.0 - args.clip, 1.0 + args.clip)
+                    policy_loss = -(torch.minimum(ratio * adv, clipped * adv) * mask).sum() / count
+                    value_clipped = old_v + torch.clamp(value - old_v, -args.value_clip, args.value_clip)
+                    value_loss = (torch.maximum((value - returns) ** 2, (value_clipped - returns) ** 2) * mask).sum() / count
+                    entropy = (evaluation.entropy.float() * mask).sum() / count
+                    # 0.5 x (log ref - log policy)^2: pilot1's exp estimator blew up (550 at update 80) once
+                    # the policy had moved away from the start
+                    log_ratio_ref = reference_eval.log_prob.float() - log_prob
+                    kl_ref = (0.5 * log_ratio_ref ** 2 * mask).sum() / count
+                    if value_only:
+                        loss = args.value_coef * value_loss
+                    else:
+                        loss = policy_loss + args.value_coef * value_loss - args.entropy_coef * entropy + args.kl_coef * kl_ref
+                    # each chunk's share of the step: its decisions over all the step's decisions
+                    (loss * (float(mask.sum()) / decisions)).backward()
+                    state = evaluation.final_state.detach()
+                    reference_state = reference_eval.final_state.detach()
                     with torch.no_grad():
-                        reference_context = fused_context(reference, chunk.observations, chunk.episode_start,
-                                                          initial_state=reference_state)
-                        reference_eval = evaluate_forced(reference, reference_context, chunk.actions,
-                                                         gate_temperature=gate_t, action_temperature=action_t,
-                                                         continue_temperature=continue_t)
-                log_prob = evaluation.log_prob.float()
-                value = evaluation.value.float()
-                returns = chunk.returns.float()
-                old_lp = old_log_prob[start:stop].to(device)
-                old_v = old_value[start:stop].to(device)
-                adv = advantage[start:stop].to(device)
-                ratio = torch.exp(log_prob - old_lp)
-                clipped = torch.clamp(ratio, 1.0 - args.clip, 1.0 + args.clip)
-                policy_loss = -(torch.minimum(ratio * adv, clipped * adv) * mask).sum() / count
-                value_clipped = old_v + torch.clamp(value - old_v, -args.value_clip, args.value_clip)
-                value_loss = (torch.maximum((value - returns) ** 2, (value_clipped - returns) ** 2) * mask).sum() / count
-                entropy = (evaluation.entropy.float() * mask).sum() / count
-                # 0.5 x (log ref - log policy)^2: pilot1's exp estimator blew up (550 at update 80) once
-                # the policy had moved away from the start
-                log_ratio_ref = reference_eval.log_prob.float() - log_prob
-                kl_ref = (0.5 * log_ratio_ref ** 2 * mask).sum() / count
-                if value_only:
-                    loss = args.value_coef * value_loss
-                else:
-                    loss = policy_loss + args.value_coef * value_loss - args.entropy_coef * entropy + args.kl_coef * kl_ref
-                # one step per --accumulate chunks: 2 lanes x 32 decisions alone made steps too noisy (pilot1)
-                (loss / args.accumulate).backward()
-                pending += 1
-                if pending == args.accumulate or stop >= steps:
-                    torch.nn.utils.clip_grad_norm_(parameters, args.max_grad_norm)
-                    optimizer.step()
-                    optimizer.zero_grad(set_to_none=True)
-                    pending = 0
-                state = evaluation.final_state.detach()
-                reference_state = reference_eval.final_state.detach()
+                        stats['policy_loss'] += float(policy_loss)
+                        stats['value_loss'] += float(value_loss)
+                        stats['entropy'] += float(entropy)
+                        stats['kl_ref'] += float(kl_ref)
+                        stats['clip_fraction'] += float((((ratio - 1.0).abs() > args.clip).float() * mask).sum() / count)
+                        stats['approx_kl'] += float((((ratio - 1.0) - torch.log(ratio)) * mask).sum() / count)
+                        stats['chunks'] += 1
+                if split and first + len(picked) == split:
+                    first_half = _flat_grad(parameters)
+            if first_half is not None:
                 with torch.no_grad():
-                    stats['policy_loss'] += float(policy_loss)
-                    stats['value_loss'] += float(value_loss)
-                    stats['entropy'] += float(entropy)
-                    stats['kl_ref'] += float(kl_ref)
-                    stats['clip_fraction'] += float((((ratio - 1.0).abs() > args.clip).float() * mask).sum() / count)
-                    stats['approx_kl'] += float((((ratio - 1.0) - torch.log(ratio)) * mask).sum() / count)
-                    stats['chunks'] += 1
+                    second_half = _flat_grad(parameters) - first_half
+                    cosines.append(float(torch.nn.functional.cosine_similarity(first_half, second_half, dim=0)))
+                del first_half
+            norms.append(float(torch.nn.utils.clip_grad_norm_(parameters, args.max_grad_norm)))
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
     chunks = max(1, stats.pop('chunks'))
-    return {name: round(total / chunks, 5) for name, total in stats.items()}
+    out = {name: round(total / chunks, 5) for name, total in stats.items()}
+    out['optimizer_steps'] = len(norms)
+    out['grad_norm'] = round(sum(norms) / max(1, len(norms)), 5)
+    out['grad_cos'] = round(sum(cosines) / len(cosines), 5) if cosines else None
+    return out
 
 
 def _version(path: Path) -> int:
@@ -183,6 +211,34 @@ def save_policy(path: Path, policy, head, update_index: int, args) -> None:
     raise RuntimeError(f'could not replace {path}')
 
 
+def _save_optimizer(out: Path, mode: str, update_index: int, optimizer) -> None:
+    import torch
+    temporary = out / 'optimizer.part'
+    torch.save({'mode': mode, 'update': update_index, 'state': optimizer.state_dict()}, temporary)
+    for attempt in range(40):
+        try:
+            temporary.replace(out / 'optimizer.pt')
+            return
+        except PermissionError:
+            time.sleep(0.25)
+
+
+def _load_optimizer(out: Path, mode: str, update_index: int, device):
+    """The saved optimizer state when it belongs to these weights (same update, same parameters)."""
+    import torch
+    path = out / 'optimizer.pt'
+    if not path.is_file():
+        return None
+    try:
+        saved = torch.load(path, map_location=device, weights_only=False)
+    except Exception as error:  # noqa: BLE001  (a half-written file: start fresh)
+        print(f'optimizer state unreadable, fresh: {type(error).__name__}: {error}', flush=True)
+        return None
+    if saved.get('mode') != mode or saved.get('update') != update_index:
+        return None
+    return saved['state']
+
+
 def main(argv: list[str]) -> int:
     import torch
     parser = argparse.ArgumentParser()
@@ -201,8 +257,11 @@ def main(argv: list[str]) -> int:
     parser.add_argument('--epochs', type=int, default=1)
     parser.add_argument('--minibatch', type=int, default=2, help='lanes per minibatch')
     parser.add_argument('--time-steps', type=int, default=32)
-    parser.add_argument('--learning-rate', type=float, default=3e-6)
-    parser.add_argument('--accumulate', type=int, default=4, help='time chunks per optimizer step')
+    # one step per update (--step-lanes 0) moves far less per game than pilot1's step per chunk: a
+    # larger rate per step
+    parser.add_argument('--learning-rate', type=float, default=1e-5)
+    parser.add_argument('--step-lanes', type=int, default=0,
+                        help='policy updates: lanes per optimizer step (0: one step over all the update\'s lanes)')
     parser.add_argument('--gamma', type=float, default=0.999)
     parser.add_argument('--gae-lambda', type=float, default=0.95)
     parser.add_argument('--clip', type=float, default=0.2)
@@ -281,6 +340,14 @@ def main(argv: list[str]) -> int:
             optimizing = 'value' if value_only else 'all'
             optimizer = (torch.optim.AdamW(value_parameters, lr=args.learning_rate * 10) if value_only
                          else torch.optim.AdamW(everything, lr=args.learning_rate))
+            # the run restarts with the other job's cycle (every few updates): a fresh Adam's first
+            # steps are full-size moves on every weight, so its moments carry over
+            saved = _load_optimizer(args.out, optimizing, update_index, device)
+            if saved is not None:
+                optimizer.load_state_dict(saved)
+                for group in optimizer.param_groups:
+                    group['lr'] = args.learning_rate * 10 if value_only else args.learning_rate
+                print(f'optimizer state restored ({optimizing}, update {update_index})', flush=True)
         parameters = value_parameters if value_only else everything
         stats = None
         for attempt in range(6):
@@ -316,6 +383,7 @@ def main(argv: list[str]) -> int:
             # the league's snapshots (il/rl.py --snapshot-every) and the run's history; ~50 MB each
             save_policy(args.out / f'policy-{update_index:04d}.pt', policy, head, update_index, args)
         save_policy(args.out / 'latest.pt', policy, head, update_index, args)
+        _save_optimizer(args.out, optimizing, update_index, optimizer)
         if device.type == 'cuda':
             torch.cuda.empty_cache()
         if args.once:

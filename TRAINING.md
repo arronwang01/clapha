@@ -144,14 +144,24 @@ used): one server.
 
 ### Learning (il/rl_learn.py)
 PPO: clipped ratio 0.2, clipped value 0.2, entropy 0.001, GAE (gamma 0.999 per decision, lambda
-0.95), AdamW, grad-norm 1.0. pilot2's settings (pilot1's, which got worse, in brackets):
-- lr 3e-6 [1e-5];
-- one optimizer step per 4 time chunks [every chunk];
-- the first 16 updates train the value only [4]: FirstLight's value head learned their shaped
-  reward, not ours;
-- anchor to the starting model 0.3 x 0.5 (log ratio)^2 [0.1 x the exp estimator, which blew up]. 32 lanes per update, 2 per minibatch (was 64 and 8: too big next to
-the other job); lanes older than 2 updates are dropped. The
-collectors reload the latest weights after every update. Resumable (latest.pt).
+0.95), AdamW, grad-norm 1.0, anchor to the starting model 0.3 x 0.5 (log ratio)^2. Since
+2026-09-29 (pilot1's settings in brackets):
+- **one optimizer step per update** (32 lanes, ~38,000 decisions), the gradient averaged over every
+  decision [a step per 32-decision chunk of 2 lanes: ~600 steps per 16 games]; lr 1e-5 per step;
+- advantages normalized over the whole update [per 2-lane minibatch];
+- Adam's state kept across restarts (optimizer.pt) [a fresh Adam at every restart, every ~4 updates];
+- the first 16 updates train the value only, a step per 2 lanes [4]: FirstLight's value head
+  learned their shaped reward, not ours;
+- **grad agree** (learn.jsonl `grad_cos`, status.txt): cosine between the gradients of the two
+  halves of an update's games. It is the signal-to-noise check: about 0 = the update is noise, and
+  more games per step are needed before more steps can help; clearly > 0 = the games agree.
+32 lanes per update, 2 per minibatch (memory, next to the other job); lanes older than 2 updates are
+dropped. The collectors reload the latest weights after every update. Resumable (latest.pt,
+optimizer.pt).
+
+Checked on the PC (value-only updates, where the policy is exactly the one that played): clip
+fraction 0.0001-0.0004, approx KL 9e-5 -- the learner (bf16, train mode) and the collectors
+(fp32) agree; the mismatch is not why pilot1 got worse.
 
 ### Reward (per decision of the trained side; the user's, 2026-09-26)
 - terminal: win +1, loss -1, draw 0
@@ -218,6 +228,17 @@ Per run folder `runs/rl/<run>/` on the PC:
   card use, placements.
 
 ## 5. Journal
+
+- **2026-09-29** **Why pilot1 got worse: steps, not reward.** The learner/collector agreement holds
+  on the PC (clip fraction ~0.0002 in value-only updates). The first policy update alone moved the
+  policy to 6.5% clipped / KL 0.02: pilot1 took ~600 Adam steps per 16 games, each on 2 lanes x 32
+  decisions. With one +-1 result spread over ~1,200 decisions, such a step is almost pure noise, and
+  Adam turns noise into full-size moves; the model random-walked away from v2 (entropy up, every
+  fixed score down) while the reward's easy terms (King activations) still moved the intended way --
+  so the reward reached the model, the steps drowned it. Fix: one step per update over all its
+  games, advantages normalized over the update, Adam kept across restarts, and grad agree logged to
+  measure whether an update's games carry a direction at all. pilot2 at that point: 88 games, 2
+  updates, 27 restarts in 6.7 h (the learner ending; learn.err to read).
 
 - **2026-09-28** **pilot1 got worse than its start.** 88 updates, 2,131 games. Learner vs v2: 46%
   in updates 0-9, then 32% +-5 (97-206) from update 10 on. vs hog2 35% -> ~16%; vs General
