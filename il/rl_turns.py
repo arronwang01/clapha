@@ -21,6 +21,12 @@ for --stall minutes: stop the run, ask every engine port for its status, restart
 answer, e.g. after a reboot -- and start again on the engines that answer. At most one restart per
 --restart-gap minutes.
 
+Guard. pilot1 got worse than its start for a day before anyone looked. Now, once the policy moves
+(after --guard-after updates, the value warm-up), the learner's last --guard-games games against
+the fixed v2 are checked every 10 minutes: a score under --guard-below (42% of 150 is ~2 standard
+errors under 50%) stops the run and writes runs/rl/<run>/HALT with the reason. Nothing restarts
+while HALT exists; delete it to go on.
+
 Disk. Under 30 GB free: recordings beyond the newest 200 and policy files other than every 50th
 and the league's latest snapshots are deleted; under 8 GB the run stops until there is room.
 
@@ -192,6 +198,30 @@ def thin(run_dir: Path, say, snapshot_every: int = 10, snapshots: int = 5) -> No
         say(f'disk: freed {freed / 2 ** 30:.1f} GB (old recordings, policy files)')
 
 
+def _score(games: list[dict]) -> str:
+    if not games:
+        return '-'
+    wins = sum(1 for g in games if g['learner_won'])
+    rate = wins / len(games)
+    return f'{100 * rate:.0f}% +-{196 * math.sqrt(rate * (1 - rate) / len(games)):.0f} ({wins}-{len(games) - wins})'
+
+
+def _decided(run_dir: Path, league: str, after: int = 0) -> list[dict]:
+    from il.rl_report import _rows
+    return [g for g in _rows(run_dir / 'games' / 'games.jsonl') if g.get('league') == league
+            and g.get('learner_won') is not None and int(g.get('learner_version', 0)) >= after]
+
+
+def guard(run_dir: Path, after: int, games: int, below: float) -> str | None:
+    """The reason to stop, when the moving policy is clearly worse than the fixed start."""
+    recent = _decided(run_dir, 'anchor', after)[-games:]
+    if len(recent) < games:
+        return None
+    rate = sum(1 for g in recent if g['learner_won']) / len(recent)
+    return (f'worse than the start: {100 * rate:.0f}% over its last {len(recent)} games against v2'
+            if rate < below else None)
+
+
 def write_status(run_dir: Path, now_line: str, restarts: list[str]) -> None:
     from il.rl_report import _rows, report
     games = _rows(run_dir / 'games' / 'games.jsonl')
@@ -209,7 +239,14 @@ def write_status(run_dir: Path, now_line: str, restarts: list[str]) -> None:
             f'games: {len(games)} ({len(hour)} in the last hour); updates: {len(updates)}',
             f'restarts: {len(restarts)}' + (f' (last: {restarts[-1]})' if restarts else ''),
             f'disk: {free_gb(run_dir):.0f} GB free',
+            *([f'HALTED: {(run_dir / "HALT").read_text().strip()} (delete HALT to go on)']
+              if (run_dir / 'HALT').is_file() else []),
             '',
+            'Running scores, the first 300 games against each fixed opponent and the latest 300:']
+    for league, name in (('anchor', 'v2 (the start)'), ('hog2', 'hog2 no-delay'), ('general', 'General, real decks')):
+        decided = _decided(run_dir, league)
+        text.append(f'  vs {name}: first {_score(decided[:300])}  latest {_score(decided[-300:])}')
+    text += ['',
             'Read the tables: "vs v2 (anchor)" is the running score against the starting model -- above',
             '50% and rising means the games are making it better; hog2 and General are the fixed',
             'benchmarks. dealt / taken: princess towers per game. King activ.: games where its own',
@@ -249,6 +286,9 @@ def main(argv: list[str]) -> int:
     parser.add_argument('--every', type=int, default=60, help='seconds between readings')
     parser.add_argument('--stall', type=int, default=20, help='minutes without a game or an update = stuck')
     parser.add_argument('--restart-gap', type=int, default=10, help='minutes between restarts, at least')
+    parser.add_argument('--guard-after', type=int, default=16, help='weights versions before this are not judged')
+    parser.add_argument('--guard-games', type=int, default=150)
+    parser.add_argument('--guard-below', type=float, default=0.42)
     args = parser.parse_args(argv)
     run_dir = CLAPHA / 'runs' / 'rl' / args.run
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -314,8 +354,16 @@ def main(argv: list[str]) -> int:
                 thin(run_dir, say)
                 disk = free_gb(run_dir)
             full = disk < 8
-            if running and (busy or full):
-                why = 'others took the GPU' if busy else f'disk nearly full ({disk:.1f} GB free)'
+            halt = run_dir / 'HALT'
+            if not halt.is_file() and time.time() >= next_status:
+                reason = guard(run_dir, args.guard_after, args.guard_games, args.guard_below)
+                if reason:
+                    halt.write_text(reason + '\n')
+                    say(f'HALT: {reason}')
+            held = halt.is_file()
+            if running and (busy or full or held):
+                why = ('others took the GPU' if busy else f'disk nearly full ({disk:.1f} GB free)' if full
+                       else 'halted (see HALT)')
                 say(f'{why}: stopping -> {_oneline(launcher("-Stop"), 1)}')
             elif running:
                 if _progress(run_dir) != progress:
@@ -329,7 +377,7 @@ def main(argv: list[str]) -> int:
                     say(f'{why}: restarting the run -> {_oneline(launcher("-Stop"), 1)}')
                     last_restart = time.time()
                     start()
-            elif calm >= args.calm and not full:
+            elif calm >= args.calm and not full and not held:
                 if mine:
                     launcher('-Stop')           # stale pids from an earlier stop
                 say(f'GPU free for {calm} min: starting')

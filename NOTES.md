@@ -1701,3 +1701,15 @@ says otherwise; improving on the teacher needs the RL stage.
   defense only within 8 tiles of an attacking troop (12,105 of 83,969 plays dropped). Weak spot:
   low-health but high-damage leftovers (two Elite Barbarians at 387) are dropped too; a damage-rate
   rule from the unit tables would fix it. Viewer: runs/attacks/attack_viewer.html.
+
+## 2026-09-28: pilot1 got worse; pilot2 with smaller steps and a guard
+
+pilot1's learner fell from 46% to 32% +-5 against v2 after update 10 (hog2 ~16%, General ~18%)
+while drifting far from v2 (KL estimates up to 550, entropy 0.20 -> 0.36). pilot2 restarts from v2:
+- lr 3e-6, a step per 4 chunks;
+- a bounded anchor (0.3);
+- 16 value-only updates;
+- a keeper guard that halts the run below 42% over 150 recent games against v2 (HALT file);
+- sharing line 9.5 GB.
+
+Details: TRAINING.md journal.

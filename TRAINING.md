@@ -144,9 +144,12 @@ used): one server.
 
 ### Learning (il/rl_learn.py)
 PPO: clipped ratio 0.2, clipped value 0.2, entropy 0.001, GAE (gamma 0.999 per decision, lambda
-0.95), lr 1e-5, AdamW, grad-norm 1.0; the first 4 updates train the value only (FirstLight's value
-head learned their shaped reward, not ours); a KL anchor (0.1) to the starting model keeps early
-updates near what it knows. 32 lanes per update, 2 per minibatch (was 64 and 8: too big next to
+0.95), AdamW, grad-norm 1.0. pilot2's settings (pilot1's, which got worse, in brackets):
+- lr 3e-6 [1e-5];
+- one optimizer step per 4 time chunks [every chunk];
+- the first 16 updates train the value only [4]: FirstLight's value head learned their shaped
+  reward, not ours;
+- anchor to the starting model 0.3 x 0.5 (log ratio)^2 [0.1 x the exp estimator, which blew up]. 32 lanes per update, 2 per minibatch (was 64 and 8: too big next to
 the other job); lanes older than 2 updates are dropped. The
 collectors reload the latest weights after every update. Resumable (latest.pt).
 
@@ -215,6 +218,21 @@ Per run folder `runs/rl/<run>/` on the PC:
   card use, placements.
 
 ## 5. Journal
+
+- **2026-09-28** **pilot1 got worse than its start.** 88 updates, 2,131 games. Learner vs v2: 46%
+  in updates 0-9, then 32% +-5 (97-206) from update 10 on. vs hog2 35% -> ~16%; vs General
+  42% -> ~18%. Newer versions lost to their own snapshots. It drifted far from v2 (sampled KL
+  0.05 at update 10 -> 0.2-6, one estimate of 550) and got more random (entropy 0.20 -> 0.36).
+  The easy reward terms moved first: King activations 59% -> 30%, damage dealt 1.24 -> 1.1.
+  Likely causes: steps too big and noisy for the signal (a step per 64 decisions at lr 1e-5,
+  after the memory cuts), a value head with 4 warm-up updates, and an anchor estimate that
+  explodes. **pilot2** (from v2 again):
+  - lr 3e-6, one step per 4 chunks;
+  - anchor 0.3 x 0.5 (log ratio)^2;
+  - 16 value-only updates;
+  - the keeper halts the run once 150 recent games against v2 score under 42%;
+  - sharing line 9.5 GB (their job now sits at 7.6 GB);
+  - running scores in status.txt.
 
 - **2026-09-27 evening** pilot1 had not played a game: the YOLO job trained all day (see sharing).
   The user chose to share at full speed and to have the run come back after reboots. The keeper

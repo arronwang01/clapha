@@ -100,6 +100,8 @@ def update(policy, reference, optimizer, parameters, sequences, extras, args, de
             advantage = (advantage - mean) / (spread.sqrt() + 1e-8)
             state = policy.initial_state(batch.batch_size, device=device)
             reference_state = reference.initial_state(batch.batch_size, device=device)
+            optimizer.zero_grad(set_to_none=True)
+            pending = 0
             for start in range(0, steps, args.time_steps):
                 stop = min(steps, start + args.time_steps)
                 chunk = slice_il_sequence(batch, start, stop).to(device)
@@ -127,16 +129,22 @@ def update(policy, reference, optimizer, parameters, sequences, extras, args, de
                 value_clipped = old_v + torch.clamp(value - old_v, -args.value_clip, args.value_clip)
                 value_loss = (torch.maximum((value - returns) ** 2, (value_clipped - returns) ** 2) * mask).sum() / count
                 entropy = (evaluation.entropy.float() * mask).sum() / count
+                # 0.5 x (log ref - log policy)^2: pilot1's exp estimator blew up (550 at update 80) once
+                # the policy had moved away from the start
                 log_ratio_ref = reference_eval.log_prob.float() - log_prob
-                kl_ref = ((torch.exp(log_ratio_ref) - 1.0 - log_ratio_ref) * mask).sum() / count
+                kl_ref = (0.5 * log_ratio_ref ** 2 * mask).sum() / count
                 if value_only:
                     loss = args.value_coef * value_loss
                 else:
                     loss = policy_loss + args.value_coef * value_loss - args.entropy_coef * entropy + args.kl_coef * kl_ref
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(parameters, args.max_grad_norm)
-                optimizer.step()
+                # one step per --accumulate chunks: 2 lanes x 32 decisions alone made steps too noisy (pilot1)
+                (loss / args.accumulate).backward()
+                pending += 1
+                if pending == args.accumulate or stop >= steps:
+                    torch.nn.utils.clip_grad_norm_(parameters, args.max_grad_norm)
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    pending = 0
                 state = evaluation.final_state.detach()
                 reference_state = reference_eval.final_state.detach()
                 with torch.no_grad():
@@ -186,19 +194,22 @@ def main(argv: list[str]) -> int:
     parser.add_argument('--lanes', type=int, default=32, help='new lanes per update')
     parser.add_argument('--max-age', type=int, default=2, help='use lanes from at most this many updates back')
     parser.add_argument('--updates', type=int, default=0, help='stop after this many (0: run until stopped)')
-    parser.add_argument('--value-warmup', type=int, default=4)
+    # pilot1 (4 warm-up updates, lr 1e-5, KL 0.1, a step per chunk) got worse than its start from
+    # update 10 on (vs v2 46% -> 32%): longer value warm-up, smaller and steadier steps, a firmer anchor
+    parser.add_argument('--value-warmup', type=int, default=16)
     # one pass: on the shared GPU the learner is the slow part and games are plentiful (2026-09-27)
     parser.add_argument('--epochs', type=int, default=1)
     parser.add_argument('--minibatch', type=int, default=2, help='lanes per minibatch')
     parser.add_argument('--time-steps', type=int, default=32)
-    parser.add_argument('--learning-rate', type=float, default=1e-5)
+    parser.add_argument('--learning-rate', type=float, default=3e-6)
+    parser.add_argument('--accumulate', type=int, default=4, help='time chunks per optimizer step')
     parser.add_argument('--gamma', type=float, default=0.999)
     parser.add_argument('--gae-lambda', type=float, default=0.95)
     parser.add_argument('--clip', type=float, default=0.2)
     parser.add_argument('--value-clip', type=float, default=0.2)
     parser.add_argument('--value-coef', type=float, default=0.5)
     parser.add_argument('--entropy-coef', type=float, default=0.001)
-    parser.add_argument('--kl-coef', type=float, default=0.1)
+    parser.add_argument('--kl-coef', type=float, default=0.3)
     parser.add_argument('--max-grad-norm', type=float, default=1.0)
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--once', action='store_true', help='one update on the lanes present, then stop (tests)')
@@ -206,7 +217,7 @@ def main(argv: list[str]) -> int:
                         help='keep lanes once used (by default they are deleted: ~4 MB per side per game)')
     parser.add_argument('--save-every', type=int, default=10,
                         help='keep policy-NNNN.pt every N updates (the league\'s snapshots are every 10)')
-    parser.add_argument('--min-free-gb', type=float, default=5.0,
+    parser.add_argument('--min-free-gb', type=float, default=3.0,
                         help='the GPU is shared: update only when this much GPU memory is free (0: always)')
     args = parser.parse_args(argv)
     import firstlight_bot  # noqa: F401  (puts FirstLight's native_runner on the path)
