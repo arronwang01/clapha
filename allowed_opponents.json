@@ -2,7 +2,6 @@
   "_comment": "Accounts the bot is allowed to play against. Add only accounts you own.",
   "allow_bots": true,
   "allowed": [
-    
     {
       "account_lo": 88303124,
       "label": "Beater (own second account)"
@@ -18,7 +17,50 @@
     {
       "account_lo": 88042930,
       "label": "own main account"
+    },
+    {
+      "account_lo": 80060787,
+      "label": "main account"
+    },
+    {
+      "account_lo": 88290036,
+      "label": "main account"
+    },
+    {
+      "account_lo": 88237070,
+      "label": "main account"
+    },
+    {
+      "account_lo": 84173448,
+      "label": "main account"
+    },
+    {
+      "account_lo": 79291852,
+      "label": "main account"
+    },
+    {
+      "account_lo": 88270338,
+      "label": "main account"
+    },
+    {
+      "account_lo": 79357121,
+      "label": "main account"
+    },
+    {
+      "account_lo": 79479411,
+      "label": "main account"
+    },
+    {
+      "account_lo": 79274380,
+      "label": "main account"
+    },
+    {
+      "account_lo": 85974262,
+      "label": "main account"
+    },
+    {
+      "account_lo": 88222372,
+      "label": "main account"
     }
-
   ]
 }
