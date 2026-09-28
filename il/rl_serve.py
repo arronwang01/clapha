@@ -507,7 +507,11 @@ def _recipe(path: Path) -> dict:
     stamp = (str(path), path.stat().st_mtime)
     if stamp not in _RECIPES:
         extra = checkpoint_extra(path)
-        _RECIPES[stamp] = {'recipe': extra.get('recipe', ''), 'extras': bool(extra.get('extras'))}
+        # il.train's final checkpoints say extras=...; every checkpoint with the head carries
+        # extras_version (il.rl_learn's did not say extras=: pilot1's learner played without its
+        # extras inputs from update 1 on, 2026-09-29)
+        _RECIPES[stamp] = {'recipe': extra.get('recipe', ''),
+                           'extras': bool(extra.get('extras') or extra.get('extras_version'))}
     return _RECIPES[stamp]
 
 

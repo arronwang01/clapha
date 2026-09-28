@@ -44,6 +44,12 @@ def lane_sequences(paths, gamma: float, gae_lambda: float):
     sequences, extras = [], []
     for path in paths:
         lane = load_lane(path)
+        if any(getattr(observation, 'extras', None) is None for observation in lane['observations']):
+            # played without the extras inputs (before 2026-09-29 the collectors did not see that the
+            # learner's own checkpoints have the head): not this model's play, and it cannot share a
+            # batch with lanes that have them
+            print(f'{path.name}: played without extras, skipped', flush=True)
+            continue
         steps = len(lane['observations'])
         rewards = torch.tensor(lane['reward'], dtype=torch.float32).reshape(steps, 1)
         values = torch.tensor(lane['value'], dtype=torch.float32).reshape(steps, 1)
@@ -200,7 +206,8 @@ def save_policy(path: Path, policy, head, update_index: int, args) -> None:
     save_actor_critic_checkpoint(temporary, policy, optimizer=None, update_step=update_index, training_stage='ppo',
                                  gamma_per_decision=args.gamma,
                                  extra={'recipe': 'clapha il.rl_learn: self-play, live path, our reward',
-                                        'init': args.init, 'update': update_index, **extras_payload(head)})
+                                        'init': args.init, 'update': update_index, 'extras': True,
+                                        **extras_payload(head)})
     for attempt in range(40):
         try:
             temporary.replace(path)
@@ -335,6 +342,10 @@ def main(argv: list[str]) -> int:
             waited += 30
         started = time.time()
         sequences, extras = lane_sequences(picked, args.gamma, args.gae_lambda)
+        if not sequences:
+            for path in picked:
+                path.unlink(missing_ok=True)
+            continue
         value_only = update_index < args.value_warmup
         if optimizing != ('value' if value_only else 'all'):
             optimizing = 'value' if value_only else 'all'

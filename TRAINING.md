@@ -229,6 +229,19 @@ Per run folder `runs/rl/<run>/` on the PC:
 
 ## 5. Journal
 
+- **2026-09-29** **The learner played blind from update 1 on (pilot1 and pilot2).** The collectors
+  decide whether a model gets the extras inputs (pending cards, arrival, exact opponent elixir,
+  hero / champion states) from `extras` in its checkpoint's recipe (il/rl_serve.py `_recipe`).
+  v2 has it; il.rl_learn's checkpoints did not say it, so from the first saved update the learner
+  (and every snapshot) played as the base model -- without those inputs, and without training the
+  extras head -- while the anchor v2 played with them. pilot1's fall against v2 (46% -> 32%) is at
+  least partly this, not RL. It surfaced in pilot2 as a crash loop: the learner stopped at update 2
+  on "cannot concatenate different V4 record types" (v0 lanes with extras, v1+ lanes without, in one
+  minibatch), and the same lanes were picked again after every restart (27 restarts). Fix: the
+  learner's checkpoints say extras, `_recipe` also reads extras_version, the learner skips lanes
+  played without extras. pilot2 is abandoned (its value head saw blind lanes); **pilot3** starts
+  from v2 with this and the one-step-per-update learner (start-training.cmd default).
+
 - **2026-09-29** **Why pilot1 got worse: steps, not reward.** The learner/collector agreement holds
   on the PC (clip fraction ~0.0002 in value-only updates). The first policy update alone moved the
   policy to 6.5% clipped / KL 0.02: pilot1 took ~600 Adam steps per 16 games, each on 2 lanes x 32
