@@ -82,7 +82,8 @@ def _flat_grad(parameters):
     return torch.cat([(p.grad if p.grad is not None else torch.zeros_like(p)).reshape(-1).float() for p in parameters])
 
 
-def update(policy, reference, optimizer, parameters, sequences, extras, args, device, value_only: bool) -> dict:
+def update(policy, reference, optimizer, parameters, sequences, extras, args, device, value_only: bool,
+           minibatch: int) -> dict:
     """One pass of PPO over these lanes (minibatches of whole lanes, chunked in time).
 
     Policy updates take one optimizer step per --step-lanes lanes (0: all of this update's lanes),
@@ -105,6 +106,8 @@ def update(policy, reference, optimizer, parameters, sequences, extras, args, de
     every = torch.cat([row['advantage'] for row in extras])
     adv_mean, adv_std = float(every.mean()), float(every.std())
     order = list(range(len(sequences)))
+    # the value warm-up steps per --minibatch lanes whatever the batch size; a policy update's result does
+    # not depend on the batch size (one step over the decision-weighted mean)
     step_lanes = args.minibatch if value_only else (args.step_lanes or len(order))
     stats = {'policy_loss': 0.0, 'value_loss': 0.0, 'entropy': 0.0, 'kl_ref': 0.0, 'clip_fraction': 0.0,
              'approx_kl': 0.0, 'chunks': 0}
@@ -115,11 +118,11 @@ def update(policy, reference, optimizer, parameters, sequences, extras, args, de
             group = order[group_first:group_first + step_lanes]
             decisions = float(sum(len(extras[i]['advantage']) for i in group))
             # the half-way point for grad_cos, on a minibatch boundary
-            split = (len(group) // 2 // args.minibatch) * args.minibatch if len(group) >= 2 * args.minibatch else 0
+            split = (len(group) // 2 // minibatch) * minibatch if len(group) >= 2 * minibatch else 0
             first_half = None
             optimizer.zero_grad(set_to_none=True)
-            for first in range(0, len(group), args.minibatch):
-                picked = group[first:first + args.minibatch]
+            for first in range(0, len(group), minibatch):
+                picked = group[first:first + minibatch]
                 batch = batch_sequences([sequences[i] for i in picked])
                 rows = [extras[i] for i in picked]
                 steps = batch.time_steps
@@ -262,7 +265,13 @@ def main(argv: list[str]) -> int:
     parser.add_argument('--value-warmup', type=int, default=16)
     # one pass: on the shared GPU the learner is the slow part and games are plentiful (2026-09-27)
     parser.add_argument('--epochs', type=int, default=1)
-    parser.add_argument('--minibatch', type=int, default=2, help='lanes per minibatch')
+    parser.add_argument('--minibatch', type=int, default=2,
+                        help='lanes per minibatch on a shared GPU (and the value warm-up\'s lanes per step)')
+    # the GPU to ourselves (2026-09-29: no other job, 13 GB free): more lanes per forward, same result;
+    # an out-of-memory halves it and retries at once
+    parser.add_argument('--minibatch-max', type=int, default=8,
+                        help='lanes per minibatch when the GPU has room (--roomy-gb free)')
+    parser.add_argument('--roomy-gb', type=float, default=11.0)
     parser.add_argument('--time-steps', type=int, default=32)
     # one step per update (--step-lanes 0) moves far less per game than pilot1's step per chunk: a
     # larger rate per step
@@ -360,10 +369,18 @@ def main(argv: list[str]) -> int:
                     group['lr'] = args.learning_rate * 10 if value_only else args.learning_rate
                 print(f'optimizer state restored ({optimizing}, update {update_index})', flush=True)
         parameters = value_parameters if value_only else everything
+        minibatch = args.minibatch
+        if device.type == 'cuda' and args.minibatch_max > args.minibatch:
+            free, _total = torch.cuda.mem_get_info(device)
+            if free >= args.roomy_gb * 2 ** 30:
+                minibatch = args.minibatch_max
+            elif free >= args.roomy_gb / 2 * 2 ** 30:
+                minibatch = max(args.minibatch, args.minibatch_max // 2)
         stats = None
         for attempt in range(6):
             try:
-                stats = update(policy, reference, optimizer, parameters, sequences, extras, args, device, value_only)
+                stats = update(policy, reference, optimizer, parameters, sequences, extras, args, device, value_only,
+                               minibatch)
                 break
             except torch.OutOfMemoryError:
                 pass
@@ -381,6 +398,11 @@ def main(argv: list[str]) -> int:
             # (outside the except block, so the traceback no longer holds the update's tensors)
             optimizer.zero_grad(set_to_none=True)
             torch.cuda.empty_cache()
+            if minibatch > args.minibatch:
+                minibatch = max(args.minibatch, minibatch // 2)
+                print(f'GPU out of memory during update {update_index + 1}: again with {minibatch} lanes per minibatch',
+                      flush=True)
+                continue
             print(f'GPU out of memory during update {update_index + 1}: try {attempt + 2} of 6 in 60 s', flush=True)
             time.sleep(60)
         if stats is None:
@@ -394,7 +416,8 @@ def main(argv: list[str]) -> int:
             for path in picked:
                 path.unlink(missing_ok=True)
         wins = sum(1 for row in extras if row['winner'] == row['side'])
-        row = {'update': update_index, 'value_only': value_only, 'lanes': len(picked), 'seconds': round(time.time() - started),
+        row = {'update': update_index, 'value_only': value_only, 'lanes': len(picked), 'minibatch': minibatch,
+               'seconds': round(time.time() - started),
                'waited_s': waited,
                'mean_return': round(sum(r['return'] for r in extras) / len(extras), 4), 'lane_wins': wins, **stats}
         print(json.dumps(row), flush=True)

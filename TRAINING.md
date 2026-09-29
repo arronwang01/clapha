@@ -229,6 +229,18 @@ Per run folder `runs/rl/<run>/` on the PC:
 
 ## 5. Journal
 
+- **2026-09-29 morning** **pilot3, first evidence RL improves the model.** 85 updates, 2,001 games.
+  Updates 0-19 (warm-up, the learner is v2): vs v2 44-47 (48%). Updates 20-89: **162-111 (59%,
+  ~3 standard errors over 50%)**. King activations 61% -> ~42% (the reward's term, learned first).
+  vs hog2 no-delay unchanged (31% -> 33%); vs General 50% -> 43% (within noise, to watch: mirrors
+  dominate the league). KL to start only ~0.005: a narrow change so far (likely much of it the
+  activations). grad agree mostly +0.0-0.1 with spikes: a weak but real direction per update.
+  Throughput 5-6 games/min: the learner (~285 s per 32 lanes, 2 lanes per minibatch) about as slow
+  as the collectors (45 lanes waiting); the other user's job is gone (GPU 3.4 of 16 GB used, no
+  other Python; RAM 19 GB free; CPU 79%). Changes: the learner takes up to 8 lanes per minibatch
+  when 11 GB are free (4 at 5.5 GB; an out-of-memory halves it and retries at once; the result is
+  the same, checked), keeper at 14 engines.
+
 - **2026-09-29** **The learner played blind from update 1 on (pilot1 and pilot2).** The collectors
   decide whether a model gets the extras inputs (pending cards, arrival, exact opponent elixir,
   hero / champion states) from `extras` in its checkpoint's recipe (il/rl_serve.py `_recipe`).
