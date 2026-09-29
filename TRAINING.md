@@ -229,6 +229,17 @@ Per run folder `runs/rl/<run>/` on the PC:
 
 ## 5. Journal
 
+- **2026-09-29 evening (handoff from the cloud session)** pilot3 at 138 updates, 3,223 games. vs v2
+  since learning: 301-210 (59%), flat since update ~20; KL to start flat ~0.006 since update ~70
+  (the 0.3 anchor now balances the weak per-update signal). A game's 92 s: engine 7, observations
+  19, deciding 65 of which **waiting for the inference server 50** (~42 ms per turn) -- the server,
+  not the CPU or engine, halves the game rate. The other user's job is back (14 GB of GPU): the
+  keeper idles the run until others hold < 9.5 GB. **Next, proposed to the user, not built yet:**
+  anchor 0.3 -> 0.1 (--kl-coef, rl_learn default) and two inference servers (rl.ps1 -Servers 2),
+  one zip; read serve-0.log's forward stats first if possible. The code reaches the PC as
+  tools/pack_training.sh --update -> clapha-code-update.zip, unzipped over clapha-train
+  (python -m zipfile -e); stop-training.cmd pilot3 before, start-training.cmd after.
+
 - **2026-09-29 midday** The PC: i7-12700KF (8 P-cores + 4 E-cores, 20 threads), 64 GB, RTX 4080;
   the other user's job gone. 14 engines running (keeper 10:42). Every game now records where its
   time goes (games.jsonl `timing`: engine, building observations, deciding, of which waiting for the
