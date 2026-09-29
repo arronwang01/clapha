@@ -576,14 +576,19 @@ def remote_runner(client: Client, key: str, checkpoint: str | None = None):
     return RemoteRunner()
 
 
+WAITED = [0.0]      # seconds this process has waited for the server's answers (il.rl reads it per game)
+
+
 def decide_many(ready: list) -> dict:
     """il.duel.play_match's decide_many: [(side, remote runner, observation)] -> {side: moves}, both
     sides' decisions in one request (the server batches them with every other game's)."""
     started = time.perf_counter()
     prepared = [(side, runner, observation, runner.session.prepare(observation)) for side, runner, observation in ready]
     client = ready[0][1].session.client
+    asked = time.perf_counter()
     results = client.decide_many([(runner.session.sid, payload)
                                   for _side, runner, _obs, (_host, _stored, payload) in prepared])
+    WAITED[0] += time.perf_counter() - asked
     elapsed = (time.perf_counter() - started) * 1000
     decided = {}
     for (side, runner, observation, (host, stored, _payload)), (actions, log_prob, value) in zip(prepared, results):

@@ -346,7 +346,7 @@ def collect_remote(args) -> int:
     import torch
     import il.duel as D
     from il.engine_convert import connect
-    from il.rl_serve import Client, _address, decide_many, remote_runner
+    from il.rl_serve import WAITED, Client, _address, decide_many, remote_runner
     from il.speed import install
     install()
     torch.set_num_threads(1)            # this process builds observations; the server does the model
@@ -407,6 +407,7 @@ def collect_remote(args) -> int:
         delays = {learner_side: 'live', 1 - learner_side: opponent_delay}
         leads = {learner_side: 'auto', 1 - learner_side: 'auto' if opponent_delay == 'live' else 0}
         started = time.time()
+        WAITED[0] = 0.0
         try:
             result = D.play_match(native, runners, delays, leads, config, forms, rng, f'rl-{tag[:8]}-{index}',
                                   record=True, measured={learner_side: overheads['learner'],
@@ -426,6 +427,9 @@ def collect_remote(args) -> int:
                 print('5 games in a row failed: stopping this collector', flush=True)
                 return 3
             continue
+        if result.get('timing'):
+            # the decide time split: waiting for the server's answer vs our own tensorize / decode
+            result['timing']['wait'] = round(WAITED[0], 2)
         try:
             row = _finish_game(args, out, run, index, kind, tag, opponent_key, opponent_delay, learner_side, learner,
                                opponent, result, started)
@@ -456,7 +460,7 @@ def _finish_game(args, out: Path, run: Path, index: int, kind: str, tag: str, op
            'learner_version': learner.version, 'opponent_version': opponent.version, 'winner': winner,
            'learner_won': None if winner not in (0, 1) else winner == learner_side,
            'crowns': result['crowns'], 'end_tick': result['tick'], 'tower_hp': result.get('tower_hp'),
-           'seconds': round(time.time() - started, 1), 'lanes': [], 'sides': {}}
+           'seconds': round(time.time() - started, 1), 'timing': result.get('timing'), 'lanes': [], 'sides': {}}
     trained = [('learner', learner_side, learner)] + ([('opponent', 1 - learner_side, opponent)] if kind == 'self' else [])
     for role, side, runner in [('learner', learner_side, learner), ('opponent', 1 - learner_side, opponent)]:
         decision_ticks = [runner.first_decision_tick + 5 * k for k in range(len(runner.last_steps))]

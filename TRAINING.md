@@ -229,6 +229,14 @@ Per run folder `runs/rl/<run>/` on the PC:
 
 ## 5. Journal
 
+- **2026-09-29 midday** The PC: i7-12700KF (8 P-cores + 4 E-cores, 20 threads), 64 GB, RTX 4080;
+  the other user's job gone. 14 engines running (keeper 10:42). Every game now records where its
+  time goes (games.jsonl `timing`: engine, building observations, deciding, of which waiting for the
+  model; status.txt shows the mean of the last 100 games) -- the measurement before optimizing.
+  Ceiling estimate: 20 threads shared by the engines (translated ARM in the VM), 14 Python
+  collectors, the server and the learner -- ~12-15 games/min as the code is, 20-25 only with less
+  CPU per game.
+
 - **2026-09-29 morning** **pilot3, first evidence RL improves the model.** 85 updates, 2,001 games.
   Updates 0-19 (warm-up, the learner is v2): vs v2 44-47 (48%). Updates 20-89: **162-111 (59%,
   ~3 standard errors over 50%)**. King activations 61% -> ~42% (the reward's term, learned first).

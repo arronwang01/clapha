@@ -82,6 +82,10 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
     from native_runner.cr_native_env import NATIVE_OBJECT_ID_ENTITY_KEY_TAG, AbilityAction, HandAction
 
     native.create_match(config)
+    # where a game's time goes (seconds): the engine (stepping, observing), building each side's
+    # observation (reader frame, FLO.build, extras), deciding (tensorize, the model, decoding)
+    timing = {'engine': 0.0, 'build': 0.0, 'decide': 0.0, 'total': 0.0, 'turns': 0}
+    match_started = time.perf_counter()
     battles = {0: None, 1: None}
     commands: list[Command] = []
     executed_rows: list[dict] = []
@@ -208,13 +212,17 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
                        and c.execute - 1 > tick]
         if waiting:
             candidates.append(tick + 1)
+        clock = time.perf_counter()
         frames, tick, ended = run_lean(native, min(candidates))
+        timing['engine'] += time.perf_counter() - clock
         if record:
             recorded_frames.extend(frames)
         if ended:
             break
         decision = tick % DECISION_TICKS == 0 and frames
+        clock = time.perf_counter()
         players = frames[-1]['state']['players'] if decision else native.observe()['players']
+        timing['engine'] += time.perf_counter() - clock
         process_taps(players if decision else [{'owner': p['owner'], 'elixirRaw': p['elixirRaw']} for p in players])
         inject_due()
         if not decision:
@@ -327,21 +335,31 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
                     command.execute = tick + max(1, int(offset))
                     counters[side]['tapped'] += 1
                 commands.append(command)
+        timing['turns'] += 1
         if decide_many is None:
             # one side after the other: side 1 is prepared after side 0's plays of this turn exist
             for side in (0, 1):
+                clock = time.perf_counter()
                 prepared = prepare(side)
+                timing['build'] += time.perf_counter() - clock
                 if prepared is not None:
-                    apply(side, prepared[0], prepared[0].decide(prepared[1]))
+                    clock = time.perf_counter()
+                    moves = prepared[0].decide(prepared[1])
+                    timing['decide'] += time.perf_counter() - clock
+                    apply(side, prepared[0], moves)
         else:
             # both sides prepared from the same state, then decided together (il/rl_serve.py)
             ready = []
+            clock = time.perf_counter()
             for side in (0, 1):
                 prepared = prepare(side)
                 if prepared is not None:
                     ready.append((side, *prepared))
+            timing['build'] += time.perf_counter() - clock
             if ready:
+                clock = time.perf_counter()
                 decided = decide_many(ready)
+                timing['decide'] += time.perf_counter() - clock
                 for side, runner, _observation in ready:
                     apply(side, runner, decided[side])
         # a tap due right now (no-delay side, offset 0) goes out this tick
@@ -357,8 +375,10 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
     for o in final.get('objects') or ():
         if 5000000 <= int(o.get('nativeObjectId', 0)) <= 5000005 and o.get('hp') is not None:
             tower_hp[int(o['owner'])] += int(o['hp'])
+    timing['total'] = time.perf_counter() - match_started
     result = {'winner': final.get('winner'), 'crowns': final.get('crownsRaw'), 'tick': final.get('tick'),
-              'counters': counters, 'tower_hp': tower_hp}
+              'counters': counters, 'tower_hp': tower_hp,
+              'timing': {k: (round(v, 2) if isinstance(v, float) else v) for k, v in timing.items()}}
     if record and recorded_frames:
         result['recording'] = _recording(recorded_frames, done, deck_forms, final)
     return result

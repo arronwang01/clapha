@@ -49,6 +49,16 @@ def report(run: Path, every: int) -> str:
         recent = [g for g in games if g['time'] >= games[-1]['time'] - 600]
         out.append(f'{len(games) / span:.1f} games/min overall, {len(recent) / 10:.1f} in the last 10 min'
                    if span else '')
+        timed = [g['timing'] for g in games[-100:] if g.get('timing')]
+        if timed:
+            def mean(name):
+                return sum(t.get(name, 0) for t in timed) / len(timed)
+            model = mean('wait')
+            out.append(f"a game's time (last {len(timed)} games): {mean('total'):.0f} s = engine {mean('engine'):.0f} s, "
+                       f"building observations {mean('build'):.0f} s, deciding {mean('decide'):.0f} s "
+                       f"(of which waiting for the model {model:.0f} s), other "
+                       f"{mean('total') - mean('engine') - mean('build') - mean('decide'):.0f} s; "
+                       f"{mean('turns'):.0f} turns")
     by_stretch: dict[int, list[dict]] = defaultdict(list)
     for game in games:
         by_stretch[int(game.get('learner_version', 0)) // every * every].append(game)
