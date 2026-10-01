@@ -262,7 +262,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument('--updates', type=int, default=0, help='stop after this many (0: run until stopped)')
     # pilot1 (4 warm-up updates, lr 1e-5, KL 0.1, a step per chunk) got worse than its start from
     # update 10 on (vs v2 46% -> 32%): longer value warm-up, smaller and steadier steps, a firmer anchor
-    parser.add_argument('--value-warmup', type=int, default=16)
+    parser.add_argument('--value-warmup', type=int, default=3)
     # one pass: on the shared GPU the learner is the slow part and games are plentiful (2026-09-27)
     parser.add_argument('--epochs', type=int, default=1)
     parser.add_argument('--minibatch', type=int, default=2,
@@ -275,8 +275,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument('--time-steps', type=int, default=32)
     # one step per update (--step-lanes 0) moves far less per game than pilot1's step per chunk: a
     # larger rate per step
-    parser.add_argument('--learning-rate', type=float, default=1e-5)
-    parser.add_argument('--step-lanes', type=int, default=0,
+    parser.add_argument('--learning-rate', type=float, default=3e-5)
+    parser.add_argument('--step-lanes', type=int, default=8,
                         help='policy updates: lanes per optimizer step (0: one step over all the update\'s lanes)')
     parser.add_argument('--gamma', type=float, default=0.999)
     parser.add_argument('--gae-lambda', type=float, default=0.95)
@@ -284,7 +284,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument('--value-clip', type=float, default=0.2)
     parser.add_argument('--value-coef', type=float, default=0.5)
     parser.add_argument('--entropy-coef', type=float, default=0.001)
-    parser.add_argument('--kl-coef', type=float, default=0.3)
+    parser.add_argument('--kl-coef', type=float, default=0.05)
     parser.add_argument('--max-grad-norm', type=float, default=1.0)
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--once', action='store_true', help='one update on the lanes present, then stop (tests)')

@@ -36,11 +36,14 @@ from pathlib import Path
 CLAPHA = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(CLAPHA / 'mac012'))
 
-PRINCESS_WEIGHT = 0.3
-KING_ACTIVATION_PENALTY = 0.2
+PRINCESS_WEIGHT = 0.7
+KING_ACTIVATION_PENALTY = 0.4
 KING_SPELL_RADIUS = 4500            # native units: a spell of ours this close to their King Tower
 TARGET_DELAY = 26                   # as mac012/console.TARGET_DELAY
 LANE_FORMAT = 'clapha-rl-lane.v1'
+LEAK_GRACE_TICKS = 60               # 3.0 s: tactical waiting at 10 elixir is free
+LEAK_PENALTY_PER_DECISION = 0.02   # small continuous penalty only when capped beyond grace
+LEAGUE = 'self=2,snap=1,anchor=2,hog2=2,general=3'
 
 # engine tower objects (il.samples.TOWER_IDS): 5000000 + firstlight_obs.TOWERS index
 KING = {0: 5000000, 1: 5000003}
@@ -73,7 +76,6 @@ def _spell_impacts(plays, side: int, enemy_king: tuple[int, int]) -> list[int]:
             impacts.append(int(play['lands']) + 1 + flight_ticks(int(play['card_id']), side, tuple(play['grid'])))
     return impacts
 
-
 def side_rewards(frames: list[dict], side: int, decision_ticks: list[int], winner, plays=None) -> tuple[list[float], dict]:
     """One reward per decision of `side`: what happened from that decision to the next (the last
     to the end), plus the result on the last. frames: the match's decision-tick snapshots; plays: the
@@ -85,14 +87,29 @@ def side_rewards(frames: list[dict], side: int, decision_ticks: list[int], winne
     enemy = 1 - side
 
     def princess(health: dict, owner: int) -> float:
-        # a tower's share of its full health, summed (0..2); a missing tower is destroyed
         return sum(health.get(tower, 0) / full.get(tower, 1) for tower in PRINCESS[owner])
 
     standing = [princess(tower_health(by_tick[t]), side) for t in ticks]
     theirs = [princess(tower_health(by_tick[t]), enemy) for t in ticks]
     index_at = {t: i for i, t in enumerate(ticks)}
     rewards, stats = [], {'dealt': 0.0, 'taken': 0.0, 'king_activation': None}
-    # the King Tower activation this side caused with a spell, if any, dated by its snapshot
+
+    # Track continuous duration at max elixir (100,000 raw)
+    continuous_full = {}
+    streak = 0
+    last_t = None
+    for t in ticks:
+        f = by_tick[t]
+        st = next((p for p in (f.get('state') or {}).get('players') or () if p['owner'] == side), None)
+        elixir = int(st.get('elixirRaw') or 0) if st else 0
+        dt = (t - last_t) if last_t is not None else 5
+        if elixir >= 100000:
+            streak += dt
+        else:
+            streak = 0
+        continuous_full[t] = streak
+        last_t = t
+
     activation_tick = None
     king_full = full.get(KING[enemy])
     for i in range(1, len(ticks)):
@@ -102,9 +119,6 @@ def side_rewards(frames: list[dict], side: int, decision_ticks: list[int], winne
         both_up = all(tower_health(by_tick[ticks[i - 1]]).get(t, 0) > 0 for t in PRINCESS[enemy])
         if both_up:
             kx, ky = _king_xy(by_tick[ticks[i - 1]], enemy)
-            # one of our spells landing on it between the last clean snapshot and this one (a
-            # Fireball in flight moves ~3 tiles per snapshot, so its landing point, not where a
-            # snapshot caught it), or a spell object of ours on it (a rolling Log)
             landed = any(ticks[i - 1] - 5 <= impact <= ticks[i] + 5
                          for impact in _spell_impacts(plays, side, (kx, ky)))
             spells = [o for f in (by_tick[ticks[i - 1]], by_tick[ticks[i]]) for o in f.get('objects') or ()
@@ -112,7 +126,8 @@ def side_rewards(frames: list[dict], side: int, decision_ticks: list[int], winne
                       and math.hypot(int(o['x']) - kx, int(o['y']) - ky) <= KING_SPELL_RADIUS]
             if landed or spells:
                 activation_tick = ticks[i]
-        break          # the first damage is the activation, whoever caused it
+        break
+
     for k, tick in enumerate(decision_ticks):
         start = index_at.get(tick)
         end = index_at.get(decision_ticks[k + 1]) if k + 1 < len(decision_ticks) else len(ticks) - 1
@@ -126,9 +141,21 @@ def side_rewards(frames: list[dict], side: int, decision_ticks: list[int], winne
             if activation_tick is not None and ticks[start] < activation_tick <= ticks[end]:
                 reward -= KING_ACTIVATION_PENALTY
                 stats['king_activation'] = activation_tick
+            
+            # Grace-period leak penalty: completely free for the first 3 seconds,
+            # tiny penalty if stagnation continues beyond that.
+            if continuous_full.get(ticks[start], 0) > LEAK_GRACE_TICKS:
+                reward -= LEAK_PENALTY_PER_DECISION
         rewards.append(reward)
+
     if rewards:
-        rewards[-1] += 0.0 if winner not in (0, 1) else (1.0 if winner == side else -1.0)
+        if winner in (0, 1):
+            rewards[-1] += 1.0 if winner == side else -1.0
+        else:
+            # 0-0 stalemate where neither side engaged: mutual penalty
+            stalemate = (stats['dealt'] < 0.05 and stats['taken'] < 0.05)
+            rewards[-1] += -0.5 if stalemate else 0.0
+
     return rewards, stats
 
 
