@@ -9,6 +9,17 @@ struct Snapshot {
     static func main() {
         let args = CommandLine.arguments
         renderingSnapshot = true
+        if args.count > 3 && args[1] == "--games" {
+            // the Training games window: snapshot --games runs/viewer/games.json out.png [game index]
+            let model = GamesModel()
+            model.file = try! JSONDecoder().decode(GameFile.self, from: Data(contentsOf: URL(fileURLWithPath: args[2])))
+            let game = model.file!.games[args.count > 4 ? Int(args[4])! : 0]
+            let view = TrainingGamesView(model: model, selection: game.id, tick: Double(game.start + (game.end - game.start) * 2 / 5))
+                .frame(width: 1150, height: 780)
+                .background(Color(nsColor: .windowBackgroundColor))
+            write(view, to: args[3])
+            return
+        }
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
         func load(_ path: String) -> DeviceState {
@@ -21,6 +32,11 @@ struct Snapshot {
         let view = ContentView(device1: one, device2: two, live: false)
             .frame(width: 1000, height: 760)
             .background(Color(nsColor: .windowBackgroundColor))
+        write(view, to: args[3])
+    }
+
+    @MainActor
+    static func write(_ view: some View, to path: String) {
         let renderer = ImageRenderer(content: view)
         renderer.scale = 1
         guard let image = renderer.nsImage, let tiff = image.tiffRepresentation,
@@ -28,7 +44,7 @@ struct Snapshot {
               let png = rep.representation(using: .png, properties: [:]) else {
             print("render failed"); exit(1)
         }
-        try! png.write(to: URL(fileURLWithPath: args[3]))
-        print("wrote \(args[3])")
+        try! png.write(to: URL(fileURLWithPath: path))
+        print("wrote \(path)")
     }
 }

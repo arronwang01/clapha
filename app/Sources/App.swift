@@ -12,6 +12,11 @@ struct ClaphaApp: App {
                 .frame(minWidth: 820, minHeight: 700)
         }
         .windowResizability(.contentMinSize)
+        // recorded RL training games, replayed (app/Sources/Games.swift)
+        Window("Training games", id: "games") {
+            TrainingGamesView()
+                .frame(minWidth: 1000, minHeight: 720)
+        }
     }
 }
 

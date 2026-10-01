@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Training Game Viewer</title>
+<style>
+:root {
+  --bg: #faf9f6; --surface: #f1efe8; --text: #1f1e1d; --muted: #5f5e5a; --border: rgba(0,0,0,.14);
+  --learner: #1D9E75; --opponent: #D85A30; --river: rgba(55,138,221,.16); --half: rgba(29,158,117,.07);
+  --chip: #ffffff; --elixir: #b14fc5;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #1f1e1d; --surface: #2c2c2a; --text: #ecebe8; --muted: #b4b2a9; --border: rgba(255,255,255,.18);
+    --river: rgba(55,138,221,.22); --half: rgba(29,158,117,.10); --chip: #353532; --elixir: #c77ad6;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #1f1e1d; --surface: #2c2c2a; --text: #ecebe8; --muted: #b4b2a9; --border: rgba(255,255,255,.18);
+  --river: rgba(55,138,221,.22); --half: rgba(29,158,117,.10); --chip: #353532; --elixir: #c77ad6;
+}
+* { box-sizing: border-box; }
+body { margin: 0; padding: 16px; background: var(--bg); color: var(--text); font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+h1 { font-size: 17px; font-weight: 600; margin: 0 0 4px; }
+.muted { color: var(--muted); }
+.bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 10px 0 14px; }
+select, button { font: inherit; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 5px 10px; }
+select#game { flex: 1; min-width: 0; max-width: 100%; }
+button { cursor: pointer; }
+.main { display: grid; grid-template-columns: 330px minmax(0, 1fr); gap: 20px; align-items: start; }
+@media (max-width: 760px) { .main { grid-template-columns: minmax(0, 1fr); } }
+canvas { width: 100%; max-width: 330px; aspect-ratio: 18 / 32; display: block; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); }
+.player { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; margin-bottom: 10px; }
+.player .who { font-weight: 600; display: flex; align-items: center; gap: 6px; }
+.dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+.elixir { position: relative; height: 8px; background: var(--surface); border-radius: 4px; margin: 6px 0; overflow: hidden; }
+.elixir > div { position: absolute; inset: 0 auto 0 0; background: var(--elixir); border-radius: 4px; }
+.hand { display: flex; flex-wrap: wrap; gap: 4px; font-size: 12px; }
+.hand span { background: var(--chip); border: 1px solid var(--border); border-radius: 6px; padding: 1px 6px; white-space: nowrap; }
+.hand span.next { opacity: .55; border-style: dashed; }
+.log { font-size: 12.5px; max-height: 260px; overflow: auto; border-top: 1px solid var(--border); padding-top: 6px; }
+.log div { display: flex; gap: 8px; }
+.log .t { color: var(--muted); width: 38px; flex: none; font-variant-numeric: tabular-nums; }
+.controls { display: flex; align-items: center; gap: 8px; margin-top: 10px; max-width: 330px; }
+.controls input { flex: 1; min-width: 0; }
+#clock { font-variant-numeric: tabular-nums; min-width: 64px; text-align: right; }
+.result { display: inline-block; padding: 1px 8px; border-radius: 6px; font-size: 12px; background: var(--surface); }
+</style>
+</head>
+<body>
+<h1>Training games</h1>
+<div class="muted" id="about"></div>
+<div class="bar">
+  <button id="prev" aria-label="Previous game">‹</button>
+  <select id="game" aria-label="Game"></select>
+  <button id="next" aria-label="Next game">›</button>
+</div>
+<div class="main">
+  <div>
+    <canvas id="board" width="660" height="1173" aria-label="The arena: the learner plays from the bottom"></canvas>
+    <div class="controls">
+      <button id="play" aria-label="Play">▶</button>
+      <input type="range" id="slider" min="0" max="0" step="1" value="0" aria-label="Time">
+      <select id="speed" aria-label="Speed"><option value="1">1×</option><option value="2" selected>2×</option><option value="4">4×</option><option value="8">8×</option></select>
+      <span id="clock"></span>
+    </div>
+  </div>
+  <div>
+    <div id="title" style="font-weight:600;font-size:15px"></div>
+    <div id="sub" class="muted" style="margin-bottom:10px"></div>
+    <div class="player" id="p1"></div>
+    <div class="player" id="p0"></div>
+    <div class="log" id="log"></div>
+  </div>
+</div>
+<script>
+const D = __DATA__;
+const L = D.labels, cv = document.getElementById('board'), g = cv.getContext('2d');
+const W = cv.width, H = cv.height, SX = W / 180, SY = H / 320;
+let gi = 0, tick = 0, playing = false, last = 0, game = null, index = null;
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const px = x => x * SX, py = y => (320 - y) * SY;
+const clock = t => { const s = Math.max(0, t / 20); const m = Math.floor(s / 60); return m + ':' + String(Math.floor(s % 60)).padStart(2, '0') + (s >= 180 ? ' OT' : ''); };
+function short(name) { const w = name.split(' '); return (w.length > 1 && w[0].length < 4 ? w.slice(0, 2).join(' ') : w[0]).slice(0, 11); }
+function objects(f) {  // [id, side, label, kind, x, y, hp]
+  const out = [], a = f[5];
+  for (let i = 0; i < a.length; i += 5) { const p = a[i + 1]; out.push([a[i], p & 1, p >> 3, (p >> 1) & 3, a[i + 2], a[i + 3], a[i + 4]]); }
+  return out;
+}
+function frameAt(t) {  // the last frame at or before t
+  const fr = game.frames; let lo = 0, hi = fr.length - 1;
+  while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (fr[mid][0] <= t) lo = mid; else hi = mid - 1; }
+  return lo;
+}
+function draw() {
+  const fr = game.frames, i = frameAt(tick), f = fr[i], n = fr[Math.min(i + 1, fr.length - 1)];
+  const a = n[0] > f[0] ? Math.min(1, (tick - f[0]) / (n[0] - f[0])) : 0;
+  const next = new Map(objects(n).map(o => [o[0], o]));
+  const text = css('--text'), learner = css('--learner'), opponent = css('--opponent');
+  g.clearRect(0, 0, W, H);
+  g.fillStyle = css('--half'); g.fillRect(0, py(150), W, H - py(150));
+  g.fillStyle = css('--river'); g.fillRect(0, py(170), W, py(150) - py(170));
+  g.textBaseline = 'middle'; g.font = '22px sans-serif';
+  // placements: a ring where a card landed, for a second
+  for (const p of game.plays) {
+    const age = tick - p[0];
+    if (age < 0 || age > 20) continue;
+    g.globalAlpha = 1 - age / 20; g.strokeStyle = p[1] === 0 ? learner : opponent; g.lineWidth = 3;
+    g.beginPath(); g.arc(px(p[3] * 10 + 5), py(p[4] * 10 + 5), 22, 0, 7); g.stroke();
+  }
+  g.globalAlpha = 1;
+  const drawn = objects(f).map(o => {
+    const m = next.get(o[0]);
+    return m ? [...o.slice(0, 4), o[4] + (m[4] - o[4]) * a, o[5] + (m[5] - o[5]) * a, o[6]] : o;
+  });
+  for (const o of drawn) {  // towers and buildings first, then troops, then spells
+    if (o[3] !== 2 && o[3] !== 1) continue;
+    const col = o[1] === 0 ? learner : opponent, x = px(o[4]), y = py(o[5]);
+    const w = o[3] === 2 ? (L[o[2]] === 'King' ? 4 : 3) * 10 * SX : 2 * 10 * SX;
+    g.globalAlpha = 0.22; g.fillStyle = col; g.fillRect(x - w / 2, y - w / 2, w, w);
+    g.globalAlpha = 1; g.strokeStyle = col; g.lineWidth = 2; g.strokeRect(x - w / 2, y - w / 2, w, w);
+    g.fillStyle = text; g.textAlign = 'center';
+    g.fillText(o[3] === 2 ? o[6] + '%' : short(L[o[2]]), x, y);
+  }
+  for (const o of drawn) {
+    if (o[3] !== 0) continue;
+    const col = o[1] === 0 ? learner : opponent, x = px(o[4]), y = py(o[5]);
+    g.fillStyle = col; g.beginPath(); g.arc(x, y, 9, 0, 7); g.fill();
+    if (o[6] >= 0 && o[6] < 100) { g.fillStyle = col; g.fillRect(x - 12, y - 18, 24 * o[6] / 100, 4); }
+    g.fillStyle = text; g.textAlign = 'left'; g.fillText(short(L[o[2]]), x + 13, y);
+  }
+  for (const o of drawn) {
+    if (o[3] !== 3) continue;
+    const col = o[1] === 0 ? learner : opponent, x = px(o[4]), y = py(o[5]);
+    g.setLineDash([5, 4]); g.strokeStyle = col; g.lineWidth = 3; g.beginPath(); g.arc(x, y, 16, 0, 7); g.stroke(); g.setLineDash([]);
+    g.fillStyle = text; g.textAlign = 'center'; g.fillText(short(L[o[2]]), x, y - 28);
+  }
+  for (const side of [0, 1]) {
+    const box = document.getElementById('p' + side), e = f[1 + side] / 10, hand = f[3 + side];
+    box.querySelector('.elixir > div').style.width = (10 * e) + '%';
+    box.querySelector('.ex').textContent = e.toFixed(1);
+    box.querySelector('.hand').innerHTML = hand.map((c, k) => `<span class="${k === 4 ? 'next' : ''}">${k === 4 ? 'next: ' : ''}${L[c]}</span>`).join('');
+  }
+  const recent = game.plays.filter(p => p[0] <= tick).slice(-14).reverse();
+  document.getElementById('log').innerHTML = recent.map(p =>
+    `<div><span class="t">${clock(p[0]).replace(' OT', '')}</span><span class="dot" style="background:${p[1] === 0 ? learner : opponent};margin-top:6px"></span><span>${L[p[2]]}</span></div>`).join('');
+  document.getElementById('clock').textContent = clock(tick);
+  document.getElementById('slider').value = Math.round(tick);
+}
+function player(side) {
+  const who = side === 0 ? game.learner : game.opponent;
+  return `<div class="who"><span class="dot" style="background:var(--${side === 0 ? 'learner' : 'opponent'})"></span>${who}<span class="muted" style="font-weight:400">${side === 0 ? '(bottom)' : '(top)'}</span></div>
+    <div class="muted" style="font-size:12px">${game.decks[side].join(' · ')}</div>
+    <div class="elixir"><div></div></div><div style="display:flex;justify-content:space-between;font-size:12px"><span class="muted">elixir</span><span class="ex"></span></div>
+    <div class="hand"></div>`;
+}
+function load(k) {
+  gi = (k + D.games.length) % D.games.length; game = D.games[gi]; tick = game.frames[0][0];
+  document.getElementById('game').value = gi;
+  document.getElementById('title').textContent = game.title;
+  document.getElementById('sub').innerHTML = `<span class="result">${game.result}</span> ${game.sub}`;
+  document.getElementById('p0').innerHTML = player(0); document.getElementById('p1').innerHTML = player(1);
+  const s = document.getElementById('slider'); s.min = game.frames[0][0]; s.max = game.frames[game.frames.length - 1][0];
+  draw();
+}
+function step(now) {
+  if (!playing) return;
+  const dt = last ? (now - last) / 1000 : 0; last = now;
+  tick = Math.min(tick + dt * 20 * +document.getElementById('speed').value, game.frames[game.frames.length - 1][0]);
+  draw();
+  if (tick >= game.frames[game.frames.length - 1][0]) { pause(); return; }
+  requestAnimationFrame(step);
+}
+function pause() { playing = false; document.getElementById('play').textContent = '▶'; }
+document.getElementById('play').onclick = () => {
+  if (playing) { pause(); return; }
+  if (tick >= game.frames[game.frames.length - 1][0]) tick = game.frames[0][0];
+  playing = true; last = 0; document.getElementById('play').textContent = '❚❚'; requestAnimationFrame(step);
+};
+document.getElementById('slider').oninput = ev => { tick = +ev.target.value; draw(); };
+document.getElementById('prev').onclick = () => { pause(); load(gi - 1); };
+document.getElementById('next').onclick = () => { pause(); load(gi + 1); };
+const sel = document.getElementById('game');
+sel.innerHTML = D.games.map((x, k) => `<option value="${k}">${x.title} — ${x.result}</option>`).join('');
+sel.onchange = () => { pause(); load(+sel.value); };
+document.getElementById('about').textContent = D.about;
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => draw());
+load(0);
+</script>
+</body>
+</html>

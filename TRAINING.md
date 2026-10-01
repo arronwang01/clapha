@@ -143,6 +143,16 @@ servers at once made things worse while the GPU was busy (35-40 ms per forward, 
 used): one server.
 
 ### Learning (il/rl_learn.py)
+**Since pilot3 update 220** (the user, with Gemini, 2026-09-30):
+- lr 3e-5;
+- 4 optimizer steps per update (`--step-lanes 8`, 8 lanes each);
+- anchor 0.05;
+- value warm-up 3;
+- league self 2 / snap 1 / anchor 2 / hog2 2 / General 3;
+- the keeper's guard judges from update 5.
+
+The cloud session's settings below ran pilot3's updates 1-219.
+
 PPO: clipped ratio 0.2, clipped value 0.2, entropy 0.001, GAE (gamma 0.999 per decision, lambda
 0.95), AdamW, grad-norm 1.0, anchor to the starting model 0.3 x 0.5 (log ratio)^2. Since
 2026-09-29 (pilot1's settings in brackets):
@@ -163,10 +173,12 @@ Checked on the PC (value-only updates, where the policy is exactly the one that 
 fraction 0.0001-0.0004, approx KL 9e-5 -- the learner (bf16, train mode) and the collectors
 (fp32) agree; the mismatch is not why pilot1 got worse.
 
-### Reward (per decision of the trained side; the user's, 2026-09-26)
-- terminal: win +1, loss -1, draw 0
-- princess towers: +0.3 x (share of a princess tower's health dealt) - 0.3 x (share taken)
-- King Tower: nothing for damage; -0.2 when **our spell** is the first thing to damage their King
+### Reward (per decision of the trained side; the user's, 2026-09-26; weights since pilot3 update 220)
+Changed at pilot3 update 220 (the user, with Gemini, 2026-09-30); the earlier values are in brackets.
+- terminal: win +1, loss -1, draw 0; **-0.5 for a draw where neither side did damage** [0]
+- princess towers: +0.7 x (share of a princess tower's health dealt) - 0.7 x (share taken) [0.3]
+- **elixir leak**: -0.02 per decision while at 10 elixir for more than 3 s straight [none]
+- King Tower: nothing for damage; -0.4 [0.2] when **our spell** is the first thing to damage their King
   Tower while both their princess towers stand (activation). Dated by the spell's landing cell and
   flight time (il/flight.py) or a spell object on it. An activation the opponent engineers is not
   charged; it shows in the result.
@@ -221,6 +233,9 @@ Per run folder `runs/rl/<run>/` on the PC:
 - `learn.jsonl`: one row per update: losses, entropy, KL to the start, clip fraction, value error,
   mean return, wins in the batch.
 - `policy-NNNN.pt` every 10 updates, `latest.pt`; logs per process (rewritten at each start).
+- `recordings/`: one whole game in 50 (il.duel's format). **Watch them in the Clapha app:** Training
+  games in the top bar (app/Sources/Games.swift; its Reload runs `il/game_viewer.py --json`). Copy a
+  run's recordings folder from the PC into runs/rl/<run>/ first.
 - `status.txt` (every 10 min), `turns.log` (a line per minute, every keeper action), `launch.log`,
   `engines.log` (what the start and engine scripts printed).
 - Behaviour metrics per checkpoint (il/habits.py and the activation check): Log targets, Ice Golem
@@ -228,6 +243,49 @@ Per run folder `runs/rl/<run>/` on the PC:
   card use, placements.
 
 ## 5. Journal
+
+- **2026-10-01** **pilot3 at 523 updates, 13,206 games: RL works in the mirror, not against real decks.**
+  Read on the Mac from the run's records (runs/rl/pilot3; checkpoint update 520 in the console as
+  clapha:p3).
+
+  | updates | vs v2 | vs hog2 no-delay | vs General (real decks) | elixir leak s/game | King activ. |
+  |---|---|---|---|---|---|
+  | 0-19 (still v2) | 48% | 31% | 50% | 60 | 62% |
+  | 60-219 (cloud settings) | 56-64% | 39-44% | 42-44% | 55 | 41-45% |
+  | 220-299 (Gemini's change) | 59-67% | 43% | 36-38% | 18 -> 8 | 32 -> 14% |
+  | 300-459 | 82-86% | 50-63% | 37-45% | 8 | 7 -> 2% |
+  | 460-539 | 89-91% | 66% | 41-42% | 8-9 | 2% |
+
+  - The cloud settings (a step per update, anchor 0.3) learned but barely moved: KL to start
+    0.002-0.007, grad agree +0.02-0.09 (a weak, real direction).
+  - Gemini's change let the model move ~25x further from v2 (KL 0.14-0.18; entropy 0.20 -> 0.24
+    -> 0.21; clip ~4%; stable) and added the elixir-leak term. Leaking fell first (220-260); the
+    wins came after (280-340) and are still creeping up. Which of the two did it is not separable
+    from this run.
+  - Style against v2 in the same games (updates 400+ vs v2), per minute: Hog Rider 2.08 vs 1.84,
+    Fireball 1.86 vs 1.58, Log 1.22 vs 1.61, Cannon 1.80 vs 1.94. Fewer bad habits: Ice Golem on
+    building-only targets 3% vs v2 6%. **Defense:** it takes 1.05 princess towers of damage per
+    game against v2, vs 1.31 at updates 20-219, for about the same dealt (1.31). Its pressure also
+    makes v2 leak less (15 s vs 57 s).
+  - **Real decks (General): no gain, a slight slide.** About 47% as v2 (pooled with pilot1's
+    start) -> ~41% now. Most matchups dipped, and the drop is concentrated in Miner / Graveyard /
+    Goblin and Skeleton Barrel decks (41% -> 32%; others 45% -> 43%). Biggest single drops (small
+    samples): Miner 58 -> 32%, Graveyard 56 -> 38%, Electro Giant 45 -> 33%, Mega Knight 25 -> 15%.
+    Hard matchups throughout: Mortar ~21%, Mega Knight, Goblin Giant, Skeleton Barrel, Royal
+    Giant ~30%, Lava ~30%. Good ones: Goblin Drill ~81%, other Hog decks ~65%.
+  - It plays ~15% fewer Logs against real decks too, as in the mirror. That costs little against
+    most decks; against the Log-dependent ones it plausibly does (not proven).
+  - Mirror games are ~81% of the training lanes (self-play gives 2 lanes a game).
+  - Throughput: a game is 66 s, of which 37 s is waiting for the inference server (the bottleneck).
+    ~10 games/min while running; 17 of the last 24 h ours.
+  - **What it says about continuing:**
+    1. The mirror is still improving but v2 is saturated as a yardstick (91%); keep hog2 and add a
+       frozen pilot3 snapshot (e.g. update 400) as the new fixed benchmark.
+    2. Real decks need their own training share: General's weight up (lanes there are 19%), and
+       more varied real-deck opponents than one model. The field-model plan (section 3), or
+       replayed human games as scripted opponents, are the options.
+    3. Watch losses against Graveyard / Miner decks (the recordings) before changing the reward.
+    4. The server wait is the cheapest speed-up: two inference servers.
 
 - **2026-09-29 evening (handoff from the cloud session)** pilot3 at 138 updates, 3,223 games. vs v2
   since learning: 301-210 (59%), flat since update ~20; KL to start flat ~0.006 since update ~70

@@ -7,6 +7,7 @@ let modelNames: [String: String] = [
     "fl:active-il": "FirstLight · Active imitation",
     "fl:general": "FirstLight · General",
     "clapha:v2": "Clapha · 2.6 Hog v2: no-delay distilled, pending cards, hero states",
+    "clapha:p3": "Clapha · 2.6 Hog p3: v2 after league RL (86% vs v2, 63% vs hog2)",
     "14k": "Own sim model · 14k",
     "40k": "Own sim model · 40k",
     "100k": "Own sim model · 100k",
@@ -89,6 +90,7 @@ struct TopBar: View {
     @ObservedObject var device2: DeviceModel
     @Binding var showTools: Bool
     @Binding var overlayOn: Bool
+    @Environment(\.openWindow) private var openWindow
 
     private func tab(_ device: DeviceModel) -> String {
         device.summary.inBattle ? "\(device.title) · in battle" : device.title
@@ -107,6 +109,8 @@ struct TopBar: View {
             Toggle(isOn: $overlayOn) { Label("Overlay on MuMu", systemImage: "circle.dashed") }
                 .toggleStyle(.button)
                 .help("Draws cards that are played but not landed yet on top of the MuMu window. Click-through.")
+            Button { openWindow(id: "games") } label: { Label("Training games", systemImage: "film") }
+                .help("Watch whole games the RL training recorded on the PC (model vs model).")
             Spacer()
             Button {
                 tasks.run("Start emulators and bot", "./start-consoles.sh")

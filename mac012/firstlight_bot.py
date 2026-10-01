@@ -67,6 +67,9 @@ CHECKPOINTS = {
     # Engine duels 2026-09-27: 15-5 vs the previous one (distill-t0-1520: 17-3 vs live fl:hog2),
     # 8-12 vs fl:hog2 playing with no delay at all
     'clapha:v2': HERE.parent / 'runs/pc/distill-v2-final.pt',
+    # v2 after league RL on the PC (il/rl_learn.py, pilot3): copy its newest policy-NNNN.pt here.
+    # The copy here is update 520. Engine league 2026-10-01 at ~470: 86% vs v2, 63% vs no-delay hog2, 42% vs General
+    'clapha:p3': HERE.parent / 'runs/pc/pilot3.pt',
 }
 
 
