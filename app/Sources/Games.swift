@@ -130,7 +130,8 @@ struct TrainingGamesView: View {
     }
 
     private static let opponents: [(String, String)] = [
-        ("all", "Everyone"), ("anchor", "The anchor: v2, or ex1's frozen pilot3"), ("hog2", "hog2, no delay"),
+        ("all", "Everyone"), ("firstlight", "FirstLight at full strength"),
+        ("anchor", "The anchor: v2, or ex1's frozen pilot3"), ("hog2", "hog2, no delay"),
         ("general", "General, real decks"), ("self", "Itself"), ("snap", "Its snapshots"),
     ]
 

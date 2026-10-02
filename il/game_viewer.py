@@ -46,6 +46,9 @@ def _version(played: dict) -> int:
 
 def _opponent(played: dict) -> str:
     who = str(played.get('b', ''))
+    if played.get('league') == 'firstlight':          # il/vs_firstlight: its own loop, inputs and timing
+        return {'fl:hog2': 'FirstLight hog2', 'fl:hog1': 'FirstLight hog1',
+                'fl:general': 'FirstLight General'}.get(who, who) + ' (full strength)'
     if who == 'fl:general':
         return 'General'
     if who == 'fl:hog2':

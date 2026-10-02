@@ -115,12 +115,19 @@ def build_replay(path: Path):
     setup = setup_of(header, first)
     timeline = header['timeline']
     owner0, owner1 = names(header)
+    exact = header.get('play_xy') or {}     # il/vs_firstlight: FirstLight's points inside a tile
     groups: dict[int, list] = {}
     for index, play in enumerate(sorted(timeline['plays'], key=lambda p: (int(p['lands']), int(p.get('index', 0))))):
         owner, start = int(play['owner']), int(play['lands'])     # lands = the tick before it executes
         if play.get('kind', 'card') == 'card':
+            subcell = (0.0, 0.0)
+            point = exact.get(str(play.get('index')))
+            if point:
+                from native_runner.arena import cell_to_world
+                centre = cell_to_world(tuple(play['grid']))
+                subcell = ((int(point[0]) - centre[0]) / 1000.0, (int(point[1]) - centre[1]) / 1000.0)
             action = ActionV1(owner=owner, kind=ActionKind.PLAY_CARD, hand_slot=0, card_id=int(play['card_id']),
-                              target_kind=TargetKind.GRID, target_grid=tuple(play['grid']), subcell_offset=(0.0, 0.0),
+                              target_kind=TargetKind.GRID, target_grid=tuple(play['grid']), subcell_offset=subcell,
                               execute_offset_ticks=1, action_id=f'{timeline["replay_tag"]}-{index}')
         else:
             action = ActionV1(owner=owner, kind=ActionKind.ACTIVATE_ABILITY, source_entity=0, execute_offset_ticks=1,
