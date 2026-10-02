@@ -457,6 +457,7 @@ def collect_remote(args) -> int:
         if result.get('timing'):
             # the decide time split: waiting for the server's answer vs our own tensorize / decode
             result['timing']['wait'] = round(WAITED[0], 2)
+        result['config'] = config
         try:
             row = _finish_game(args, out, run, index, kind, tag, opponent_key, opponent_delay, learner_side, learner,
                                opponent, result, started)
@@ -472,6 +473,18 @@ def collect_remote(args) -> int:
         print(json.dumps({k: row[k] for k in ('game', 'league', 'learner_won', 'crowns', 'seconds')}
                          | {'return': row['sides']['learner']['return']}), flush=True)
     return 0
+
+
+def battle_setup(config) -> dict | None:
+    """A game's whole battle setup (its MatchConfig), kept with its recording so it can be played
+    again exactly in Null's (il/watch_nulls.py)."""
+    if config is None:
+        return None
+    keys = ('deck0', 'deck1', 'deck0_form_availability', 'deck1_form_availability', 'tower_troop0_id',
+            'tower_troop1_id', 'seed', 'game_mode', 'arena', 'location', 'level_cap', 'minimum_card_level',
+            'king_tower_level')
+    return {key: list(value) if isinstance(value, tuple) else value
+            for key in keys if (value := getattr(config, key, None)) is not None}
 
 
 def _finish_game(args, out: Path, run: Path, index: int, kind: str, tag: str, opponent_key: str, opponent_delay: str,
@@ -510,7 +523,8 @@ def _finish_game(args, out: Path, run: Path, index: int, kind: str, tag: str, op
         # an occasional whole game for watching (il.duel's recording format; the viewer reads it)
         header = dict(recording['header'])
         header['played'] = {'a': f'latest v{learner.version}', 'b': opponent_key, 'a_side': learner_side,
-                            'league': kind, 'result': 'a' if row['learner_won'] else ('b' if winner in (0, 1) else 'draw')}
+                            'league': kind, 'result': 'a' if row['learner_won'] else ('b' if winner in (0, 1) else 'draw'),
+                            'run': run.name, 'config': battle_setup(result.get('config'))}
         save_recorded(run / 'recordings', header, frames)
     with (out / 'games.jsonl').open('a') as handle:
         handle.write(json.dumps(row) + '\n')

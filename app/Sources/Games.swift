@@ -4,7 +4,9 @@ import SwiftUI
 //
 // The data is il/game_viewer.py's (`--json runs/viewer/games.json`): per game every snapshot
 // (half a second apart) with the board, both players' elixir and hands, and every play. The
-// learner is always at the bottom. Reload rebuilds the file from the newest recordings.
+// learner is always at the bottom. Reload rebuilds the file from the newest recordings; Import
+// brings games over from the PC (il/recordings.py: pack-recordings.cmd's zip, folders, files);
+// Watch in Null's plays one again in the real game on CR_4k (Nulls.swift, il/watch_nulls.py).
 
 struct GameFile: Decodable {
     let labels: [String]
@@ -30,6 +32,8 @@ struct GameFrame: Decodable {
 struct TrainingGame: Decodable, Identifiable {
     let tag: String
     let league: String
+    let run: String?         // runs/rl/<run>
+    let path: String?        // the recording, for Watch in Null's
     let title: String
     let result: String
     let sub: String
@@ -105,7 +109,9 @@ func gameClock(_ tick: Double) -> String {
 struct TrainingGamesView: View {
     @StateObject private var model: GamesModel
     @StateObject private var builder = TaskRunner(root: claphaRoot())
+    @StateObject private var nulls = NullsPlayer(root: claphaRoot())
     @State private var selection: String?
+    @State private var run = "all"
     @State private var opponent = "all"
     @State private var outcome = "all"
     @State private var tick: Double = 0
@@ -125,11 +131,27 @@ struct TrainingGamesView: View {
         ("general", "General, real decks"), ("self", "Itself"), ("snap", "Its snapshots"),
     ]
 
+    private static let reload = "./py -m il.game_viewer runs/rl --max 80 --json runs/viewer/games.json"
+
+    private var runs: [String] { Array(Set((model.file?.games ?? []).map { $0.run ?? "other" })).sorted() }
+
     private var shown: [TrainingGame] {
         (model.file?.games ?? []).filter { game in
-            (opponent == "all" || game.league == opponent)
+            (run == "all" || (game.run ?? "other") == run)
+                && (opponent == "all" || game.league == opponent)
                 && (outcome == "all" || game.result.hasPrefix(outcome))
         }
+    }
+
+    private func importRecordings(_ urls: [URL]) {
+        guard !urls.isEmpty, !builder.running else { return }
+        guard let inbox = stageForImport(urls, root: claphaRoot()) else {
+            builder.output = "Could not copy what was picked into runs/inbox."
+            return
+        }
+        let relative = "runs/inbox/" + inbox.lastPathComponent
+        builder.run("Import training games",
+                    "./py -m il.recordings import \(relative.shellQuoted) --remove && \(Self.reload)")
     }
     private var current: TrainingGame? { shown.first { $0.id == selection } ?? shown.first }
 
@@ -138,8 +160,12 @@ struct TrainingGamesView: View {
             sidebar.frame(width: 290)
             Divider()
             if let game = current, let labels = model.file?.labels {
-                GamePlayer(game: game, labels: labels, tick: $tick, playing: $playing, speed: $speed)
-                    .padding(14)
+                VStack(alignment: .leading, spacing: 10) {
+                    GamePlayer(game: game, labels: labels, tick: $tick, playing: $playing, speed: $speed)
+                    Divider()
+                    NullsBar(nulls: nulls, game: game)
+                }
+                .padding(14)
             } else {
                 VStack(spacing: 8) {
                     Image(systemName: "film").font(.largeTitle).foregroundStyle(.secondary)
@@ -154,6 +180,16 @@ struct TrainingGamesView: View {
             if tick >= Double(game.end) { playing = false }
         }
         .onAppear { if model.file == nil { model.load() } }
+        .onChange(of: nulls.tick) { _, value in
+            // the board follows the game playing in Null's
+            guard let value, nulls.gameTag == current?.id, nulls.active else { return }
+            playing = false
+            tick = Double(value)
+        }
+        .dropDestination(for: URL.self) { urls, _ in
+            importRecordings(urls)
+            return !urls.isEmpty
+        }
         .onChange(of: current?.id) { _, _ in
             playing = false
             tick = Double(current?.start ?? 0)
@@ -170,11 +206,19 @@ struct TrainingGamesView: View {
                 Spacer()
                 if builder.running { ProgressView().controlSize(.small) }
                 Button {
-                    builder.run("Load training games",
-                                "./py -m il.game_viewer runs/rl ~/recordings --max 80 --json runs/viewer/games.json")
+                    builder.run("Load training games", Self.reload)
                 } label: { Label("Reload", systemImage: "arrow.clockwise") }
                     .disabled(builder.running)
-                    .help("Reads the newest recorded games (runs/rl/*/recordings, and ~/recordings while a copy sits there).")
+                    .help("Reads each run's newest recorded games (runs/rl/*/recordings).")
+                Button { importRecordings(pickRecordings()) } label: { Label("Import", systemImage: "square.and.arrow.down") }
+                    .disabled(builder.running)
+                    .help("Adds games from the PC: pick clapha-recordings.zip (made by pack-recordings.cmd), or folders and recordings. You can also drop them on this window.")
+            }
+            if runs.count > 1 {
+                Picker("Run", selection: $run) {
+                    Text("All runs").tag("all")
+                    ForEach(runs, id: \.self) { Text($0).tag($0) }
+                }
             }
             Picker("Opponent", selection: $opponent) {
                 ForEach(Self.opponents, id: \.0) { Text($0.1).tag($0.0) }
@@ -200,8 +244,11 @@ struct TrainingGamesView: View {
                 .listStyle(.sidebar)
             }
             if builder.lastExit.map({ $0 != 0 }) == true {
-                Text("Reload failed:\n" + String(builder.output.suffix(300)))
+                Text("\(builder.title) failed:\n" + String(builder.output.suffix(300)))
                     .font(.caption2.monospaced()).foregroundStyle(.red)
+            } else if builder.title == "Import training games", !builder.running,
+                      let line = builder.output.split(separator: "\n").last(where: { $0.hasPrefix("imported") }) {
+                Text(line).font(.caption).foregroundStyle(.secondary)
             }
         }
         .padding(12)

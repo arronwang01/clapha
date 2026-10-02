@@ -233,9 +233,23 @@ Per run folder `runs/rl/<run>/` on the PC:
 - `learn.jsonl`: one row per update: losses, entropy, KL to the start, clip fraction, value error,
   mean return, wins in the batch.
 - `policy-NNNN.pt` every 10 updates, `latest.pt`; logs per process (rewritten at each start).
-- `recordings/`: one whole game in 50 (il.duel's format). **Watch them in the Clapha app:** Training
-  games in the top bar (app/Sources/Games.swift; its Reload runs `il/game_viewer.py --json`). Copy a
-  run's recordings folder from the PC into runs/rl/<run>/ first.
+- `recordings/`: one whole game in 50 (il.duel's format; since 2026-10-02 each also keeps its run and
+  its whole battle setup, played.run / played.config). **Watching them:**
+  1. PC: `pack-recordings.cmd` (clapha-train) puts every game not packed before, all runs, into one
+     zip, clapha-recordings.zip (`--all`: everything again). Transfer that one file with ToDesk.
+  2. Mac: Clapha -> Training games -> **Import** (or drop the zip / a folder on the window):
+     il/recordings.py files each game under runs/rl/<run>/recordings, skips games already there and
+     reports files cut short in transfer.
+  3. The window shows each run's newest 80 (Run picker), the board in 2D (app/Sources/Games.swift,
+     il/game_viewer.py). **Watch in Null's** plays the selected game again in the real game on
+     CR_4k (il/watch_nulls.py with FirstLight's replay player: pause, 0.25-4x, 5 s back; the 2D
+     board follows it). Every training deal uses FirstLight's fixed deal seed, so the decks' slot
+     order is the deal; levels and tower troops come from played.config, or for older games from
+     the towers' full health (all 27,660 sides of runs/conv-hog26 map one-to-one). The engine's
+     deal is checked against the recording before the first card. The power button shuts CR_4k
+     down (it costs ~85% CPU) before playing live.
+  FirstLight's own console (Human vs Model, its AI with no delay): Clapha -> More, or
+  `tools/play_firstlight.sh --no-delay`.
 - `status.txt` (every 10 min), `turns.log` (a line per minute, every keeper action), `launch.log`,
   `engines.log` (what the start and engine scripts printed).
 - Behaviour metrics per checkpoint (il/habits.py and the activation check): Log targets, Ice Golem

@@ -91,6 +91,8 @@ struct TopBar: View {
     @Binding var showTools: Bool
     @Binding var overlayOn: Bool
     @Environment(\.openWindow) private var openWindow
+    // FirstLight's own console (Human vs Model) on CR_4k: tools/play_firstlight.sh
+    @StateObject private var firstlight = TaskRunner(root: claphaRoot())
 
     private func tab(_ device: DeviceModel) -> String {
         device.summary.inBattle ? "\(device.title) · in battle" : device.title
@@ -124,6 +126,18 @@ struct TopBar: View {
                 }
                 Button("Check devices") {
                     tasks.run("Check devices", "CR_MUMU_SERIAL=127.0.0.1:26624 ./py mac012/preflight.py 127.0.0.1:26624 127.0.0.1:26656")
+                }
+                Divider()
+                Button(firstlight.running ? "FirstLight's console is open (CR_4k)" : "FirstLight's console: play its AI, no delay") {
+                    firstlight.run("FirstLight console", "set -o pipefail; tools/play_firstlight.sh --no-delay 2>&1 | tee build/firstlight.log")
+                }
+                .disabled(firstlight.running)
+                Button("FirstLight's console: its AI with the live delay") {
+                    firstlight.run("FirstLight console", "set -o pipefail; tools/play_firstlight.sh 2>&1 | tee build/firstlight.log")
+                }
+                .disabled(firstlight.running)
+                if firstlight.lastExit.map({ $0 != 0 }) == true {
+                    Text("FirstLight's console failed: build/firstlight.log")
                 }
                 Divider()
                 Toggle("Show tools and output", isOn: $showTools)

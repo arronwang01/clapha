@@ -8,7 +8,9 @@ bottom.
         [--out runs/viewer/pilot3.html]
 
 The Clapha app's "Training games" window shows the same games natively: its Reload runs this with
---json runs/viewer/games.json (the data alone) and reads that file.
+--json runs/viewer/games.json (the data alone) and reads that file. --max is per run (the folder
+under runs/rl); each game carries its run and its recording's path (for Watch in Null's,
+il/watch_nulls.py).
 """
 from __future__ import annotations
 
@@ -58,6 +60,15 @@ def _opponent(played: dict) -> str:
     if 'ex1-target' in who:
         return 'frozen pilot3 (ex1\'s target)'
     return Path(who.replace('\\', '/')).stem or who
+
+
+def run_of(path: Path) -> str:
+    """The run a recording belongs to: runs/rl/<run>/recordings/..."""
+    parts = path.resolve().parts
+    for i, part in enumerate(parts[:-2]):
+        if part == 'rl':
+            return parts[i + 1]
+    return 'other'
 
 
 def game(path: Path, label, name, every: int) -> dict:
@@ -138,6 +149,7 @@ def game(path: Path, label, name, every: int) -> dict:
             crowns[0 if result == 'won' else 1] += 1
     score = f'{crowns[0]}-{crowns[1]}' + (' on tower health' if crowns[0] == crowns[1] and result != 'draw' else '')
     return {'tag': header.get('replay_tag') or path.stem, 'league': played.get('league', ''),
+            'run': run_of(path), 'path': str(path.resolve()),
             'title': f'update {_version(played)} vs {opponent}', 'result': f'{result} {score}',
             'sub': f"{played.get('league', '')} game · {clock(out[-1][0]) if out else ''}",
             'learner': f'learner (update {_version(played)})', 'opponent': opponent, 'decks': decks,
@@ -157,7 +169,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument('paths', nargs='+', type=Path, help='recordings folders or files')
     parser.add_argument('--league', help='only these games: self, snap, anchor, hog2, general')
     parser.add_argument('--result', choices=('won', 'lost'), help="only the learner's wins or losses")
-    parser.add_argument('--max', type=int, default=40, help='the newest N games')
+    parser.add_argument('--max', type=int, default=40, help="each run's newest N games")
     parser.add_argument('--every', type=int, default=10, help='ticks between snapshots (motion is smoothed between)')
     parser.add_argument('--out', type=Path, default=CLAPHA / 'runs' / 'viewer' / 'games.html')
     parser.add_argument('--json', type=Path, help='write the data alone here (for the app) instead of a page')
@@ -176,7 +188,10 @@ def main(argv: list[str]) -> int:
         if args.result and {'a': 'won', 'b': 'lost'}.get(played.get('result')) != args.result:
             continue
         chosen.append((_version(played), path))
-    chosen = [path for _version_, path in sorted(chosen, reverse=True)[:args.max]]
+    by_run: dict[str, list] = {}
+    for version, path in chosen:
+        by_run.setdefault(run_of(path), []).append((version, path))
+    chosen = [path for run in sorted(by_run) for _version_, path in sorted(by_run[run], reverse=True)[:args.max]]
     labels: list[str] = []
     index: dict[str, int] = {}
 
