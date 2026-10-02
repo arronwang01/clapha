@@ -53,7 +53,11 @@ def _opponent(played: dict) -> str:
     if 'distill-v2' in who:
         return 'v2 (the start)'
     match = re.search(r'policy-(\d+)', who)
-    return f'snapshot {int(match.group(1))}' if match else who
+    if match:
+        return f'snapshot {int(match.group(1))}'
+    if 'ex1-target' in who:
+        return 'frozen pilot3 (ex1\'s target)'
+    return Path(who.replace('\\', '/')).stem or who
 
 
 def game(path: Path, label, name, every: int) -> dict:
