@@ -240,6 +240,16 @@ struct DevicePanel: View {
                 .font(.callout.monospaced())
                 .lineLimit(2)
                 .foregroundStyle(sum.botStatus.contains("FAIL") ? .red : .primary)
+            if !sum.deckWarning.isEmpty {
+                Label(sum.deckWarning, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption).foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let note = codeNote {
+                Label(note, systemImage: "arrow.clockwise.circle")
+                    .font(.caption).foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             // The scope gate only needs attention when it blocks.
             if let gate = sum.gate, !gate.isEmpty, sum.gateOk == false {
                 Label(gate, systemImage: "lock").font(.caption).foregroundStyle(.red)
@@ -253,6 +263,17 @@ struct DevicePanel: View {
             .font(.caption)
             .frame(maxWidth: 360, alignment: .leading)
         }
+    }
+
+    /// The console runs older code than what is on disk: it loads it only when Start restarts it.
+    private var codeNote: String? {
+        guard sum.reachable else { return nil }
+        guard let changed = sum.codeChanged else {
+            return "This console started before the app's last update: press Start between battles to restart it."
+        }
+        guard !changed.isEmpty else { return nil }
+        let names = changed.prefix(3).map { ($0 as NSString).lastPathComponent }.joined(separator: ", ")
+        return "Updated since this console started (\(names)\(changed.count > 3 ? ", …" : "")): press Start between battles to load it."
     }
 
     /// FirstLight models first, then ours (il/train.py); the old simulator models only if

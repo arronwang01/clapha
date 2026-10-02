@@ -64,6 +64,8 @@ struct BotInfo: Decodable {
     let readerError: String?
     let gate: String?
     let gateOk: Bool?
+    let deckWarning: String?
+    let codeChanged: [String]?      // nil: the console predates this report, so it is older than the app
     let decoding: String?
     let decodingUsed: String?
 }
@@ -111,6 +113,8 @@ struct DeviceSummary: Equatable {
     var readerError: String?
     var gate: String?
     var gateOk: Bool?
+    var deckWarning = ""
+    var codeChanged: [String]?
     var botStatus = "engine not running"
     var decoding = "auto"
     var decodingUsed: String?
@@ -205,6 +209,8 @@ final class DeviceModel: ObservableObject, Identifiable {
             next.readerError = s.bot.readerError
             next.gate = s.bot.gate
             next.gateOk = s.bot.gateOk
+            next.deckWarning = s.bot.deckWarning ?? ""
+            next.codeChanged = s.bot.codeChanged
             next.botStatus = s.bot.status
             next.decoding = s.bot.decoding ?? "auto"
             next.decodingUsed = s.bot.decodingUsed

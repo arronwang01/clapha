@@ -58,8 +58,60 @@ TARGET_DELAY = int(os.environ.get('CR_TARGET_DELAY', '26'))
 # not 1 in 10, while near-ties still vary.
 STEADY_ACTION_TEMPERATURE = 0.3
 
+STARTED = time.time()
+_CODE_CHECK = {'at': 0.0, 'changed': []}
+
+
+def code_changed() -> list[str]:
+    """This console's own source files (ours and FirstLight's) changed since it started: it runs
+    the old code until Start restarts it, and the app says so. Checked at most every 5 s."""
+    now = time.time()
+    if now - _CODE_CHECK['at'] < 5:
+        return _CODE_CHECK['changed']
+    _CODE_CHECK['at'] = now
+    roots = [Path(__file__).resolve().parents[1], Path(FLB.FIRSTLIGHT).resolve()]
+    try:
+        modules = list(sys.modules.values())
+    except RuntimeError:            # a module being imported meanwhile: next time
+        return _CODE_CHECK['changed']
+    changed = []
+    for module in modules:
+        name = getattr(module, '__file__', None)
+        if not isinstance(name, str) or not name.endswith('.py'):
+            continue
+        path = Path(name).resolve()
+        root = next((r for r in roots if path.is_relative_to(r)), None)
+        try:
+            if root is not None and path.stat().st_mtime > STARTED:
+                changed.append(str(path.relative_to(root)))
+        except OSError:
+            continue
+    _CODE_CHECK['changed'] = sorted(changed)
+    return _CODE_CHECK['changed']
+
+
+# The user's choices that outlive a restart (Start): only the decoding preference.
+SETTINGS_FILE = Path(__file__).resolve().parents[1] / 'build' / f'console_settings_{PORT}.json'
+
+
+def load_settings() -> dict:
+    try:
+        return json.loads(SETTINGS_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(**values) -> None:
+    try:
+        SETTINGS_FILE.write_text(json.dumps(load_settings() | values))
+    except OSError:
+        pass
+
+
 # The deck the Hog 2.6 specialists trained on (FirstLight checkpoints/README.md), with the
-# forms their interface sets explicitly: 1 = evolution, 2 = hero.
+# forms their interface sets explicitly: 1 = evolution, 2 = hero. Our models (clapha:*) were
+# trained holding the same eight cards (il/train.py, il/rl.py: the learner is always the Hog 2.6
+# side), mostly with these forms.
 HOG26_DECK = {26000021: 0,   # Hog Rider
               26000014: 2,   # Musketeer (hero)
               27000000: 1,   # Cannon (evolution)
@@ -223,8 +275,9 @@ class Bot:
         self.layout = None
         self.gate = 'unchecked'
         self.gate_ok = False
-        self.decoding = 'auto'          # auto | sampled | steady | greedy
+        self.decoding = load_settings().get('decoding', 'auto')    # auto | sampled | steady | greedy
         self.decoding_used = None
+        self.deck_warning = ''          # the deck is not the one the model was trained on
         self.tracker = None
         self.opp_deck = None
         self.seen_plays = 0
@@ -273,6 +326,7 @@ class Bot:
             return f'unknown model {model}'
         self.model, self.armed, self.plays = model, armed, 0
         self.running = True
+        self.deck_warning = ''
         self.status = f'{model}: loading'
         self.log = []
         self.thread = threading.Thread(target=self._run, daemon=True)
@@ -752,22 +806,28 @@ class Bot:
             pass
 
     def _check_deck_fit(self, deck, forms) -> None:
-        """The Hog specialists were trained on one deck with fixed forms. Say so when the
-        deck differs: out of that deck they are a different, weaker model."""
-        if self.model not in ('fl:hog1', 'fl:hog2'):
+        """The Hog specialists and our models were trained holding one deck. Say so when this
+        deck differs: out of it they are a different, weaker model (the user, 2026-10-02: The Log
+        swapped for Arrows made ours much weaker in the 2.6 mirror). A card that differs shows in
+        the app (deck_warning); forms not equipped only in the log."""
+        self.deck_warning = ''
+        if self.model not in ('fl:hog1', 'fl:hog2') and not str(self.model).startswith('clapha:'):
             return
         flags = {int(c): int(f or 0) for c, f in zip(deck or [], forms or [0] * 8)}
-        missing = [V.CARDS.get(c, {}).get('name', c) for c in HOG26_DECK if c not in flags]
-        wrong_form = [V.CARDS.get(c, {}).get('name', c) for c, form in HOG26_DECK.items()
-                      if c in flags and form and not flags[c] & form]
-        if missing or wrong_form:
-            self.note('DECK MISMATCH for the Hog specialist - trained on Hog, Hero Musketeer, '
-                      'Evo Cannon, Fireball, Log, Evo Skeletons, Ice Golem, Ice Spirit. '
-                      + (f'missing: {", ".join(map(str, missing))}. ' if missing else '')
-                      + (f'form not equipped: {", ".join(map(str, wrong_form))}.'
-                         if wrong_form else ''))
-        else:
-            self.note('deck matches the Hog specialist training deck')
+
+        def name(card):
+            return str(V.CARDS.get(card, {}).get('name', card))
+        missing = [name(c) for c in HOG26_DECK if c not in flags]
+        extra = [name(c) for c in flags if c not in HOG26_DECK]
+        wrong_form = [name(c) for c, form in HOG26_DECK.items() if c in flags and form and not flags[c] & form]
+        if missing:
+            self.deck_warning = (f'Not the deck {self.model} was trained on: {", ".join(extra) or "?"} in place of '
+                                 f'{", ".join(missing)}. Expect much weaker play.')
+            self.note('DECK MISMATCH - ' + self.deck_warning)
+        if wrong_form:
+            self.note(f'forms not equipped (trained mostly with them): {", ".join(wrong_form)}')
+        if not missing and not wrong_form:
+            self.note(f'deck matches the deck {self.model} was trained on')
 
     def _hand_position(self, hand_indices: list[int], deck_slot: int) -> int | None:
         return hand_indices.index(deck_slot) if deck_slot in hand_indices else None
@@ -1301,6 +1361,7 @@ class Handler(BaseHTTPRequestHandler):
             value = (parse_qs(route.query).get('value') or [''])[0]
             if value in ('auto', 'sampled', 'steady', 'greedy'):
                 BOT.decoding = value
+                save_settings(decoding=value)
                 BOT.note(f'decoding preference -> {value} (applies from the next battle)')
                 result = 'ok'
             else:
@@ -1328,6 +1389,7 @@ class Handler(BaseHTTPRequestHandler):
                    'mode': ('off' if not BOT.running else 'play' if BOT.armed else 'watch'),
                    'serial': SERIAL, 'port': PORT,
                    'decoding': BOT.decoding, 'decoding_used': BOT.decoding_used,
+                   'deck_warning': BOT.deck_warning, 'code_changed': code_changed(),
                    'gate': BOT.gate, 'gate_ok': BOT.gate_ok, 'deduced': BOT.deduced,
                    'reader_error': reader_error}
             if frame and health and frame.get('battle_active'):

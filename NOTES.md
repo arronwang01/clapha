@@ -1749,3 +1749,14 @@ Details: TRAINING.md journal.
   card-and-tile pick at temperature 1.0 (gate 0.2, continue 5.0), so a 10%-likely tile is played one
   time in ten. Console decoding **Steady** (mac012/console.py STEADY_ACTION_TEMPERATURE 0.3): when to
   act as trained, card and tile sharpened. Trade-off: fewer random misplacements, more predictable.
+- **The user's live weakness was the deck: Arrows in place of The Log** (the user, 2026-10-02 evening:
+  with The Log back, "the real 2.6 deck", the model plays mostly fine). Every model we have holds the
+  Hog 2.6 eight in training (il/train.py, il/rl.py: the learner is always the Hog 2.6 side), as the
+  specialists do; one card out of it makes a much weaker model. The console's deck check covered
+  only fl:hog1/hog2 and only wrote to the log: it now covers clapha:* too, and a card that differs
+  shows in the app as a warning (bot.deck_warning); forms not equipped stay a log line.
+- **"I can't choose Steady": the consoles were a day old.** They had run since 2026-10-01 and refused
+  'steady' as unknown, which the app showed as nothing happening. Each console now reports its own
+  source files changed since it started (bot.code_changed, ours and FirstLight's), and the app says
+  "press Start between battles" when there are any (or when a console is too old to report it). The
+  decoding preference now survives a restart (build/console_settings_<port>.json).
