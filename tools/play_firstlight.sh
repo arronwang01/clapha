@@ -69,11 +69,20 @@ echo "FirstLight's original probe installed."
 # its console preselects the newest checkpoint: make that the Hog 2.6 specialist 2 (fl:hog2, the stronger
 # one in model-vs-model play); both decks already default to the Hog 2.6 mirror (interface_mac presets)
 touch "$HOME/Documents/GitHub/FirstLight_CR/checkpoints/2_6hog_expert/hog26-specialist2.pt"
+# His hit boxes (the overlay's and the probe's) are measured on a 1080x1920 surface, and at CR_4k's
+# 1080x2400 the game lays itself out differently: every card pick and placement lands wrong. So the
+# game runs at 1080x1920 for the console (Null's starts after this, it was force-stopped above; the
+# overlay finds the centred picture), and the panel goes back to its own size when the console closes.
+a shell wm size 1080x1920
+trap 'a shell wm size reset >/dev/null 2>&1 || true' EXIT
+if pgrep -f "MuMu Android Device" >/dev/null; then
+  echo "note: MuMu is running too (~65% CPU); close it for a smoother game"
+fi
 cd "$PORT_DIR"
 if [ "$no_delay" = 1 ]; then
   echo "opening FirstLight's interface: NO-DELAY AI (cards land 1 tick after it decides)"
-  CR_AI_NO_DELAY=1 exec "$PY" interface_mac.py
+  CR_AI_NO_DELAY=1 "$PY" interface_mac.py
 else
   echo "opening FirstLight's interface: realistic AI (cards land ~21-25 ticks after it decides)"
-  exec "$PY" interface_mac.py
+  "$PY" interface_mac.py
 fi
