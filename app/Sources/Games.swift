@@ -117,7 +117,10 @@ struct TrainingGamesView: View {
     @State private var tick: Double = 0
     @State private var playing = false
     @State private var speed: Double = 2
+    @State private var arrived: URL?          // a zip from the PC not imported yet (newFromPC)
+    @State private var importing: URL?
     private let timer = Timer.publish(every: 1.0 / 30.0, on: .main, in: .common).autoconnect()
+    private let look = Timer.publish(every: 5, on: .main, in: .common).autoconnect()
 
     @MainActor
     init(model: GamesModel? = nil, selection: String? = nil, tick: Double = 0) {
@@ -143,8 +146,34 @@ struct TrainingGamesView: View {
         }
     }
 
+    /// pack-recordings.cmd's zip where ToDesk puts files (its last folder, ~/crtrain-stage/engine) or
+    /// in the home folder, newer than the last one imported and done arriving (5 s unchanged).
+    private func newFromPC() -> URL? {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let places = ["crtrain-stage/engine", "crtrain-stage", ""].map { home.appendingPathComponent($0) }
+        var newest: (URL, Date)?
+        for place in places {
+            let names = (try? FileManager.default.contentsOfDirectory(atPath: place.path)) ?? []
+            for name in names where name.hasPrefix("clapha-recordings") && name.hasSuffix(".zip") {
+                let url = place.appendingPathComponent(name)
+                guard let date = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date,
+                      Date().timeIntervalSince(date) > 5 else { continue }
+                if newest == nil || date > newest!.1 { newest = (url, date) }
+            }
+        }
+        guard let (url, date) = newest else { return nil }
+        let done = UserDefaults.standard.string(forKey: "importedFromPC") ?? ""
+        return done == "\(url.path)|\(date.timeIntervalSince1970)" ? nil : url
+    }
+
+    private func markImported(_ url: URL) {
+        guard let date = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date else { return }
+        UserDefaults.standard.set("\(url.path)|\(date.timeIntervalSince1970)", forKey: "importedFromPC")
+    }
+
     private func importRecordings(_ urls: [URL]) {
         guard !urls.isEmpty, !builder.running else { return }
+        importing = urls.count == 1 && urls[0] == arrived ? arrived : nil
         guard let inbox = stageForImport(urls, root: claphaRoot()) else {
             builder.output = "Could not copy what was picked into runs/inbox."
             return
@@ -179,7 +208,11 @@ struct TrainingGamesView: View {
             tick = min(Double(game.end), tick + speed * 20 / 30)
             if tick >= Double(game.end) { playing = false }
         }
-        .onAppear { if model.file == nil { model.load() } }
+        .onAppear {
+            if model.file == nil { model.load() }
+            arrived = newFromPC()
+        }
+        .onReceive(look) { _ in if !builder.running { arrived = newFromPC() } }
         .dropDestination(for: URL.self) { urls, _ in
             importRecordings(urls)
             return !urls.isEmpty
@@ -189,7 +222,13 @@ struct TrainingGamesView: View {
             tick = Double(current?.start ?? 0)
         }
         .onChange(of: builder.running) { _, running in
-            if !running && builder.lastExit == 0 { model.load() }
+            guard !running else { return }
+            if builder.lastExit == 0 {
+                model.load()
+                if let url = importing { markImported(url) }
+            }
+            importing = nil
+            arrived = newFromPC()
         }
     }
 
@@ -207,6 +246,14 @@ struct TrainingGamesView: View {
                 Button { importRecordings(pickRecordings()) } label: { Label("Import", systemImage: "square.and.arrow.down") }
                     .disabled(builder.running)
                     .help("Adds games from the PC: pick clapha-recordings.zip (made by pack-recordings.cmd), or folders and recordings. You can also drop them on this window.")
+            }
+            if let zip = arrived, !builder.running {
+                Button { importRecordings([zip]) } label: {
+                    Label("Import \(zip.lastPathComponent) from the PC", systemImage: "tray.and.arrow.down.fill")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .buttonStyle(.borderedProminent)
+                .help("A new zip from pack-recordings.cmd arrived in \(zip.deletingLastPathComponent().path).")
             }
             if runs.count > 1 {
                 Picker("Run", selection: $run) {

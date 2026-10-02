@@ -66,6 +66,9 @@ installed=$(a shell "sha256sum $LIB/libcrprobe.so" | cut -d' ' -f1)
 echo "FirstLight's original probe installed."
 [ "$install_only" = 1 ] && exit 0
 
+# its console preselects the newest checkpoint: make that the Hog 2.6 specialist 2 (fl:hog2, the stronger
+# one in model-vs-model play); both decks already default to the Hog 2.6 mirror (interface_mac presets)
+touch "$HOME/Documents/GitHub/FirstLight_CR/checkpoints/2_6hog_expert/hog26-specialist2.pt"
 cd "$PORT_DIR"
 if [ "$no_delay" = 1 ]; then
   echo "opening FirstLight's interface: NO-DELAY AI (cards land 1 tick after it decides)"
