@@ -415,7 +415,8 @@ def watch(path: Path, speed: float) -> int:
                 'shows the board without hands).'))
         if time.monotonic() - last_report >= 0.2:
             last_report = time.monotonic()
-            say(tick=tick, plays=checked, skipped=len(failed), explored=reached)
+            # the speed Null's itself reports, so the app shows what is really running
+            say(tick=tick, plays=checked, skipped=len(failed), explored=reached, engine_speed=status.get('speed'))
 
     errors = 0
     while True:

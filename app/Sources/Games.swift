@@ -192,7 +192,7 @@ struct TrainingGamesView: View {
                 VStack(alignment: .leading, spacing: 10) {
                     GamePlayer(game: game, labels: labels, tick: $tick, playing: $playing, speed: $speed, nulls: nulls)
                     Divider()
-                    NullsBar(nulls: nulls, game: game)
+                    NullsBar(nulls: nulls, game: game, speed: speed)
                 }
                 .padding(14)
             } else {
@@ -315,7 +315,6 @@ struct GamePlayer: View {
     @Binding var speed: Double
     @ObservedObject var nulls: NullsPlayer
     @State private var dragging = false
-    private static let nullsSpeeds: [Double] = [0.25, 0.5, 1, 2, 4]
 
     private func label(_ index: Int) -> String { labels.indices.contains(index) ? labels[index] : "?" }
 
@@ -365,20 +364,18 @@ struct GamePlayer: View {
                     dragging = editing
                     if !editing && linked { nulls.seek(Int(tick)) }
                 }
-                if linked {
-                    Picker("Speed", selection: Binding(get: { nulls.speed }, set: { nulls.setSpeed($0) })) {
-                        ForEach(Self.nullsSpeeds, id: \.self) { value in
-                            Text(value == value.rounded() ? "\(Int(value))×" : "\(value)×").tag(value)
-                        }
-                    }
-                    .labelsHidden().frame(width: 76)
-                    .help("Null's speed (its fastest is 4×).")
-                } else {
-                    Picker("Speed", selection: $speed) {
-                        Text("1×").tag(1.0); Text("2×").tag(2.0); Text("4×").tag(4.0); Text("8×").tag(8.0)
-                    }
-                    .labelsHidden().frame(width: 70)
+                // one click each (a pop-up menu loses its choice while the board redraws under it):
+                // the board's own speeds, or Null's while the game is up there (its fastest is 4x)
+                let speeds: [Double] = linked ? [0.25, 0.5, 1, 2, 4] : [0.25, 0.5, 1, 2, 4, 8]
+                Picker("Speed", selection: Binding(get: { linked ? nulls.speed : speed },
+                                                   set: { value in
+                                                       if linked { nulls.setSpeed(value) }
+                                                       speed = value
+                                                   })) {
+                    ForEach(speeds, id: \.self) { Text(speedText($0)).tag($0) }
                 }
+                .pickerStyle(.segmented).labelsHidden().fixedSize()
+                .help(linked ? "Null's speed (its fastest is 4×)." : "The board's speed.")
                 Text(gameClock(tick)).font(.callout.monospacedDigit()).frame(width: 64, alignment: .trailing)
             }
         }

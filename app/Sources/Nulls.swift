@@ -18,6 +18,7 @@ final class NullsPlayer: ObservableObject {
     @Published var of = 0
     @Published var skipped = 0
     @Published var speed: Double = 1
+    @Published var engineSpeed: Double?    // what Null's itself reports
     @Published var end: Int?
     @Published var explored = 0        // how far it has played: seeks up to here are near-instant
     @Published var seeking: Int?       // a far seek, running there at 4x
@@ -37,8 +38,11 @@ final class NullsPlayer: ObservableObject {
         running && gameTag == game.id && ["playing", "paused", "done"].contains(state)
     }
 
-    func watch(_ game: TrainingGame) {
+    /// Plays `game` in Null's, starting at `speed` (clamped to Null's 0.25-4x).
+    func watch(_ game: TrainingGame, speed start: Double) {
         guard let path = game.path, !running else { return }
+        speed = [0.25, 0.5, 1, 2, 4].last { $0 <= start } ?? 0.25
+        engineSpeed = nil
         gameTag = game.id
         state = "preparing"; message = "Starting…"; tick = nil; plays = 0; of = 0; skipped = 0; lastLog = ""
         end = nil; explored = 0; seeking = nil
@@ -143,6 +147,7 @@ final class NullsPlayer: ObservableObject {
             if let value = object["of"] as? Int { of = value }
             if let value = object["skipped"] as? Int { skipped = value }
             if let value = object["speed"] as? Double { speed = value }
+            if let value = object["engine_speed"] as? Double { engineSpeed = value }
             if let value = object["end"] as? Int { end = value }
             if let value = object["explored"] as? Int { explored = value }
             if object.keys.contains("seeking") { seeking = object["seeking"] as? Int }
@@ -155,6 +160,7 @@ final class NullsPlayer: ObservableObject {
 struct NullsBar: View {
     @ObservedObject var nulls: NullsPlayer
     let game: TrainingGame
+    let speed: Double                    // the board's speed: Null's starts at it
 
     private var mine: Bool { nulls.gameTag == game.id }
 
@@ -169,7 +175,7 @@ struct NullsBar: View {
                 Button(role: .destructive) { nulls.stop() } label: { Label("Stop", systemImage: "stop.fill") }
                     .help("Ends the game in Null's (CR_4k stays open for the next one).")
             } else {
-                Button { nulls.watch(game) } label: { Label("Watch in Null's", systemImage: "play.tv") }
+                Button { nulls.watch(game, speed: speed) } label: { Label("Watch in Null's", systemImage: "play.tv") }
                     .disabled(nulls.running || game.path == nil)
                     .help("Plays this game again in Null's Royale itself, on the CR_4k emulator (its window shows the game). Play, the progress bar and speed here then drive it.")
                 if mine || nulls.state == "closed" || (nulls.state == "failed" && nulls.gameTag == nil) {
@@ -194,10 +200,15 @@ struct NullsBar: View {
         if nulls.state == "playing" || nulls.state == "paused", let tick = nulls.tick {
             let cards = nulls.of > 0 ? " · card \(nulls.plays) of \(nulls.of)" : ""
             let skipped = nulls.skipped > 0 ? " · \(nulls.skipped) could not be played" : ""
-            return (nulls.state == "paused" ? "In Null's, paused at " : "In Null's: ") + gameClock(Double(tick)) + cards + skipped
+            let running = nulls.engineSpeed.map { " at \(speedText($0))" } ?? ""
+            return (nulls.state == "paused" ? "In Null's, paused at " : "In Null's\(running): ") + gameClock(Double(tick)) + cards + skipped
         }
         return nulls.message
     }
+}
+
+func speedText(_ value: Double) -> String {
+    value == value.rounded() ? "\(Int(value))×" : "\(value)×"
 }
 
 // MARK: - Import: games brought over from the PC
