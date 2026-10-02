@@ -53,6 +53,10 @@ DEFER_SECONDS = 0.8
 # 2026-09-26). 26 = the command's 20 + up to 6 ticks of our own reading, deciding and tapping; a
 # slower play lands late and is counted. The model is told this delay; training covered 23-27.
 TARGET_DELAY = int(os.environ.get('CR_TARGET_DELAY', '26'))
+# Decoding 'steady': the card-and-tile pick is sampled at this temperature instead of the trained 1.0
+# (when to act stays as trained, gate 0.2): a 60%-vs-10% tile choice goes the 10% way ~1 time in 400,
+# not 1 in 10, while near-ties still vary.
+STEADY_ACTION_TEMPERATURE = 0.3
 
 # The deck the Hog 2.6 specialists trained on (FirstLight checkpoints/README.md), with the
 # forms their interface sets explicitly: 1 = evolution, 2 = hero.
@@ -219,7 +223,7 @@ class Bot:
         self.layout = None
         self.gate = 'unchecked'
         self.gate_ok = False
-        self.decoding = 'auto'          # auto | sampled | greedy
+        self.decoding = 'auto'          # auto | sampled | steady | greedy
         self.decoding_used = None
         self.tracker = None
         self.opp_deck = None
@@ -330,9 +334,11 @@ class Bot:
         against a human or a bot their run_offline_match samples; a model against a model is
         their offline_duel, which decodes greedily. 'auto' tells them apart by asking the other
         console whether it is running a model against this one's account."""
-        if self.decoding in ('sampled', 'greedy'):
+        if self.decoding in ('sampled', 'steady', 'greedy'):
             choice = self.decoding
-            why = 'set by hand'
+            why = ('set by hand' if choice != 'steady' else
+                   f'set by hand: when to act sampled as trained, card and tile at temperature {STEADY_ACTION_TEMPERATURE} '
+                   '(as trained: 1.0, so a 10% tile was played one time in ten)')
         else:
             opponent = next((a['lo'] for a in (accounts or []) if a and a.get('side') == 1 - side), None)
             duel = False
@@ -358,7 +364,7 @@ class Bot:
                    'against a human or a bot: FirstLight\'s run_offline_match samples')
         self.decoding_used = choice
         self.note(f'decoding: {choice.upper()} - {why}')
-        return choice == 'sampled'
+        return choice in ('sampled', 'steady')
 
     def set_mode(self, mode: str, model: str | None) -> str:
         """One control instead of start/stop + an 'armed' box: off, watch (decides, never
@@ -883,6 +889,7 @@ class Bot:
                     # tracker-backed episode. Read, not assumed: a battle joined late does not
                     # start at five.
                     runner.sample = self._decide_sampling(accounts, side)
+                    runner.set_action_temperature(STEADY_ACTION_TEMPERATURE if self.decoding_used == 'steady' else None)
                     runner.start_battle(our_deck, opponent, side, observation,
                                         {p['side']: p['elixir_raw'] / 10000.0
                                          for p in frame['players']},
@@ -1292,7 +1299,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if route.path == '/api/decoding':
             value = (parse_qs(route.query).get('value') or [''])[0]
-            if value in ('auto', 'sampled', 'greedy'):
+            if value in ('auto', 'sampled', 'steady', 'greedy'):
                 BOT.decoding = value
                 BOT.note(f'decoding preference -> {value} (applies from the next battle)')
                 result = 'ok'

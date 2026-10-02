@@ -320,7 +320,7 @@ struct DecodingSwitch: View {
         HStack(spacing: 8) {
             Text("Decoding").font(.caption).foregroundStyle(.secondary)
             HStack(spacing: 0) {
-                ForEach([("auto", "Auto"), ("sampled", "Sampled"), ("greedy", "Greedy")], id: \.0) { option in
+                ForEach([("auto", "Auto"), ("sampled", "Sampled"), ("steady", "Steady"), ("greedy", "Greedy")], id: \.0) { option in
                     let selected = value == option.0
                     Button { if !selected { choose(option.0) } } label: {
                         Text(option.1).font(.caption.weight(selected ? .semibold : .regular))
@@ -337,7 +337,7 @@ struct DecodingSwitch: View {
                 Text("this battle: \(used)").font(.caption2).foregroundStyle(.secondary)
             }
         }
-        .help("Auto: sampled against you or a bot (FirstLight's human-vs-AI), greedy when both devices run models against each other (FirstLight's AI duel).")
+        .help("Auto: sampled against you or a bot (FirstLight's human-vs-AI), greedy when both devices run models against each other (FirstLight's AI duel). Steady: when to act exactly as trained, but the card and tile are its clear favourite instead of a draw (fewer random misplacements); applies from the next battle.")
     }
 }
 

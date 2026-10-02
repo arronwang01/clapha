@@ -54,7 +54,7 @@ def _kept(frame: dict) -> dict:
 
 
 def play_game(env, native, theirs, ours, config, their_side: int, rng: random.Random, sample: bool,
-              match_id: str) -> dict:
+              match_id: str, ours_delay: str = 'live') -> dict:
     """One whole game; the result, with the recording (il/duel's format)."""
     import firstlight_obs as FLO
     from native_runner.arena import cell_to_world
@@ -141,7 +141,7 @@ def play_game(env, native, theirs, ours, config, their_side: int, rng: random.Ra
             plays=executed_rows, decks=ours.tracked_decks(),
             hand_forms=ours.hand_forms(me['deck_card_ids'], me['deck_form_flags'], me['evo_progress']),
             pending_ability_sources=tuple(c.entity_id for c in commands if c.side == side and c.kind == 'ability'),
-            elixir_lead_ticks=elixir_lead(TARGET_DELAY))
+            elixir_lead_ticks=elixir_lead(TARGET_DELAY) if ours_delay == 'live' else 0)
         if tick < ours.first_decision_tick:
             ours.observe(observation)
             return None
@@ -156,7 +156,7 @@ def play_game(env, native, theirs, ours, config, their_side: int, rng: random.Ra
         for move in moves:
             kind, _slot, card_id, target_grid, offset = move
             kind = str(getattr(kind, 'value', kind))
-            tap = tick + int(offset) + max(D._overhead(rng), hold)
+            tap = tick + int(offset) + max(D._overhead(rng), hold) if ours_delay == 'live' else tick
             seq += 1
             if kind == 'activate_ability':
                 entity = getattr(move, 'source_entity', None)
@@ -172,7 +172,8 @@ def play_game(env, native, theirs, ours, config, their_side: int, rng: random.Ra
                 counters['ours']['decided'] += 1
                 commands.append(D.Command(side=side, card_id=int(card_id), grid=(int(target_grid[0]), int(target_grid[1])),
                                           decided=tick, tap=tap, seq=seq, cost=S._card_cost(int(card_id)) or 0.0,
-                                          moment=tick + int(offset)))
+                                          # no delay (FirstLight's sandbox, the league's hog2): it executes here
+                                          moment=tick + (int(offset) if ours_delay == 'live' else max(1, int(offset)))))
 
     def due_taps(frame: dict, tick: int) -> list:
         """Our taps due before the next turn, elixir checked as the console checks it; their ActionV1s."""
@@ -182,12 +183,12 @@ def play_game(env, native, theirs, ours, config, their_side: int, rng: random.Ra
         screen = state['elixirRaw'] / 10000.0 - in_flight
         for command in sorted((c for c in commands if c.side == side and c.execute is None
                                and c.tap < tick + POLICY_DECISION_TICKS), key=lambda c: c.seq):
-            if screen < command.cost - 1e-6:
+            if screen < command.cost - 1e-6 and ours_delay == 'live':
                 if tick - command.tap > DEFER_TICKS:
                     counters['ours']['dropped_elixir'] += 1
                     commands.remove(command)
                 continue
-            execute = max(command.tap, tick) + COMMAND_AGE_TICKS
+            execute = max(command.tap, tick) + COMMAND_AGE_TICKS if ours_delay == 'live' else max(command.moment, tick + 1)
             if command.kind == 'ability':
                 try:
                     native.queue_ability_action_at(AbilityAction(side, NATIVE_OBJECT_ID_ENTITY_KEY_TAG,
@@ -203,13 +204,20 @@ def play_game(env, native, theirs, ours, config, their_side: int, rng: random.Ra
                     commands.remove(command)
                     continue
                 command.hand_slot = slot
-                actions.append(ActionV1(owner=side, kind=ActionKind.PLAY_CARD, hand_slot=slot, card_id=command.card_id,
-                                        target_kind=TargetKind.GRID, target_grid=tuple(command.grid),
-                                        subcell_offset=(0.0, 0.0), execute_offset_ticks=execute - tick,
-                                        # the next decision on the five-tick grid, as FirstLight's own actions
-                                        # say (the environment advances to the earliest side's next decision)
-                                        next_decision_ticks=POLICY_DECISION_TICKS,
-                                        action_id=f'{match_id}-ours-{command.seq}'))
+                candidate = ActionV1(owner=side, kind=ActionKind.PLAY_CARD, hand_slot=slot, card_id=command.card_id,
+                                     target_kind=TargetKind.GRID, target_grid=tuple(command.grid),
+                                     subcell_offset=(0.0, 0.0), execute_offset_ticks=execute - tick,
+                                     # the next decision on the five-tick grid, as FirstLight's own actions
+                                     # say (the environment advances to the earliest side's next decision)
+                                     next_decision_ticks=POLICY_DECISION_TICKS,
+                                     action_id=f'{match_id}-ours-{command.seq}')
+                try:
+                    env._validate_action(candidate, env._raw)
+                except Exception:  # noqa: BLE001  (an illegal target or not affordable now: the engine refuses it)
+                    counters['ours']['rejected'] = counters['ours'].get('rejected', 0) + 1
+                    commands.remove(command)
+                    continue
+                actions.append(candidate)
             command.execute = execute
             command.injected = True
             screen -= command.cost
@@ -316,6 +324,10 @@ def main(argv: list[str]) -> int:
     parser.add_argument('--level', type=int, default=16, help='card, King and princess tower level (both sides)')
     parser.add_argument('--seed', type=int, default=0, help='first deal seed (0: random)')
     parser.add_argument('--deterministic', action='store_true', help="FirstLight's argmax instead of its sampling")
+    parser.add_argument('--ours-delay', default='live', choices=('live', 'none'),
+                        help="none: our side's plays execute 1-4 ticks after deciding (FirstLight's sandbox, how the "
+                             "league's hog2 played); with --ours fl:hog2 it is the league's hog2 against the real one")
+    parser.add_argument('--run', default=RUN.name, help='the runs/rl folder the recordings go to')
     args = parser.parse_args(argv)
     from native_runner.battle_env import BattleEnvV1
     from native_runner.cr_native_env import NativeClashEnv
@@ -347,9 +359,10 @@ def main(argv: list[str]) -> int:
                       effect_catalog=RuntimeEffectCatalog.from_catalog(bundle.native_effect_catalog))
     rng = random.Random(args.seed or None)
     score = {'ours': 0, 'theirs': 0, 'draw': 0}
+    run = RUN.parent / args.run
     for index in range(args.games):
-        their_side = index % 2
         seed = args.seed + index if args.seed else rng.randrange(1, 2 ** 31)
+        their_side = 1 - seed % 2                # ours on side seed % 2, as il.duel --specialist puts its a
         config = MatchConfig(deck0=HOG26, deck1=HOG26, deck0_form_availability=HOG26_FORMS,
                              deck1_form_availability=HOG26_FORMS, seed=seed, level_cap=args.level,
                              minimum_card_level=args.level, king_tower_level=args.level,
@@ -357,15 +370,16 @@ def main(argv: list[str]) -> int:
                              owner1_name=f'Ours u{update}' if their_side == 0 else 'FirstLight')
         started = time.time()
         result = play_game(env, native, theirs, ours, config, their_side, rng, not args.deterministic,
-                           match_id=f'vsfl-{seed}')
+                           match_id=f'vsfl-{seed}', ours_delay=args.ours_delay)
         winner = result['winner']
         label = 'draw' if winner not in (0, 1) else ('ours' if winner == 1 - their_side else 'theirs')
         score[label] += 1
         header = result['recording']['header']
         header['played'] = {'a': f'{args.ours} v{update}', 'b': args.theirs, 'a_side': 1 - their_side,
                             'league': 'firstlight', 'result': {'ours': 'a', 'theirs': 'b'}.get(label, 'draw'),
-                            'run': RUN.name, 'config': battle_setup(config), 'counters': result['counters']}
-        save_recorded(RUN / 'recordings', header, result['recording']['frames'])
+                            'run': run.name, 'config': battle_setup(config), 'counters': result['counters'],
+                            'ours_delay': args.ours_delay}
+        save_recorded(run / 'recordings', header, result['recording']['frames'])
         print(json.dumps({'game': index + 1, 'winner': label, 'crowns': result['crowns'], 'end_tick': result['tick'],
                           'ours_side': 1 - their_side, 'seconds': round(time.time() - started),
                           'counters': result['counters'], 'score': score}), flush=True)

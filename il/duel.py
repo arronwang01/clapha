@@ -494,6 +494,16 @@ def replay_matchups(frames_dir: Path, count: int, seed: int, opponent_has: set[i
     return out
 
 
+def _update_of(name: str) -> int:
+    """A checkpoint's update count (RL runs), 0 when it has none."""
+    try:
+        import torch
+        import firstlight_bot as FLB
+        return int(torch.load(FLB.CHECKPOINTS[name], map_location='cpu', weights_only=False).get('update_step') or 0)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument('--a', default='fl:hog2')
@@ -526,6 +536,14 @@ def main(argv: list[str]) -> int:
     parser.add_argument('--record', type=Path, help='save every match here in the conversion format (DAgger data)')
     parser.add_argument('--record-sides', choices=('a', 'b', 'both'), default='a',
                         help="whose side is training data (index.jsonl train_sides)")
+    parser.add_argument('--specialist', action='store_true',
+                        help="FirstLight's Hog 2.6 specialist deck for both sides (Evo Cannon, Hero Musketeer, Evo "
+                             "Skeletons) at level 16, deal seeds --seed, --seed + 1, ... (il/vs_firstlight's games)")
+    parser.add_argument('--plain', action='store_true',
+                        help='with --specialist: no evolution or hero forms on either side (a deck as most players own it)')
+    parser.add_argument('--together', action='store_true',
+                        help='both sides decide from the same state, as the RL collectors do (il/rl_serve); '
+                             'otherwise side 1 is prepared after side 0 has played this turn')
     args = parser.parse_args(argv)
     import firstlight_bot as FLB
     from il.engine_convert import connect
@@ -542,6 +560,16 @@ def main(argv: list[str]) -> int:
     if replay:
         matchups = [(config, forms, tag, hog, plays)
                     for config, forms, tag, hog, plays in replay_matchups(args.frames, args.matches, args.seed)]
+    elif args.specialist:
+        from native_runner.match_factory import MatchConfig
+        hog26 = (27000000, 28000000, 26000021, 26000038, 26000030, 26000014, 26000010, 28000011)
+        forms = (0,) * 8 if args.plain else (1, 0, 0, 0, 0, 2, 1, 0)
+        # a's side from the seed, so one game per call (seed S) is the game S of a longer set
+        matchups = [(MatchConfig(deck0=hog26, deck1=hog26, deck0_form_availability=forms,
+                                 deck1_form_availability=forms, seed=args.seed + index, level_cap=16,
+                                 minimum_card_level=16, king_tower_level=16),
+                     {0: list(forms), 1: list(forms)}, f'spec{args.seed + index:08d}', (args.seed + index) % 2, None)
+                    for index in range(args.matches)]
     elif args.real_decks:
         # real games' decks and deals, both sides played by models: a on the Hog 2.6 side
         wanted = {int(card) for card in args.opponent_has.split(',')} if args.opponent_has else None
@@ -561,7 +589,10 @@ def main(argv: list[str]) -> int:
                                 extra_delay={a_side: args.a_extra_delay, 1 - a_side: args.b_extra_delay},
                                 measured={a_side: overheads['a'], 1 - a_side: overheads['b']},
                                 script={1 - a_side: script_plays} if script_plays is not None else None,
-                                target_delay=args.target_delay)
+                                target_delay=args.target_delay,
+                                decide_many=(lambda ready: {side: runner.decide(observation)
+                                                            for side, runner, observation in ready})
+                                if args.together else None)
         except Exception as error:  # noqa: BLE001  (one broken match must not end the set)
             print(f'match {index + 1} failed: {type(error).__name__}: {error}', flush=True)
             for runner in runners.values():
@@ -586,6 +617,13 @@ def main(argv: list[str]) -> int:
             from il.frames import save_recorded
             header = result['recording']['header']
             header['played'] = {k: v for k, v in row.items() if k not in ('counters',)}
+            # what Training games and Watch in Null's read: the version, the league, the run, the exact setup
+            from il.rl import battle_setup
+            header['played'].update(
+                a=f"{args.a} v{_update_of(args.a)}", result={'draw': 'draw'}.get(label, label),
+                league='hog2' if (args.b, args.b_delay) == ('fl:hog2', 'none') else 'duel',
+                run=args.record.parent.name if args.record.name == 'recordings' else args.record.name,
+                config=battle_setup(config))
             save_recorded(args.record, header, result['recording']['frames'])
             sides = {'a': [a_side], 'b': [1 - a_side], 'both': [0, 1]}[args.record_sides]
             with (args.record / 'index.jsonl').open('a') as handle:

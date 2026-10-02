@@ -151,6 +151,10 @@ class FirstLightRunner:
             self.has_extras = '_extras_head' in self.model.__dict__
             self.elixir_lead = 9 if self.clapha_inputs else 0    # median tap overhead 5 + window 4
         self.sample = bool(sample)
+        # the card-and-tile pick's temperature as trained (1.0 for every shipped and RL checkpoint);
+        # 'steady' decoding sharpens it (set_action_temperature) while the act/wait gate stays as trained
+        self.trained_action_temperature = (float(self.model.ppo_action_temperature)
+                                           if self.model is not None else 1.0)
         self.session = None
         self.actor_owner = None
         self.opponent_source = 'unknown'
@@ -161,6 +165,12 @@ class FirstLightRunner:
         self.refused: list[tuple[int, int, str]] = []   # (side, card, reason), for the console
         self._processed: set = set()            # plays / reveals already registered
         self._attributed_abilities: set[int] = set()
+
+    def set_action_temperature(self, temperature: float | None) -> None:
+        """Sampling temperature of the card-and-tile pick (None: as trained). Only sampled decoding
+        reads it; the gate's own temperature (when to act) is left as trained."""
+        if self.model is not None:
+            self.model.set_ppo_action_temperature(float(temperature or self.trained_action_temperature))
 
     def start_battle(self, our_deck, opponent_deck, actor_owner: int,
                      observation, initial_elixir, our_forms=None,

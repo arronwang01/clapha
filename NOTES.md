@@ -1734,3 +1734,18 @@ Details: TRAINING.md journal.
   winner. The game's play button, progress bar and speed drive it: snapshots every 120 ticks for
   the whole game (the probe keeps 64), so seeking back, or forward to anywhere already played,
   restores one and runs at most 240 ticks; further ahead runs at 4x, the probe's fastest.
+
+## 2026-10-02 afternoon: why our model felt weak against the user, while training said it beat hog2
+
+- **Training's hog2 was weaker than the real one.** il/strength_check.py on the Mac engine, the
+  specialist's deck at L16, both no delay: hog2 as training fed it (our reconstruction, tile-centre
+  placements, our turn loop) lost **1-5** to hog2 in FirstLight's own environment (il/vs_firstlight).
+  Our model (p3, update 520, live delay) against the real hog2: **2-3**, against training's 66% on the
+  same kind of deals (640 games at updates 400-521). Deck forms did not matter in training (67% with
+  the specialist's forms, 61% without). Recordings: runs/rl/check-pipeline, check-full.
+- **98% of training's Hog 2.6 sides had evolutions and Hero Musketeer** (no evo and no hero: 0.5%). The
+  user plays the plain deck; with "the real 2.6 deck" the model's play was mostly fine (user, live).
+- **Occasional game-losing blunders: sampling.** Every checkpoint (ours and FirstLight's) samples the
+  card-and-tile pick at temperature 1.0 (gate 0.2, continue 5.0), so a 10%-likely tile is played one
+  time in ten. Console decoding **Steady** (mac012/console.py STEADY_ACTION_TEMPERATURE 0.3): when to
+  act as trained, card and tile sharpened. Trade-off: fewer random misplacements, more predictable.
