@@ -280,6 +280,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument('--run', required=True)
     parser.add_argument('--engines', type=int, default=16)
     parser.add_argument('--league', default='self=2/snap=1/anchor=2/hog2=2/general=3')
+    parser.add_argument('--init', help="the checkpoint a new run starts from, and its 'anchor' opponent (rl.ps1 -Init; "
+                                       'default: rl.ps1\'s, v2)')
     parser.add_argument('--others-gb', type=float, default=1.5,
                         help="other processes holding more than this = someone else's turn")
     parser.add_argument('--calm', type=int, default=3, help='minutes free of others before we start')
@@ -318,7 +320,8 @@ def main(argv: list[str]) -> int:
         if not up:
             say('no engine answers: not starting (trying again later)')
             return
-        output = launcher('-Engines', str(len(up)), '-Ports', '/'.join(map(str, up)), '-League', args.league)
+        output = launcher('-Engines', str(len(up)), '-Ports', '/'.join(map(str, up)), '-League', args.league,
+                          *(('-Init', args.init) if args.init else ()))
         parts = {int(pid): name for name, pid in re.findall(r'(\S+) pid (\d+)', output)}
         progress, progress_at = _progress(run_dir), time.time()
         say(f'started on {len(up)} engines: {_oneline(output, 3)}')
