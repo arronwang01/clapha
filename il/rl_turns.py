@@ -243,7 +243,10 @@ def write_status(run_dir: Path, now_line: str, restarts: list[str]) -> None:
               if (run_dir / 'HALT').is_file() else []),
             '',
             'Running scores, the first 300 games against each fixed opponent and the latest 300:']
-    for league, name in (('anchor', 'v2 (the start)'), ('hog2', 'hog2 no-delay'), ('general', 'General, real decks')):
+    anchors = {g.get('opponent') for g in _decided(run_dir, 'anchor')}
+    anchor_name = ('v2 (the start)' if not anchors or any('distill-v2' in str(a) for a in anchors)
+                   else f"the anchor, {Path(str(next(iter(anchors)))).stem}")
+    for league, name in (('anchor', anchor_name), ('hog2', 'hog2 no-delay'), ('general', 'General, real decks')):
         decided = _decided(run_dir, league)
         text.append(f'  vs {name}: first {_score(decided[:300])}  latest {_score(decided[-300:])}')
     text += ['',
