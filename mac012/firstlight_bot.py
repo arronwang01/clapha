@@ -78,7 +78,18 @@ def FLO_ruleset_id() -> str:
     return ruleset_id()
 
 
+def _discover() -> None:
+    """Models brought from the PC by Training games -> Import (il/recordings.py, pack --models):
+    runs/pc/<run>-u<N>.pt, offered as clapha:<run>-u<N>."""
+    for path in sorted((HERE.parent / 'runs/pc').glob('*-u[0-9]*.pt')):
+        CHECKPOINTS.setdefault(f'clapha:{path.stem}', path)
+
+
+_discover()
+
+
 def available() -> list[str]:
+    _discover()             # a model imported while the console runs shows up at the next look
     return [name for name, path in CHECKPOINTS.items() if path.is_file()]
 
 

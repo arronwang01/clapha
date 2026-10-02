@@ -2,19 +2,21 @@
 
 On the PC (tools/windows/pack-recordings.cmd):
 
-    python -m il.recordings pack [--all]
+    python -m il.recordings pack [--all] [--models]
 
 puts every run's recordings (runs/rl/<run>/recordings) that were not packed before into ONE zip,
 clapha-recordings.zip next to the clapha folder, as <run>/<tag>.jsonl.zst. One file moves through
 ToDesk far faster than hundreds of small ones; .zst does not compress further, so it is stored as
-is. --all packs everything again (a lost zip).
+is. --all packs everything again (a lost zip). --models adds each run's newest kept model
+(policy-NNNN.pt, ~50 MB) as <run>/<run>-u<N>.pt, for playing it live in the console.
 
 On the Mac (the Clapha app's Training games -> Import, or by hand):
 
     ./py -m il.recordings import PATH... [--remove]
 
 takes zips, folders or single recordings from anywhere and files each game under
-runs/rl/<run>/recordings/frames/<tag[:2]>/<tag>.jsonl.zst, where il.game_viewer reads it. Games
+runs/rl/<run>/recordings/frames/<tag[:2]>/<tag>.jsonl.zst, where il.game_viewer reads it, and each
+model (<run>-u<N>.pt) under runs/pc, where the console lists it (firstlight_bot: clapha:<run>-u<N>). Games
 already there are skipped; a file cut short in transfer is reported and left out. The run comes
 from the recording (played.run, newer recordings), from the zip's or folder's path (runs/rl/<run>,
 a pack's <run>/), or from what the game names (ex1's frozen target, a snapshot's run folder); a
@@ -37,6 +39,8 @@ CLAPHA = Path(__file__).resolve().parents[1]
 RUNS = CLAPHA / 'runs' / 'rl'
 SUFFIX = '.jsonl.zst'
 SKIP = {'recordings', 'frames', 'runs', 'rl', 'inbox'}
+MODEL = re.compile(r'[A-Za-z0-9_.-]+-u\d+\.pt')
+MODELS = CLAPHA / 'runs' / 'pc'
 
 
 def _check(data: bytes) -> dict:
@@ -90,8 +94,25 @@ def _entries(path: Path):
         yield path.name, _run_in_path(path.resolve().parts, False), path.read_bytes
 
 
+def _models(path: Path):
+    """(name, reader) for every model a pack carries (<run>-u<N>.pt), in a zip, folder or file."""
+    if path.is_dir():
+        for file in sorted(path.rglob('*.pt')):
+            if MODEL.fullmatch(file.name):
+                yield file.name, file.read_bytes
+        for archive in sorted(path.rglob('*.zip')):
+            yield from _models(archive)
+    elif path.suffix.lower() == '.zip':
+        archive = zipfile.ZipFile(path)
+        for info in archive.infolist():
+            if MODEL.fullmatch(Path(info.filename).name):
+                yield Path(info.filename).name, (lambda info=info: archive.read(info))
+    elif MODEL.fullmatch(path.name):
+        yield path.name, path.read_bytes
+
+
 def import_paths(paths: list[Path], default_run: str | None = None) -> dict:
-    found, problems = [], []
+    found, problems, models = [], [], []
     for source in paths:
         if not source.exists():
             problems.append(f'{source}: not found')
@@ -111,6 +132,18 @@ def import_paths(paths: list[Path], default_run: str | None = None) -> dict:
                 continue
             run = (header.get('played') or {}).get('run') or path_run or _run_named(header)
             batch.append([run, name, data, header])
+        try:
+            for name, read in _models(source):
+                target = MODELS / name
+                data = read()
+                if not (target.exists() and target.stat().st_size == len(data)):
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    temporary = target.with_suffix('.part')
+                    temporary.write_bytes(data)
+                    os.replace(temporary, target)
+                    models.append(name[:-3])
+        except (zipfile.BadZipFile, OSError) as error:
+            problems.append(f'{source.name}: a model could not be read ({type(error).__name__}), left out')
         # a folder or zip from one run: games that name no run belong to the one the others name
         named = {run for run, *_ in batch if run}
         for item in batch:
@@ -129,7 +162,7 @@ def import_paths(paths: list[Path], default_run: str | None = None) -> dict:
         temporary.write_bytes(data)
         os.replace(temporary, target)
         added[run] = added.get(run, 0) + 1
-    return {'added': added, 'already': already, 'problems': problems}
+    return {'added': added, 'already': already, 'problems': problems, 'models': models}
 
 
 def pack(args) -> int:
@@ -137,24 +170,37 @@ def pack(args) -> int:
     out = Path(args.out)
     manifest = RUNS / 'packed-recordings.txt'
     done = set() if args.all or not manifest.exists() else set(manifest.read_text().split())
-    files = [(run_dir.name, file) for run_dir in sorted(RUNS.iterdir()) if run_dir.is_dir()
+    runs = [run_dir for run_dir in sorted(RUNS.iterdir()) if run_dir.is_dir()]
+    files = [(run_dir.name, file, f'{run_dir.name}/{file.name}') for run_dir in runs
              for file in sorted((run_dir / 'recordings').rglob('*' + SUFFIX))]
-    fresh = [(run, file) for run, file in files if f'{run}/{file.name}' not in done]
-    if not fresh:
+    fresh = [item for item in files if item[2] not in done]
+    models = []
+    if args.models:
+        for run_dir in runs:
+            kept = sorted(run_dir.glob('policy-[0-9]*.pt'), key=lambda f: int(re.sub(r'\D', '', f.stem) or 0))
+            if kept:
+                name = f'{run_dir.name}-u{int(re.sub(r"[^0-9]", "", kept[-1].stem))}.pt'
+                if f'{run_dir.name}/{name}' not in done:
+                    models.append((run_dir.name, kept[-1], f'{run_dir.name}/{name}'))
+    if not fresh and not models:
         print(f'nothing new to pack ({len(files)} games packed before; --all packs them again)')
         return 0
     temporary = out.with_name(out.name + '.part')
     counts: dict[str, int] = {}
     with zipfile.ZipFile(temporary, 'w', compression=zipfile.ZIP_STORED) as archive:
-        for run, file in fresh:
-            archive.write(file, f'{run}/{file.name}')
-            counts[run] = counts.get(run, 0) + 1
+        for run, file, name in fresh + models:
+            archive.write(file, name)
+            if name.endswith(SUFFIX):
+                counts[run] = counts.get(run, 0) + 1
     os.replace(temporary, out)
     with manifest.open('a') as handle:
-        handle.writelines(f'{run}/{file.name}\n' for run, file in fresh)
+        handle.writelines(f'{name}\n' for _run, _file, name in fresh + models)
     size = out.stat().st_size / 1e6
-    print(f'{len(fresh)} games ({", ".join(f"{run} {n}" for run, n in counts.items())}), {size:.1f} MB -> {out}')
-    print('Transfer that one file to the Mac, then Clapha -> Training games -> Import.')
+    print(f'{len(fresh)} games ({", ".join(f"{run} {n}" for run, n in counts.items()) or "none new"})'
+          + (f' and the models {", ".join(Path(name).stem for *_, name in models)}' if models else '')
+          + f', {size:.1f} MB -> {out}')
+    print('Transfer that one file to the Mac, then Clapha -> Training games -> Import.'
+          + ('' if args.models else ' (--models also brings each run\'s newest model.)'))
     return 0
 
 
@@ -164,6 +210,7 @@ def main(argv: list[str]) -> int:
     p = commands.add_parser('pack', help='PC: new recordings of every run into one zip')
     p.add_argument('--out', default=str(CLAPHA.parent / 'clapha-recordings.zip'))
     p.add_argument('--all', action='store_true', help='pack every recording again, not only new ones')
+    p.add_argument('--models', action='store_true', help="also each run's newest kept model (policy-NNNN.pt)")
     i = commands.add_parser('import', help='Mac: file zips / folders / recordings under runs/rl/<run>')
     i.add_argument('paths', nargs='+', type=Path)
     i.add_argument('--run', help="the run for games that name none (default: 'unsorted')")
@@ -179,11 +226,13 @@ def main(argv: list[str]) -> int:
     summary = '; '.join(f"{run}: {result['added'].get(run, 0)} new"
                         + (f" ({result['already'][run]} already here)" if result['already'].get(run) else '')
                         for run in runs) or 'no recordings found'
+    if result['models']:
+        summary += '; models for the console: ' + ', '.join(f'clapha:{name}' for name in result['models'])
     print(f'imported in {time.time() - started:.1f} s -- {summary}')
     if args.remove:
         for path in args.paths:
             shutil.rmtree(path, ignore_errors=True) if path.is_dir() else path.unlink(missing_ok=True)
-    return 0 if runs or not result['problems'] else 1
+    return 0 if runs or result['models'] or not result['problems'] else 1
 
 
 if __name__ == '__main__':

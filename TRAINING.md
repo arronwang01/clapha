@@ -242,12 +242,18 @@ Per run folder `runs/rl/<run>/` on the PC:
      reports files cut short in transfer.
   3. The window shows each run's newest 80 (Run picker), the board in 2D (app/Sources/Games.swift,
      il/game_viewer.py). **Watch in Null's** plays the selected game again in the real game on
-     CR_4k (il/watch_nulls.py with FirstLight's replay player: pause, 0.25-4x, 5 s back; the 2D
-     board follows it). Every training deal uses FirstLight's fixed deal seed, so the decks' slot
-     order is the deal; levels and tower troops come from played.config, or for older games from
-     the towers' full health (all 27,660 sides of runs/conv-hog26 map one-to-one). The engine's
-     deal is checked against the recording before the first card. The power button shuts CR_4k
-     down (it costs ~85% CPU) before playing live.
+     CR_4k (il/watch_nulls.py); while it plays, the game's play button, progress bar and speed
+     drive Null's and the 2D board follows. Seeking (measured): back, or forward to anywhere
+     already played, 1-2 s (a snapshot every 120 ticks, restore, then the rest at 4x); further
+     ahead runs at 4x, the probe's fastest (3,100 ticks in 40 s). It holds one tick before the
+     recorded end: once the stock battle ends, its HUD is gone for good. Every training deal uses
+     FirstLight's fixed deal seed, so the decks' slot order is the deal; levels and tower troops
+     come from played.config, or for older games from the towers' full health (all 27,660 sides
+     of runs/conv-hog26 map one-to-one). The engine's deal is checked against the recording before
+     the first card; tested games end on their recorded tick with every card in. The power button
+     shuts CR_4k down (it costs ~85% CPU) before playing live.
+  4. Models: `pack-recordings.cmd --models` adds each run's newest kept model; Import puts it in
+     runs/pc/<run>-u<N>.pt and the console's model list shows it (clapha:<run>-u<N>) for live play.
   FirstLight's own console (Human vs Model, its AI with no delay): Clapha -> More, or
   `tools/play_firstlight.sh --no-delay`.
 - `status.txt` (every 10 min), `turns.log` (a line per minute, every keeper action), `launch.log`,

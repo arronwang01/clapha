@@ -13,7 +13,15 @@ let modelNames: [String: String] = [
     "100k": "Own sim model · 100k",
 ]
 
-func modelLabel(_ id: String) -> String { modelNames[id] ?? id }
+func modelLabel(_ id: String) -> String {
+    if let name = modelNames[id] { return name }
+    // brought from the PC by Training games -> Import: clapha:<run>-u<N>
+    if id.hasPrefix("clapha:"), let cut = id.range(of: "-u", options: .backwards),
+       let update = Int(id[cut.upperBound...]) {
+        return "Clapha · \(id[id.index(id.startIndex, offsetBy: 7)..<cut.lowerBound]) update \(update) (from the PC)"
+    }
+    return id
+}
 
 struct ContentView: View {
     @StateObject private var tasks = TaskRunner(root: claphaRoot())

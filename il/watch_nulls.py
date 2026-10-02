@@ -1,13 +1,12 @@
 """Watch a training game in Null's Royale itself: the recorded game played again in the real game, on
-the Mac's engine emulator (CR_4k), by FirstLight's own replay player
-(native_runner/training/replay_viewer.py: each card is scheduled in the probe for the tick it went
-in, and the stock renderer runs at 0.25-4x with pause and 5 s back).
+the Mac's engine emulator (CR_4k), with FirstLight's direct scheduling (each card registered in the
+probe for the tick it went in) in the stock renderer at 0.25-4x, and seeking both ways (watch()).
 
     ./py -m il.watch_nulls RECORDING [--speed 1] [--check]
 
 The Clapha app's Training games window runs this. Controls on stdin, one per line: pause, resume,
-speed X, back, stop. Progress on stdout, one JSON object per line. --check builds the replay and
-prints its setup without touching the emulator.
+speed X, seek TICK, stop. Progress on stdout, one JSON object per line. --check builds the replay
+and prints its setup without touching the emulator.
 
 A game is played again exactly when the battle is set up as it was. Every training deal comes from
 runs/conv-hog26, whose battles all use FirstLight's fixed deal seed, where the decks' slot order
@@ -20,7 +19,6 @@ a game that would not replay exactly is refused, not shown wrong.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import io
 import json
 import os
@@ -34,7 +32,6 @@ CLAPHA = Path(__file__).resolve().parents[1]
 FIRSTLIGHT = Path(os.environ.get('FIRSTLIGHT_ROOT') or Path.home() / 'Documents/GitHub/FirstLight_CR')
 PORT_DIR = Path.home() / 'Documents/GitHub/cr-engine-extraction/macos-port'
 ADB = str(Path.home() / 'Library/Android/sdk/platform-tools/adb')
-SERIAL = 'emulator-5554'
 PACKAGE = 'nullsroyale.rel.free'
 PORT = 26789
 # FirstLight's attested probe (tools/play_firstlight.sh installs it; its sandbox and player expect it)
@@ -53,6 +50,12 @@ if str(FIRSTLIGHT) not in sys.path:
 
 def say(**fields) -> None:
     print(json.dumps(fields), flush=True)
+
+
+def gameclock(tick: int) -> str:
+    seconds = tick // 20
+    return f'{seconds // 60}:{seconds % 60:02d}'
+
 
 
 def _load(path: Path) -> tuple[dict, dict]:
@@ -149,22 +152,32 @@ def build_replay(path: Path):
 
 # --- the engine on the Mac --------------------------------------------------------------------
 
-def _adb(*args: str, timeout: float = 20.0) -> str:
-    return subprocess.run((ADB, '-s', SERIAL, *args), capture_output=True, text=True, timeout=timeout).stdout.strip()
-
-
-def _booted() -> bool:
+def cr4k() -> str | None:
+    """CR_4k's adb serial, by the AVD name the device itself reports (ro.boot.qemu.avd_name).
+    Never assume "emulator-5554": MuMu Pro's adbd listens on port 5555 and adb lists anything there
+    as emulator-5554 -- the live MuMu device. tools/play_firstlight.sh boots CR_4k on its own ports
+    (emulator-5580)."""
     try:
         listed = subprocess.run((ADB, 'devices'), capture_output=True, text=True, timeout=10).stdout
-        return any(line.startswith(SERIAL + '\t') for line in listed.splitlines()) and _adb('shell', 'getprop',
-                                                                                            'sys.boot_completed') == '1'
+        for line in listed.splitlines()[1:]:
+            serial, _, state = line.partition('\t')
+            if state.strip() == 'device' and _adb(serial, 'shell', 'getprop', 'ro.boot.qemu.avd_name') == 'CR_4k':
+                return serial
     except (OSError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
+def _adb(serial: str, *args: str, timeout: float = 20.0) -> str:
+    return subprocess.run((ADB, '-s', serial, *args), capture_output=True, text=True, timeout=timeout).stdout.strip()
+
+
+def _ready(serial: str | None) -> bool:
+    """CR_4k booted, with FirstLight's attested probe inside Null's."""
+    if serial is None or _adb(serial, 'shell', 'getprop', 'sys.boot_completed') != '1':
         return False
-
-
-def _probe_installed() -> bool:
-    lib = _adb('shell', f'ls -d /data/app/*/{PACKAGE}*/lib/arm64')
-    return bool(lib) and _adb('shell', f'sha256sum {lib}/libcrprobe.so').split(' ')[0] == PROBE_SHA
+    lib = _adb(serial, 'shell', f'ls -d /data/app/*/{PACKAGE}*/lib/arm64')
+    return bool(lib) and _adb(serial, 'shell', f'sha256sum {lib}/libcrprobe.so').split(' ')[0] == PROBE_SHA
 
 
 def _request(command: str, timeout: float = 1.5) -> dict | None:
@@ -202,17 +215,21 @@ def prepare_engine() -> None:
     busy = _engine_busy()
     if busy:
         raise RuntimeError(busy)
-    if not _booted() or not _probe_installed():
+    serial = cr4k()
+    if not _ready(serial):
         say(state='preparing', message='Booting CR_4k and installing FirstLight\'s probe (about a minute the first time)…'
-            if not _booted() else 'Installing FirstLight\'s probe…')
+            if serial is None else 'Installing FirstLight\'s probe…')
         result = subprocess.run(('/bin/bash', str(CLAPHA / 'tools/play_firstlight.sh'), '--install-only'),
                                 capture_output=True, text=True, timeout=420)
         if result.returncode != 0:
             raise RuntimeError((result.stderr or result.stdout).strip()[-400:] or 'play_firstlight.sh failed')
+        serial = cr4k()
+        if serial is None:
+            raise RuntimeError('CR_4k did not come up')
     if _cold_ready():
         return
     say(state='preparing', message='Starting Null\'s offline engine (about 30 s)…')
-    env = dict(os.environ, CR_ADB=ADB, CR_ADB_SERIAL=SERIAL, CR_CONTROL_PORT=str(PORT))
+    env = dict(os.environ, CR_ADB=ADB, CR_ADB_SERIAL=serial, CR_CONTROL_PORT=str(PORT))
     result = subprocess.run(('/bin/bash', str(PORT_DIR / 'start_offline.sh')), cwd=str(PORT_DIR), env=env,
                             capture_output=True, text=True, timeout=420)
     if result.returncode != 0:
@@ -220,92 +237,212 @@ def prepare_engine() -> None:
 
 
 def shutdown() -> None:
-    """Close the emulator (it idles at ~85% CPU)."""
-    subprocess.run((ADB, '-s', SERIAL, 'emu', 'kill'), capture_output=True, timeout=20)
+    """Close CR_4k (it idles at ~85% CPU). Only CR_4k: found by name, never the MuMu device."""
+    serial = cr4k()
+    if serial is not None:
+        subprocess.run((ADB, '-s', serial, 'emu', 'kill'), capture_output=True, timeout=20)
 
 
 # --- playing it -------------------------------------------------------------------------------
 
+SNAPSHOT_EVERY = 120      # ticks between kept snapshots (6 s): a whole game fits the probe's 64 handles
+FASTEST = 4.0             # the stock renderer's fastest speed (the probe allows 0.25-4x)
+
+
+def _deal_mismatch(observation: dict, deals: dict) -> str:
+    """'' when the engine dealt both sides what the recording dealt (paused at tick 0)."""
+    problems = []
+    for player in observation.get('players') or ():
+        owner = int(player['owner'])
+        hand = [h['cardId'] for h in sorted(player['hand'], key=lambda h: h['handIndex'])]
+        cycle = [c['cardId'] for c in sorted(player['cycle'], key=lambda c: c['cycleIndex'])]
+        want = deals.get(str(owner)) or deals.get(owner)
+        if want and (hand != list(want[0]) or cycle != list(want[1])):
+            problems.append(f'owner {owner} was dealt {hand} / {cycle}, the recording {want[0]} / {want[1]}')
+    return '; '.join(problems)
+
+
 def watch(path: Path, speed: float) -> int:
-    from native_runner.training.replay_viewer import ReplayRewindControl, play_training_replay
+    """Play the game in the stock renderer; seek anywhere, both ways.
+
+    Every card is registered in the probe for its tick up front (FirstLight's direct scheduling:
+    the probe resolves it from the live hand at the boundary). A snapshot is kept every
+    SNAPSHOT_EVERY ticks for the whole game, so a seek back -- or forward to anywhere already
+    played -- restores the nearest one at or before the target and runs the rest exactly
+    (at most 2 x 120 ticks at 4x); a seek further ahead runs there at 4x, keeping snapshots on
+    the way. After a restore the cards still to come are registered again.
+
+    It holds one tick before the recorded end: once the stock battle ends, its HUD (hands, names,
+    clock) is gone for good and a restore brings back only the board, so the last tick is not
+    played and every position stays watchable."""
+    import bisect
+    import queue
+    from native_runner.cr_native_env import NativeClashEnv
+    from native_runner.training.replay_viewer import (_direct_render_commands, _match_config_from_replay,
+                                                       _schedule_direct_render_commands)
     replay, header = build_replay(path)
-    deals = header['timeline']['deals']
+    end_tick = replay.end_native_tick
+    commands = _direct_render_commands(replay)
+    targets = [command.target_tick for command in commands]
     prepare_engine()
-    stop, pause, rewind = threading.Event(), threading.Event(), ReplayRewindControl()
-    native_box: list = []
-    mismatch: list[str] = []
-    skipped = [0]
-
-    def ready(native) -> None:
-        # paused at tick 0: the engine must deal what the recording dealt, or the game is not this one
-        observed = native.observe()
-        for player in observed.get('players') or ():
-            owner = int(player['owner'])
-            hand = [h['cardId'] for h in sorted(player['hand'], key=lambda h: h['handIndex'])]
-            cycle = [c['cardId'] for c in sorted(player['cycle'], key=lambda c: c['cycleIndex'])]
-            want = deals.get(str(owner)) or deals.get(owner)
-            if want and (hand != list(want[0]) or cycle != list(want[1])):
-                mismatch.append(f'owner {owner} was dealt {hand} / {cycle}, the recording {want[0]} / {want[1]}')
-        if mismatch:
-            stop.set()
-            return
-        native_box.append(native)
-        say(state='playing', message='Playing in Null\'s (the CR_4k window).', tick=0, speed=speed)
-
-    def progress(value) -> None:
-        if str(value.phase).startswith('skipped'):
-            skipped[0] += 1
-        say(state='playing', tick=int(value.native_tick), plays=int(value.operation_index),
-            of=int(value.operation_count), phase=str(value.phase), skipped=skipped[0])
-
-    def controls() -> None:
-        for line in sys.stdin:
-            command, _, value = line.strip().partition(' ')
-            if command == 'pause':
-                pause.set()
-                say(state='paused')
-            elif command == 'resume':
-                pause.clear()
-                say(state='playing')
-            elif command == 'speed' and native_box:
-                try:
-                    native_box[0].set_speed(float(value))
-                    say(speed=float(value))
-                except Exception as error:  # noqa: BLE001
-                    say(message=f'speed: {error}')
-            elif command == 'back':
-                say(message='Back 5 s…' if rewind.request_rewind() else rewind.message)
-            elif command == 'stop':
-                pause.clear()
-                stop.set()
-        stop.set()                                  # the app went away
-
-    def clock() -> None:
-        # the tick for the app's board, four times a second (FirstLight reports only at each card)
-        while not stop.is_set():
-            time.sleep(0.25)
-            if native_box and not pause.is_set():
-                try:
-                    status = native_box[0].status()
-                    say(tick=int(status['tick']), ended=bool(status.get('ended')))
-                except Exception:  # noqa: BLE001  (the session is closing)
-                    pass
-    threading.Thread(target=controls, daemon=True).start()
-    threading.Thread(target=clock, daemon=True).start()
     say(state='starting', message='Setting up the battle…')
-    result = play_training_replay(replay, port=PORT, speed=speed, stop_event=stop, pause_event=pause,
-                                  on_native_ready=ready, on_progress=progress, rewind_control=rewind)
-    stop.set()
+    native = NativeClashEnv('127.0.0.1', PORT, timeout=30.0)
+    native.wait_ready(timeout=30.0)
+    native.create_native_match(_match_config_from_replay(replay))
+    native.pause()
+    mismatch = _deal_mismatch(native.observe(), header['timeline']['deals'])
     if mismatch:
-        say(state='failed', message='This game cannot be played again exactly: ' + '; '.join(mismatch))
+        say(state='failed', message='This game cannot be played again exactly: ' + mismatch)
         return 2
-    same = result.expected_winner == result.actual_winner
-    say(state='stopped' if result.stopped else 'done', tick=int(result.final_native_tick),
-        message=('Stopped.' if result.stopped else
-                 ('Finished: same result as in training.' if same else
-                  f'Finished, but the winner differs from training (owner {result.actual_winner} won, '
-                  f'owner {result.expected_winner} in training): the replay drifted.'))
-        + (f' {skipped[0]} card(s) could not be played.' if skipped[0] else ''))
+
+    controls: queue.Queue = queue.Queue()
+
+    def read_controls() -> None:
+        for line in sys.stdin:
+            controls.put(line.strip())
+        controls.put('stop')                       # the app went away
+    threading.Thread(target=read_controls, daemon=True).start()
+
+    snapshots: dict[int, dict] = {}                # tick -> handle, kept for the whole game
+    scheduled: dict[int, int] = {}                 # command index -> the probe's sequence
+    failed: set[int] = set()
+    checked = 0                                    # cards before this index have been accounted for
+
+    def schedule_after(tick: int) -> None:
+        nonlocal checked
+        start = bisect.bisect_right(targets, tick)
+        scheduled.clear()
+        scheduled.update(_schedule_direct_render_commands(native, commands, start_index=start))
+        checked = start
+
+    def keep_snapshot() -> None:
+        try:
+            handle = native.create_snapshot()
+            snapshots[int(handle['tick'])] = dict(handle)
+        except Exception:  # noqa: BLE001  (mid-step, or the probe is full: the next bucket)
+            pass
+
+    schedule_after(0)
+    keep_snapshot()
+    native.set_speed(speed)
+    native.resume()
+    paused, finished, heading_to, reached, last_report = False, False, None, 0, 0.0
+    say(state='playing', message='Playing in Null\'s (the CR_4k window).', tick=0, end=end_tick, speed=speed,
+        of=len(commands))
+
+    def run_to(target: int, tick: int) -> None:
+        """From a paused `tick` <= target: exactly to target at 4x, then the chosen speed."""
+        if target > tick:
+            native.set_speed(FASTEST)
+            native.advance_native_render(target - tick)
+        native.set_speed(speed)
+        if not paused:
+            native.resume()
+
+    last = end_tick - 1                            # held here: see the docstring
+
+    def seek(target: int) -> None:
+        nonlocal heading_to, finished
+        target = max(0, min(int(target), last))
+        finished = False                           # reaching the end again reports it again
+        native.pause()
+        tick = int(native.status()['tick'])
+        base = max((t for t in snapshots if t <= target), default=None)
+        if base is not None and (target < tick or base > tick):
+            tick = int(native.restore(snapshots[base])['tick'])
+            schedule_after(tick)
+        if target - tick <= 2 * SNAPSHOT_EVERY:
+            heading_to = None
+            run_to(target, tick)
+        else:
+            heading_to = target                    # far ahead: run there at 4x, snapshots on the way
+            native.set_speed(FASTEST)
+            native.resume()
+
+    def step(name: str, value: str) -> None:
+        """One control (if any), then one look at the battle."""
+        nonlocal paused, finished, heading_to, reached, last_report, speed, checked
+        if name == 'pause':
+            paused, heading_to = True, None
+            native.pause()
+            native.set_speed(speed)
+            say(state='paused')
+        elif name == 'resume':
+            paused = False
+            native.resume()
+            say(state='playing')
+        elif name == 'speed' and value:
+            speed = float(value)
+            if heading_to is None:
+                native.set_speed(speed)
+            say(speed=speed)
+        elif name == 'seek' and value:
+            seek(int(float(value)))
+            say(state='paused' if paused else 'playing', seeking=heading_to)
+        status = native.status()
+        tick = int(status['tick'])
+        reached = max(reached, tick)
+        if tick // SNAPSHOT_EVERY not in {t // SNAPSHOT_EVERY for t in snapshots}:
+            keep_snapshot()
+        while checked < len(commands) and targets[checked] <= tick:
+            receipt = native.replay_schedule_status(scheduled[checked]) if checked in scheduled else {'state': 'failed'}
+            if receipt.get('state') == 'pending':
+                break
+            if receipt.get('state') == 'failed':
+                failed.add(checked)
+            checked += 1
+        if heading_to is not None and tick >= heading_to - 2 * SNAPSHOT_EVERY:
+            native.pause()
+            target, heading_to = heading_to, None
+            run_to(target, int(native.status()['tick']))
+            say(state='paused' if paused else 'playing', seeking=None)
+        if not finished and heading_to is None and tick >= last - (int(10 * speed) + 3) and not status.get('ended'):
+            # the end: exactly to the last tick before it, paused there
+            native.pause()
+            tick = int(native.status()['tick'])
+            if tick < last:
+                native.advance_native_render(last - tick)
+                tick = last
+            finished, paused = True, True
+            say(state='done', tick=tick, message=f'End of the game ({gameclock(end_tick)}), as in training'
+                + (f', but {len(failed)} card(s) could not be played: it drifted.' if failed else
+                   ': every card went in at its tick.') + ' Drag back to watch any part again.')
+        if status.get('ended') and not finished:
+            finished = True
+            say(state='done', tick=tick, message=(
+                f'The game ended early, at {gameclock(tick)} instead of {gameclock(end_tick)}: it drifted from training.'
+                if tick < end_tick else 'End of the game, as in training (the battle screen closed; dragging back '
+                'shows the board without hands).'))
+        if time.monotonic() - last_report >= 0.2:
+            last_report = time.monotonic()
+            say(tick=tick, plays=checked, skipped=len(failed), explored=reached)
+
+    errors = 0
+    while True:
+        try:
+            command = controls.get(timeout=0.05)
+        except queue.Empty:
+            command = ''
+        name, _, value = command.partition(' ')
+        if name == 'stop':
+            break
+        try:
+            step(name, value)
+            errors = 0
+        except Exception as error:  # noqa: BLE001  (one refused command must not end the session)
+            errors += 1
+            say(message=f'{type(error).__name__}: {error}')
+            if errors >= 40:
+                say(state='failed', message=f'The engine stopped answering: {error}')
+                return 1
+            time.sleep(0.05)
+    native.pause()
+    for handle in snapshots.values():
+        try:
+            native.release_snapshot(handle)
+        except Exception:  # noqa: BLE001
+            pass
+    say(state='stopped', message='Stopped.')
     return 0
 
 

@@ -3,9 +3,10 @@ import SwiftUI
 
 // MARK: - Watch in Null's: a recorded training game played again in the real game
 //
-// il/watch_nulls.py does the work (CR_4k with FirstLight's replay player). This runs it, sends it
-// the controls on stdin (pause, resume, speed X, back, stop) and reads its progress, one JSON
-// object per line, from stdout. The game shows in the CR_4k emulator window.
+// il/watch_nulls.py does the work (CR_4k, FirstLight's direct scheduling, snapshots for seeking).
+// This runs it, sends it the controls on stdin (pause, resume, speed X, seek TICK, stop) and reads
+// its progress, one JSON object per line, from stdout. The game shows in the CR_4k emulator window;
+// while it plays, the game's own play button, progress bar and speed drive it (GamePlayer).
 
 @MainActor
 final class NullsPlayer: ObservableObject {
@@ -17,6 +18,9 @@ final class NullsPlayer: ObservableObject {
     @Published var of = 0
     @Published var skipped = 0
     @Published var speed: Double = 1
+    @Published var end: Int?
+    @Published var explored = 0        // how far it has played: seeks up to here are near-instant
+    @Published var seeking: Int?       // a far seek, running there at 4x
     @Published private(set) var running = false
     private var process: Process?
     private var input: FileHandle?
@@ -26,12 +30,18 @@ final class NullsPlayer: ObservableObject {
 
     init(root: URL) { self.root = root }
 
-    var active: Bool { running && ["preparing", "starting", "playing", "paused"].contains(state) }
+    var active: Bool { running && ["preparing", "starting", "playing", "paused", "done"].contains(state) }
+
+    /// This game is up in Null's: its controls drive Null's.
+    func linked(_ game: TrainingGame) -> Bool {
+        running && gameTag == game.id && ["playing", "paused", "done"].contains(state)
+    }
 
     func watch(_ game: TrainingGame) {
         guard let path = game.path, !running else { return }
         gameTag = game.id
         state = "preparing"; message = "Starting…"; tick = nil; plays = 0; of = 0; skipped = 0; lastLog = ""
+        end = nil; explored = 0; seeking = nil
         buffer = Data()
         let speedText = speed == speed.rounded() ? String(Int(speed)) : String(speed)
         launch("exec ./py -m il.watch_nulls \(path.shellQuoted) --speed \(speedText)")
@@ -54,7 +64,12 @@ final class NullsPlayer: ObservableObject {
         try? input?.write(contentsOf: Data((command + "\n").utf8))
     }
 
-    func pauseOrResume() { send(state == "paused" ? "resume" : "pause") }
+    func pauseOrResume() {
+        if state == "done" { seek(0); send("resume") }       // from the start again
+        else { send(state == "paused" ? "resume" : "pause") }
+    }
+
+    func seek(_ tick: Int) { send("seek \(tick)") }
 
     func setSpeed(_ value: Double) {
         speed = value
@@ -128,40 +143,35 @@ final class NullsPlayer: ObservableObject {
             if let value = object["of"] as? Int { of = value }
             if let value = object["skipped"] as? Int { skipped = value }
             if let value = object["speed"] as? Double { speed = value }
+            if let value = object["end"] as? Int { end = value }
+            if let value = object["explored"] as? Int { explored = value }
+            if object.keys.contains("seeking") { seeking = object["seeking"] as? Int }
         }
     }
 }
 
-/// Under a game: the button that plays it in Null's, then its controls while it plays.
+/// Under a game: the button that plays it in Null's; while it plays, where it is and Stop (the
+/// game's own play button, progress bar and speed drive it).
 struct NullsBar: View {
     @ObservedObject var nulls: NullsPlayer
     let game: TrainingGame
-    private static let speeds: [Double] = [0.25, 0.5, 1, 2, 4]
 
     private var mine: Bool { nulls.gameTag == game.id }
 
     var body: some View {
         HStack(spacing: 10) {
             if mine && nulls.active {
-                if nulls.state == "preparing" || nulls.state == "starting" { ProgressView().controlSize(.small) }
-                Button { nulls.pauseOrResume() } label: {
-                    Image(systemName: nulls.state == "paused" ? "play.fill" : "pause.fill").frame(width: 18)
+                if nulls.state == "preparing" || nulls.state == "starting" || nulls.seeking != nil {
+                    ProgressView().controlSize(.small)
                 }
-                .disabled(nulls.state != "playing" && nulls.state != "paused")
-                .help("Pause or resume the game in Null's.")
-                Button { nulls.send("back") } label: { Label("5 s", systemImage: "gobackward.5") }
-                    .disabled(nulls.state != "playing" && nulls.state != "paused")
-                    .help("Back 5 seconds in Null's.")
-                Picker("Speed", selection: Binding(get: { nulls.speed }, set: { nulls.setSpeed($0) })) {
-                    ForEach(Self.speeds, id: \.self) { Text(speedLabel($0)).tag($0) }
-                }
-                .labelsHidden().frame(width: 76)
-                Button(role: .destructive) { nulls.stop() } label: { Label("Stop", systemImage: "stop.fill") }
+                Image(systemName: "play.tv").foregroundStyle(.secondary)
                 Text(status).font(.callout).foregroundStyle(.secondary).lineLimit(2)
+                Button(role: .destructive) { nulls.stop() } label: { Label("Stop", systemImage: "stop.fill") }
+                    .help("Ends the game in Null's (CR_4k stays open for the next one).")
             } else {
                 Button { nulls.watch(game) } label: { Label("Watch in Null's", systemImage: "play.tv") }
                     .disabled(nulls.running || game.path == nil)
-                    .help("Plays this game again in Null's Royale itself, on the CR_4k emulator (its window shows the game). The board here follows it.")
+                    .help("Plays this game again in Null's Royale itself, on the CR_4k emulator (its window shows the game). Play, the progress bar and speed here then drive it.")
                 if mine || nulls.state == "closed" || (nulls.state == "failed" && nulls.gameTag == nil) {
                     Text(nulls.message).font(.callout)
                         .foregroundStyle(nulls.state == "failed" ? Color.red : .secondary).lineLimit(3)
@@ -178,16 +188,15 @@ struct NullsBar: View {
     }
 
     private var status: String {
+        if let target = nulls.seeking {
+            return "Running ahead at 4× to \(gameClock(Double(target)))…"
+        }
         if nulls.state == "playing" || nulls.state == "paused", let tick = nulls.tick {
             let cards = nulls.of > 0 ? " · card \(nulls.plays) of \(nulls.of)" : ""
-            let skipped = nulls.skipped > 0 ? " · \(nulls.skipped) skipped" : ""
-            return (nulls.state == "paused" ? "Paused at " : "In Null's: ") + gameClock(Double(tick)) + cards + skipped
+            let skipped = nulls.skipped > 0 ? " · \(nulls.skipped) could not be played" : ""
+            return (nulls.state == "paused" ? "In Null's, paused at " : "In Null's: ") + gameClock(Double(tick)) + cards + skipped
         }
         return nulls.message
-    }
-
-    private func speedLabel(_ value: Double) -> String {
-        value == value.rounded() ? "\(Int(value))×" : "\(value)×"
     }
 }
 

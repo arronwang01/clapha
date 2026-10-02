@@ -1713,3 +1713,24 @@ while drifting far from v2 (KL estimates up to 550, entropy 0.20 -> 0.36). pilot
 - sharing line 9.5 GB.
 
 Details: TRAINING.md journal.
+
+## 2026-10-02: training games from the PC, replays in Null's, models for the console
+
+- **CR_4k is never "emulator-5554" by name.** MuMu Pro's adbd listens on port 5555, and adb lists
+  anything there as emulator-5554: while CR_4k is down, that name is the live MuMu device (official
+  CR, model SM-S7310). An emulator booted without -port then takes console 5554 beside it, so even
+  `adb emu avd name` answers CR_4k while `adb shell` reaches MuMu. Found when a test's
+  `play_firstlight.sh --install-only` ran `getprop`, `adb root` (a no-op: MuMu's adbd is already
+  root) and an `ls` on MuMu, twice, and stopped there; nothing was written or started on it. Now
+  CR_4k boots on its own ports (`-port 5580`, emulator-5580) and is found by the property it
+  reports itself, `ro.boot.qemu.avd_name` = CR_4k (tools/play_firstlight.sh, il/watch_nulls.py).
+  Still assuming emulator-5554: il.engine_convert --serial's default, and the macos-port scripts
+  when run on their own (play_firstlight.sh exports CR_ADB_SERIAL for them).
+- **Training games** (TRAINING.md section 4): pack-recordings.cmd on the PC (one zip; --models adds
+  each run's newest model) -> Clapha Training games -> Import. Models land in runs/pc/<run>-u<N>.pt
+  and the console offers them as clapha:<run>-u<N> without a restart (firstlight_bot._discover).
+- **Watch in Null's** (il/watch_nulls.py): a recorded game played again in the stock renderer; the
+  first test (pilot3 self-play, 143 cards) ended on the recorded tick 6135 with the recorded
+  winner. The game's play button, progress bar and speed drive it: snapshots every 120 ticks for
+  the whole game (the probe keeps 64), so seeking back, or forward to anywhere already played,
+  restores one and runs at most 240 ticks; further ahead runs at 4x, the probe's fastest.

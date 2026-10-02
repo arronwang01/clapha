@@ -161,7 +161,7 @@ struct TrainingGamesView: View {
             Divider()
             if let game = current, let labels = model.file?.labels {
                 VStack(alignment: .leading, spacing: 10) {
-                    GamePlayer(game: game, labels: labels, tick: $tick, playing: $playing, speed: $speed)
+                    GamePlayer(game: game, labels: labels, tick: $tick, playing: $playing, speed: $speed, nulls: nulls)
                     Divider()
                     NullsBar(nulls: nulls, game: game)
                 }
@@ -180,12 +180,6 @@ struct TrainingGamesView: View {
             if tick >= Double(game.end) { playing = false }
         }
         .onAppear { if model.file == nil { model.load() } }
-        .onChange(of: nulls.tick) { _, value in
-            // the board follows the game playing in Null's
-            guard let value, nulls.gameTag == current?.id, nulls.active else { return }
-            playing = false
-            tick = Double(value)
-        }
         .dropDestination(for: URL.self) { urls, _ in
             importRecordings(urls)
             return !urls.isEmpty
@@ -272,6 +266,9 @@ struct GamePlayer: View {
     @Binding var tick: Double
     @Binding var playing: Bool
     @Binding var speed: Double
+    @ObservedObject var nulls: NullsPlayer
+    @State private var dragging = false
+    private static let nullsSpeeds: [Double] = [0.25, 0.5, 1, 2, 4]
 
     private func label(_ index: Int) -> String { labels.indices.contains(index) ? labels[index] : "?" }
 
@@ -306,19 +303,43 @@ struct GamePlayer: View {
                 }
                 .frame(minWidth: 280, maxWidth: 360, alignment: .leading)
             }
+            // while the game is up in Null's these drive it: play / pause, drag anywhere, its speed
+            let linked = nulls.linked(game)
             HStack(spacing: 10) {
                 Button {
+                    if linked { nulls.pauseOrResume(); return }
                     if !playing && tick >= Double(game.end) { tick = Double(game.start) }
                     playing.toggle()
-                } label: { Image(systemName: playing ? "pause.fill" : "play.fill").frame(width: 18) }
-                    .keyboardShortcut(.space, modifiers: [])
-                Slider(value: $tick, in: Double(game.start)...Double(max(game.end, game.start + 1)))
-                Picker("Speed", selection: $speed) {
-                    Text("1×").tag(1.0); Text("2×").tag(2.0); Text("4×").tag(4.0); Text("8×").tag(8.0)
+                } label: {
+                    Image(systemName: (linked ? nulls.state == "playing" : playing) ? "pause.fill" : "play.fill").frame(width: 18)
                 }
-                .labelsHidden().frame(width: 70)
+                    .keyboardShortcut(.space, modifiers: [])
+                Slider(value: $tick, in: Double(game.start)...Double(max(game.end, game.start + 1))) { editing in
+                    dragging = editing
+                    if !editing && linked { nulls.seek(Int(tick)) }
+                }
+                if linked {
+                    Picker("Speed", selection: Binding(get: { nulls.speed }, set: { nulls.setSpeed($0) })) {
+                        ForEach(Self.nullsSpeeds, id: \.self) { value in
+                            Text(value == value.rounded() ? "\(Int(value))×" : "\(value)×").tag(value)
+                        }
+                    }
+                    .labelsHidden().frame(width: 76)
+                    .help("Null's speed (its fastest is 4×).")
+                } else {
+                    Picker("Speed", selection: $speed) {
+                        Text("1×").tag(1.0); Text("2×").tag(2.0); Text("4×").tag(4.0); Text("8×").tag(8.0)
+                    }
+                    .labelsHidden().frame(width: 70)
+                }
                 Text(gameClock(tick)).font(.callout.monospacedDigit()).frame(width: 64, alignment: .trailing)
             }
+        }
+        .onChange(of: nulls.tick) { _, value in
+            // the board follows the game in Null's, except while the bar is being dragged
+            guard let value, nulls.linked(game), !dragging else { return }
+            playing = false
+            tick = Double(value)
         }
     }
 
