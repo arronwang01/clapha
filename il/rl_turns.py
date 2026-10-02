@@ -56,6 +56,26 @@ LAUNCHER = CLAPHA.parent / 'rl.ps1'          # the code update puts it next to c
 ENGINE_SCRIPTS = Path(r'D:\crtrain\engine')  # stage6c.ps1 (engines), stage7.ps1 (VM, firewall, engines)
 ADB = Path(r'D:\crtrain\platform-tools\adb.exe')
 SERIAL = '127.0.0.1:16416'                   # the engine VM, crengine12
+MUMU_MANAGER = Path(r'C:\Program Files\Netease\MuMu\nx_main\MuMuManager.exe')
+VM_INDEX = 1
+
+
+def _reset_mumu(say) -> None:
+    """Clear what a dead VM leaves behind before relaunching it. 2026-10-02: the VM process was gone
+    but MuMu still said 'process started', and MuMuManager calls hung for hours; every relaunch then
+    started nothing. Kill the stuck manager calls and the device window, then mark the VM shut down."""
+    for image in ('MuMuManager.exe', 'MuMuNxDevice.exe'):
+        try:
+            subprocess.run(['taskkill', '/F', '/IM', image], capture_output=True, timeout=30, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    try:
+        subprocess.run([str(MUMU_MANAGER), 'control', '-v', str(VM_INDEX), 'shutdown'], capture_output=True,
+                       timeout=60, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    time.sleep(10)
+    say('cleared stuck MuMu processes and marked the engine VM shut down')
 BASE_PORT = 26789
 
 
@@ -152,11 +172,12 @@ def ensure_engines(count: int, run_dir: Path, say) -> list[int]:
     log = run_dir / 'engines.log'
     if vm_up():
         say(f'{len(up)} of {count} engines answer: restarting the engines (stage6c, ~1 min each)')
-        powershell(ENGINE_SCRIPTS / 'stage6c.ps1', '-Count', str(count), timeout=150 * 60, log=log)
+        powershell(ENGINE_SCRIPTS / 'stage6c.ps1', '-Count', str(count), timeout=40 * 60, log=log)
         status = Path(r'D:\crtrain\status6.txt')
     else:
         say('the engine VM does not answer: restarting it, its firewall and the engines (stage7)')
-        powershell(ENGINE_SCRIPTS / 'stage7.ps1', timeout=180 * 60, log=log)
+        _reset_mumu(say)
+        powershell(ENGINE_SCRIPTS / 'stage7.ps1', timeout=30 * 60, log=log)
         status = Path(r'D:\crtrain\status7.txt')
     tail = _oneline(status.read_text(errors='replace'), 2) if status.is_file() else ''
     up = [port for port in ports if engine_up(port)]
@@ -317,12 +338,19 @@ def main(argv: list[str]) -> int:
     progress, progress_at = _progress(run_dir), time.time()
     last_restart = 0.0
 
+    engines_down = {'tries': 0, 'next': 0.0}
+
     def start() -> None:
         nonlocal parts, progress, progress_at
         up = ensure_engines(args.engines, run_dir, say)
         if not up:
-            say('no engine answers: not starting (trying again later)')
+            # back off instead of relaunching every few minutes; status.txt says so
+            engines_down['tries'] += 1
+            wait = min(60, 15 * engines_down['tries'])
+            engines_down['next'] = time.time() + wait * 60
+            say(f"no engine answers after {engines_down['tries']} tries: next try in {wait} min (engines.log)")
             return
+        engines_down['tries'] = 0
         output = launcher('-Engines', str(len(up)), '-Ports', '/'.join(map(str, up)), '-League', args.league,
                           *(('-Init', args.init) if args.init else ()))
         parts = {int(pid): name for name, pid in re.findall(r'(\S+) pid (\d+)', output)}
@@ -354,7 +382,10 @@ def main(argv: list[str]) -> int:
             calm = 0 if busy else calm + 1
             say(f"{'RUN ' if running else 'idle'} ours {own} MiB, others {other_mib} MiB ({top})")
             now_line = (f'RUN (ours {own} MiB)' if running else
-                        f'idle: others hold {other_mib} MiB ({top})' if busy else f'idle: GPU free for {calm} min')
+                        f'idle: others hold {other_mib} MiB ({top})' if busy else
+                        f"ENGINES DOWN: the VM did not come back after {engines_down['tries']} tries; next try "
+                        f"{time.strftime('%H:%M', time.localtime(engines_down['next']))} (engines.log)"
+                        if engines_down['tries'] else f'idle: GPU free for {calm} min')
             disk = free_gb(run_dir)
             if disk < 30:
                 thin(run_dir, say)
@@ -383,7 +414,7 @@ def main(argv: list[str]) -> int:
                     say(f'{why}: restarting the run -> {_oneline(launcher("-Stop"), 1)}')
                     last_restart = time.time()
                     start()
-            elif calm >= args.calm and not full and not held:
+            elif calm >= args.calm and not full and not held and time.time() >= engines_down['next']:
                 if mine:
                     launcher('-Stop')           # stale pids from an earlier stop
                 say(f'GPU free for {calm} min: starting')
