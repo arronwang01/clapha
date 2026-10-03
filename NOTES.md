@@ -1893,3 +1893,27 @@ in half. So pilot3 keeps the hold; the mask is for the next model.
 - Still to do: run `il/duel.py --a-deal hold|mask` in the engine (does it run; what the rule costs pilot3);
   a friendly with the bot on to confirm no failed clicks; the next run with `-Deal mask`.
 
+## 2026-10-03 evening: RoyaleGym's "2.1k games an hour with learning" on a 3050 -- where it comes from
+
+The user asked (github.com/orgs/RoyaleGym: RoyaleSim, RoyaleGym, RoyaleLearn, read at their 2026-10-03 heads).
+- **What it is:** a from-scratch Rust battle simulator (not the game's engine), ~32,000 ticks/s raw, 1.21 ms
+  per env step through Python (0.31 engine + 0.90 observation and mask, both seats); a decision every 500 ms;
+  a ~430,000-parameter conv net (64 channels, 4 blocks); PPO with 3 epochs. Their own measurement (4-core
+  laptop, RTX 3050 4 GB, 7.8 GB RAM, other jobs running, 2026-09-22): 8,256 transitions per 30-35 s
+  iteration, the update 71-83% of it: 48 battles advancing 43 game-seconds each = 60-70x real time. The
+  2.1k figure is not in the repositories; 60-70 game-hours an hour is 2,100 battles at ~1.8 minutes each
+  (1,300 at three minutes). Their docs: "Nobody has trained a bot with this yet", and against recorded real
+  matches a non-tower unit is within a quarter tile 56.5% of the time (hitpoints exact 79.5%).
+- **Ours, same units** (pilot3's games.jsonl, last 400 timed games): 69 s per game per engine -- engine 6.1 s,
+  building observations 10.7 s, deciding 51.5 s (the model's forward and the wait for the inference server)
+  -- for 6,132 ticks and 2,450 decisions; ~10 games/min on 14 engines = 50x real time, 400 decisions/s
+  against their ~250, with a model 30 times larger (12.7M parameters) deciding twice as often.
+- **So the gap in games/hour is decisions per game (ours ~2,450, theirs ~350-700) and model size, not the
+  simulator:** the real engine is 9% of our game's wall time. Their simulator would save us 6 s of 69 and
+  cost the fidelity. The levers are the ones already planned -- the deciding path (51 of 69 s), then
+  observation building, then the learner (3.9 ms per decision = 9.5 GPU-seconds a game, which caps the 4080
+  near 380 games/h whatever the collectors do).
+- **Worth taking:** their client measurements on 15.535.29 agree with ours of today and add the hand's
+  refill timer (docs/GAME_INTEGRATION.md); their calibration file names each rule's evidence and what would
+  overturn it.
+
