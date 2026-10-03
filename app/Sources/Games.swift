@@ -42,7 +42,15 @@ struct TrainingGame: Decodable, Identifiable {
     let decks: [[String]]
     let frames: [GameFrame]
     let plays: [[Int]]       // tick, side (0 = learner), label, grid x, grid y
+    let clicks: [[Int]]?     // a live match (il/live_games.py): the bot's clicks -- tick, label, grid x, grid y, 1 = the game never took it
     var id: String { tag }
+
+    var failedClicks: [[Int]] { (clicks ?? []).filter { $0.count > 4 && $0[4] == 1 } }
+
+    /// Plays and the bot's failed clicks in time order: tick, side, label, 1 = a failed click.
+    var log: [[Int]] {
+        (plays.map { [$0[0], $0[1], $0[2], 0] } + failedClicks.map { [$0[0], 0, $0[1], 1] }).sorted { $0[0] < $1[0] }
+    }
     var start: Int { frames.first?.tick ?? 0 }
     var end: Int { frames.last?.tick ?? 0 }
 
@@ -133,6 +141,7 @@ struct TrainingGamesView: View {
         ("all", "Everyone"), ("firstlight", "FirstLight at full strength"),
         ("anchor", "The anchor: v2, or ex1's frozen pilot3"), ("hog2", "hog2, no delay"),
         ("general", "General, real decks"), ("self", "Itself"), ("snap", "Its snapshots"),
+        ("live", "Live matches against you"),
     ]
 
     private static let reload = "./py -m il.game_viewer runs/rl --max 80 --json runs/viewer/games.json"
@@ -336,13 +345,18 @@ struct GamePlayer: View {
                     side(0, frame: frame)
                     Text("Plays").font(.subheadline.weight(.semibold))
                     VStack(alignment: .leading, spacing: 3) {
-                        ForEach(Array(game.plays.filter { Double($0[0]) <= tick }.suffix(14).reversed().enumerated()),
+                        ForEach(Array(game.log.filter { Double($0[0]) <= tick }.suffix(14).reversed().enumerated()),
                                 id: \.offset) { _, play in
                             HStack(spacing: 8) {
                                 Text(gameClock(Double(play[0])).replacingOccurrences(of: " OT", with: ""))
                                     .font(.caption.monospacedDigit()).foregroundStyle(.secondary).frame(width: 36, alignment: .leading)
-                                Circle().fill(play[1] == 0 ? learnerColor : opponentColor).frame(width: 8, height: 8)
-                                Text(label(play[2])).font(.caption)
+                                if play[3] == 1 {
+                                    Image(systemName: "xmark").font(.caption2.weight(.bold)).foregroundStyle(.red).frame(width: 8)
+                                    Text("\(label(play[2])): click failed").font(.caption.weight(.semibold)).foregroundStyle(.red)
+                                } else {
+                                    Circle().fill(play[1] == 0 ? learnerColor : opponentColor).frame(width: 8, height: 8)
+                                    Text(label(play[2])).font(.caption)
+                                }
                             }
                         }
                     }
@@ -379,6 +393,19 @@ struct GamePlayer: View {
                 .help(linked ? "Null's speed (its fastest is 4×)." : "The board's speed.")
                 Text(gameClock(tick)).font(.callout.monospacedDigit()).frame(width: 64, alignment: .trailing)
             }
+            // a live match: the clicks the game never took, along the match, and a jump to each
+            let failed = game.failedClicks
+            if !failed.isEmpty {
+                HStack(spacing: 10) {
+                    Button { jump(failed, back: true) } label: { Image(systemName: "chevron.left") }
+                        .help("The failed click before this moment.")
+                    Button { jump(failed, back: false) } label: { Label("Next failed click", systemImage: "chevron.right") }
+                        .help("Jumps to 1.5 s before the next click the game never took.")
+                    FailedStrip(game: game, failed: failed, tick: tick)
+                        .frame(height: 16)
+                    Text("\(failed.count) clicks failed").font(.caption).foregroundStyle(.red)
+                }
+            }
         }
         .onChange(of: nulls.tick) { _, value in
             // the board follows the game in Null's, except while the bar is being dragged
@@ -386,6 +413,12 @@ struct GamePlayer: View {
             playing = false
             tick = Double(value)
         }
+    }
+
+    private func jump(_ failed: [[Int]], back: Bool) {
+        let target = back ? failed.last { Double($0[0]) < tick - 40 } : failed.first { Double($0[0]) > tick + 31 }
+        guard let click = target else { return }
+        tick = max(Double(game.start), Double(click[0]) - 30)
     }
 
     private func side(_ side: Int, frame: GameFrame) -> some View {
@@ -490,8 +523,47 @@ struct GameBoard: View {
                 context.draw(Text(name(o.label)).font(.system(size: 9, weight: .bold)).foregroundStyle(.yellow),
                              at: CGPoint(x: p.x, y: p.y - r - 7))
             }
+            // a click the game never took: a cross on the tile it was aimed at, with the card, for three seconds
+            for click in game.failedClicks {
+                let age = tick - Double(click[0])
+                guard age >= 0, age <= 60 else { continue }
+                let fade = 1 - max(0, age - 40) / 20
+                let p = point(Double(click[2] * 10 + 5), Double(click[3] * 10 + 5))
+                let r = tile * 0.7
+                var cross = Path()
+                cross.move(to: CGPoint(x: p.x - r, y: p.y - r)); cross.addLine(to: CGPoint(x: p.x + r, y: p.y + r))
+                cross.move(to: CGPoint(x: p.x - r, y: p.y + r)); cross.addLine(to: CGPoint(x: p.x + r, y: p.y - r))
+                context.stroke(cross, with: .color(.white.opacity(fade)), style: StrokeStyle(lineWidth: 5, lineCap: .round))
+                context.stroke(cross, with: .color(.red.opacity(fade)), style: StrokeStyle(lineWidth: 3, lineCap: .round))
+                let text = context.resolve(Text("\(name(click[1])): click failed").font(.system(size: 10, weight: .bold)).foregroundStyle(.white))
+                let box = text.measure(in: CGSize(width: 300, height: 40))
+                let at = CGPoint(x: min(max(p.x, box.width / 2 + 6), w - box.width / 2 - 6), y: max(box.height, p.y - r - 11))
+                context.fill(Path(roundedRect: CGRect(x: at.x - box.width / 2 - 4, y: at.y - box.height / 2 - 2,
+                                                      width: box.width + 8, height: box.height + 4), cornerRadius: 4),
+                             with: .color(.red.opacity(0.9 * fade)))
+                context.draw(text, at: at)
+            }
         }
         .aspectRatio(18.0 / 32.0, contentMode: .fit)
         .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+/// Where along a live match the bot's failed clicks are, and where the replay is now.
+struct FailedStrip: View {
+    let game: TrainingGame
+    let failed: [[Int]]
+    let tick: Double
+
+    var body: some View {
+        Canvas { context, size in
+            let span = Double(max(1, game.end - game.start))
+            func x(_ t: Double) -> Double { (t - Double(game.start)) / span * size.width }
+            context.fill(Path(CGRect(x: 0, y: size.height / 2 - 0.5, width: size.width, height: 1)), with: .color(.secondary.opacity(0.4)))
+            for click in failed {
+                context.fill(Path(CGRect(x: x(Double(click[0])) - 1, y: 2, width: 2, height: size.height - 4)), with: .color(.red))
+            }
+            context.fill(Path(CGRect(x: x(tick) - 0.75, y: 0, width: 1.5, height: size.height)), with: .color(.primary))
+        }
     }
 }

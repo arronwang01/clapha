@@ -14,7 +14,8 @@ struct Snapshot {
             let model = GamesModel()
             model.file = try! JSONDecoder().decode(GameFile.self, from: Data(contentsOf: URL(fileURLWithPath: args[2])))
             let game = model.file!.games[args.count > 4 ? Int(args[4])! : 0]
-            let view = TrainingGamesView(model: model, selection: game.id, tick: Double(game.start + (game.end - game.start) * 2 / 5))
+            let view = TrainingGamesView(model: model, selection: game.id,
+                                         tick: args.count > 5 ? Double(args[5])! : Double(game.start + (game.end - game.start) * 2 / 5))
                 .frame(width: 1150, height: 780)
                 .background(Color(nsColor: .windowBackgroundColor))
             write(view, to: args[3])

@@ -219,6 +219,11 @@ def main(argv: list[str]) -> int:
             'about': f'{len(games)} games from {", ".join(str(p) for p in args.paths)}, newest first'
                      + (f'; {args.league} only' if args.league else '') + (f'; {args.result} only' if args.result else '')
                      + '. The learner plays from the bottom; rings mark where cards landed.'}
+    if args.json:
+        from il.live_games import merge            # live matches the user marked (il/live_games.py)
+        live = merge(data)
+        if live:
+            print(f'{live} live matches added')
     target = args.json or args.out
     target.parent.mkdir(parents=True, exist_ok=True)
     body = json.dumps(data, separators=(',', ':'))
