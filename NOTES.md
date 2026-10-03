@@ -1779,3 +1779,23 @@ decides each recorded play again from the game's own inputs, once as it was and 
   it played on 23% of Musketeer turns, 29% of Ice Spirit turns, 7% of Fireball turns, no Cannon turns --
   and its urge to play rises (+0.05 on average). Game results with Arrows were not measured (that needs
   engine games).
+
+## 2026-10-03: what training at scale costs, and the plan the user chose
+
+- **Scale, from measured rates** (TRAINING.md section 2 and the pilot3 journal): a game is ~302 s, 2,420
+  decisions (both sides), 3.9 MB per lane. The PC as the code is: ~10 games/min while running, 6,000-11,000
+  games a day at pilot3's real availability; of a game's 66 s, 37 s wait for the inference server, and the
+  learner just keeps up (<= ~3.9 ms per learner decision). pilot3 so far: ~20,000 games (0.19 in-game years).
+  FirstLight's listed PPO chain (30 + 460 + 192 + 616 updates x 1,528 matches x 40 game-s): ~262,000 games
+  (2.5 in-game years); hog2's own stage ~190,000.
+- **Google's $300 trial credit: ~20,000-60,000 games** (L4 at $0.62 spot / $0.71 on demand per hour, ~3x
+  slower than the 4080 on this work: about a week of the PC). The trial has no GPUs and 8 cores until
+  upgraded; nested virtualization only on Intel (not E2, AMD except N4D, Arm). Playing there and learning on
+  the PC would move ~3 TB of lanes per 500,000 games: the download fees exceed the credit. The user will not
+  use it for this.
+- **The plan (the user, 2026-10-03):** 500,000-1,000,000 mirror games on the 4080 PC as the proof of concept
+  of a skilful 2.6 mirror bot. Order: (1) the delay diagnosis (timing record, marked games); (2) two
+  speed-ups, target 20-25 games/min: the inference server's wait, and the learner 2.5-3x; (3) before the long
+  run, the training opponent fixed (training's hog2 lost 1-5 to the real one). The PC is down for about a
+  week from 2026-10-03. A friend has an A100 on a machine with KVM disabled: no engines there as they run
+  today (the Android VM needs it); it could take the learner, with engines elsewhere.
