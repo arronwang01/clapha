@@ -1919,3 +1919,15 @@ The user asked (github.com/orgs/RoyaleGym: RoyaleSim, RoyaleGym, RoyaleLearn, re
   refill timer (docs/GAME_INTEGRATION.md); their calibration file names each rule's evidence and what would
   overturn it.
 
+## 2026-10-03 night: the opponent on the MuMu overlay (deck guessed, deck seen, hand, elixir)
+
+For debugging (the user): `console.opponent_view` in /state, drawn by the app's overlay (Overlay.swift
+`drawOpponent`, the "Opponent info" switch) in a strip beside the game picture, or small inside its top left
+when the screen has no room. Three things kept apart: the deck held for theirs before they play (their
+console's published deck, else the API's equipped deck), faint, and gone the moment a card they play is not
+in it; the cards actually seen, with the hand that follows from the order of their plays (a card is out of
+the hand from its play, which we see ~10 ticks later in the queue; after four plays the hand is every card
+not among their last four, unknown ones as "?"), and the next card back; their exact elixir. Checked with
+made-up plays and an off-screen render (`build/clapha_snapshot --overlay state.json out.png`), not yet on a
+live battle.
+
