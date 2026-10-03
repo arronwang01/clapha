@@ -1,6 +1,8 @@
 """Live matches the user marked, whole, in the app's game viewer (Training games -> Live matches): the board as
 the bot's client had it (the bot at the bottom), both players' plays, and every click the bot made -- the ones
-the game never registered marked on the tile they were aimed at.
+the game never registered marked on the tile they were aimed at, each with why (the card not dealt into the
+game's hand yet; sent right after another click; the card already used), and a card that a failed click of
+another card put down named as such in the plays.
 
 From the console's recordings of those matches (artifacts/viewer-sessions/<session>: frames.jsonl, queue.jsonl)
 and its log (build/bot_<port>.log: one line per click, with its tile). A click counts as registered when a
@@ -50,9 +52,14 @@ def read(session: Path):
             pid, address, tick = frame['pid'], frame['chain']['battle'], int(frame['game_tick'])
             battle = current.get(pid)
             if battle is None or battle['battle'] != address or tick < battle['last'] - 100:
-                battle = current[pid] = {'pid': pid, 'battle': address, 'side': side, 'frames': [], 'last': tick}
+                battle = current[pid] = {'pid': pid, 'battle': address, 'side': side, 'frames': [], 'last': tick,
+                                         'hands': {}}
                 battles.append(battle)
             battle['last'] = tick
+            me = next((p for p in frame['players'] if p.get('side') == side), None)
+            if me:      # the game's own hand on every tick: which cards a click could reach
+                deck = me.get('deck_card_ids') or ()
+                battle['hands'][tick] = [deck[i] for i in me.get('hand_deck_indices') or () if 0 <= i < len(deck)]
             if tick % EVERY == 0 or not battle['frames']:
                 battle['frames'].append(frame)
             battle['final'] = frame
@@ -154,16 +161,46 @@ def convert(battle: dict, commands: list[dict], logged: dict | None, V, label, t
             ours.append(c)
     clicks, failed = [], 0
     if logged is not None and logged['side'] == side:
-        claimed: set[int] = set()
-        for click in logged['clicks']:
+        hands = {tick: [card_name(V, V.card_identity(c)[0]) for c in cards] for tick, cards in battle['hands'].items()}
+
+        def held(card: str, tick: int):
+            """Whether the game's own hand had the card on that tick (None: no frame near it)."""
+            hand = next((hands[t] for t in (tick, tick - 1, tick + 1) if t in hands), None)
+            return None if hand is None else card in hand
+        claimed: dict[int, int] = {}
+        rows = []
+        for number, click in enumerate(logged['clicks']):
             match = next((i for i, c in enumerate(ours) if i not in claimed and card_name(V, c['card']) == click['card']
                           and -3 <= c['issue'] - click['tick'] <= 8), None)
             if match is not None:
-                claimed.add(match)
-            else:
+                claimed[match] = number
+            rows.append((click, match))
+        for number, (click, match) in enumerate(rows):
+            text = click['card']
+            if match is None:
                 failed += 1
+                tick, card = click['tick'], click['card']
+                before = [c for c, _ in rows[:number] if 0 <= tick - c['tick'] <= 1]
+                if held(card, tick) is False or held(card, tick - 1) is False:
+                    dealt = next((t for t in range(tick, tick + 120) if held(card, t)), None)
+                    # short: the board shows it on one line
+                    text = (f'{card}, not dealt yet ({(dealt - tick) / 20:.1f} s early)'
+                            if dealt is not None and dealt > tick else f'{card}, only just dealt')
+                elif before:
+                    text = f'{card}, right after another click'
+                elif any(card_name(V, c['card']) == card and 0 <= tick - c['issue'] <= COMMAND_AGE for c in ours):
+                    text = f'{card}, already played'
+                # a card of ours that no click of its own put down, at this click's moment: this click did it
+                stray = next((i for i, c in enumerate(ours) if i not in claimed and -3 <= c['issue'] - tick <= 8), None)
+                if stray is not None:
+                    claimed[stray] = number
+                    wrong = card_name(V, ours[stray]['card'])
+                    for play in plays:
+                        if play[0] == ours[stray]['issue'] + COMMAND_AGE + 1 and play[1] == 0 and play[2] == label(wrong):
+                            play[2] = label(f'{wrong} (put down by the failed {card} click)')
+                            break
             gx, gy = (17 - click['column'], 31 - click['row']) if flip else (click['column'], click['row'])
-            clicks.append([click['tick'], label(click['card']), gx, gy, 0 if match is not None else 1])
+            clicks.append([click['tick'], label(text), gx, gy, 0 if match is not None else 1])
     # crowns from the towers standing at the end
     standing = {0: [], 1: []}
     for e in battle['final'].get('entities') or ():

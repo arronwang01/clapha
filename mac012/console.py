@@ -54,6 +54,17 @@ LOST_AFTER_TICKS = 12
 # How long a play chosen against elixir the client has not credited yet may wait for it (and for
 # its moment: a play is held until it will land TARGET_DELAY ticks after its decision).
 DEFER_SECONDS = 0.8
+# The client lets a card be tapped only once the game itself has dealt it into the hand: when the play before
+# it in that slot executes, ~1.1 s after that play's tap. Our models' hand is the screen view, which has the
+# next card in at the tap -- as in their training, where the engine takes such a command and it lands (pilot3
+# recordings: 160 of the learner's 2,543 plays were issued before their deal) -- so the model picks a card up
+# to 21 ticks before it can be tapped. Live games of 2026-10-03: 27 of 27 taps sent before the deal never
+# registered, and 2 of 2 sent on the tick of the deal; 3 of 3 sent two ticks after it did. Each lost tap also
+# left the console one card behind the game in that slot, so its next taps there played the card before (a
+# Cannon on the Hog's tile at the bridge, a Log on the Cannon's). So a play is held until its card has been
+# in the game's own hand this many ticks, tapped where the game holds it, and may wait this long for it.
+DEALT_TICKS = 2
+DEAL_WAIT_SECONDS = 2.5
 # Every play lands this many ticks after its moment (decision turn + the model's offset), counted
 # to its replay tick (issue + 20): the tap is held until then, less the measured tap -> issue lag,
 # so the landing does not wander with the pipeline's timing (the game is precise; the user,
@@ -300,6 +311,7 @@ class Bot:
         self._timing = None
         self._battle_key = None
         self._resend: list[dict] = []
+        self._dealt: dict[int, tuple[int, int]] = {}
         self.opponent_intel = None
 
     def model_warning(self) -> str:
@@ -496,7 +508,7 @@ class Bot:
                 claimed.add(key)
                 self.rtt.append(max(0, entry['issue_tick'] - flight['tap_tick']))
                 del self.rtt[:-50]
-                if flight.get('turn') is not None and not flight.get('elixir_wait'):
+                if flight.get('turn') is not None and not flight.get('elixir_wait') and not flight.get('deal_wait'):
                     overhead = max(0, entry['issue_tick'] - flight['turn'] - flight['offset'])
                     self.overheads.append(overhead)
                     del self.overheads[:-50]
@@ -546,7 +558,8 @@ class Bot:
                    card=V.CARDS.get(flight['card'], {}).get('name', flight['card']), turn=flight.get('turn'),
                    offset=flight.get('offset'), target_issue=target, issue_tick=issue_tick,
                    late=(issue_tick - target) if issue_tick is not None and target is not None else None,
-                   elixir_wait=bool(flight.get('elixir_wait')), delay=TARGET_DELAY,
+                   elixir_wait=bool(flight.get('elixir_wait')), deal_wait=bool(flight.get('deal_wait')),
+                   delay=TARGET_DELAY,
                    gesture_ms=ack.get('gesture_ms'), ack_ms=ack.get('ack_ms'), **timing)
 
     def _report_placement(self, flight: dict, entry: dict) -> None:
@@ -705,13 +718,27 @@ class Bot:
             runner.session.tensorizer, pending, opponent_elixir=(opponent.get('elixir_raw') or 0) / 10000.0,
             delay=delay, abilities=abilities)
 
+    def _note_hand(self, hand, tick: int) -> None:
+        """Since which tick each slot of the game's own hand has held its card (the hand the console first
+        sees in a battle: always)."""
+        first = not self._dealt
+        for position, index in enumerate(hand):
+            if self._dealt.get(position, (None, 0))[0] != index:
+                self._dealt[position] = (index, -10 ** 9 if first else tick)
+
+    @staticmethod
+    def _wait_limit(move: dict) -> float:
+        """Seconds a play may wait for what it is waiting for."""
+        return DEAL_WAIT_SECONDS if move.get('wait') == 'not dealt yet' else DEFER_SECONDS
+
     def _try_play(self, move: dict, me: dict, deck: list, reserved: float,
                   in_flight: list[dict], accounts, side: int, frame: dict) -> bool:
         """Tap one play. True when it is done with (tapped, or refused for good); False when it
         should wait for elixir.
 
-        The card is found by identity in the hand as memory holds it now, not by the policy's
-        slot, so a hand that changed between the frame and the tap cannot tap the wrong card.
+        `me` is the hand the model chose from (the screen view for our models: a card sent is out, the
+        next one in). The tap goes to the slot where the game's own hand in `frame` holds the card, and only
+        once it has held it DEALT_TICKS: before that the client does not take the tap (DEALT_TICKS above).
         """
         card = move['card']
         name = V.CARDS.get(card, {}).get('name', str(card))
@@ -725,7 +752,16 @@ class Bot:
         if not positions:
             move['wait'] = 'not in the hand'
             return False       # not in the hand (yet): the hand changed since the frame
-        position = positions[0]
+        own = next((p for p in frame['players'] if p.get('side') == side), None) or me
+        tick = int(frame['game_tick'])
+        position = next((pos for pos, index in enumerate(own['hand_deck_indices'])
+                         if 0 <= index < len(deck) and deck[index] == card
+                         and self._dealt.get(pos, (index, -10 ** 9))[0] == index
+                         and tick - self._dealt.get(pos, (index, -10 ** 9))[1] >= DEALT_TICKS), None)
+        if position is None:
+            move['wait'] = 'not dealt yet'
+            move['deal_wait'] = True
+            return False       # the game has not dealt it (the play before it in that slot has not executed)
         cost = float(V.CARDS.get(card, {}).get('elixir') or 0)
         if me['elixir_raw'] / 10000.0 - reserved < cost - 1e-6:
             move['elixir_wait'] = True
@@ -758,20 +794,22 @@ class Bot:
                       tap_sent=sent, tap_tick=int(frame['game_tick']), tap_us=frame.get('sample_monotonic_us'),
                       not_before=move.get('not_before'), lag_used=self._tap_lag(),
                       tap_n=self.tapper.count if self.tapper is not None and self.tapper.alive() else None)
-        in_flight.append({'slot': me['hand_deck_indices'][position], 'card': card,
+        in_flight.append({'slot': own['hand_deck_indices'][position], 'card': card,
                           'form': int((getattr(self, '_hand_forms', None) or {}).get(card, 0)),
                           'cost': cost, 'tap_tick': int(frame['game_tick']),
                           'tap_time': sent, 'timing': timing,
                           'turn': move.get('turn'), 'offset': int(move.get('offset', 0)),
-                          'elixir_wait': bool(move.get('elixir_wait')),
+                          'elixir_wait': bool(move.get('elixir_wait')), 'deal_wait': bool(move.get('deal_wait')),
                           'row': move['row'], 'column': move['column'], 'resent': bool(move.get('resend')),
                           'target': (move['column'] * 1000 + 500, move['row'] * 1000 + 500)})
         self.plays += 1
         self.last_play = f'{name} at row {move["row"]} col {move["column"]}'
         waited = time.time() - move['since']
+        why = ('for the card to be dealt' if move.get('deal_wait')
+               else 'for elixir' if move.get('elixir_wait') else '')
         self.note(f't={frame["game_tick"]/20:5.1f}s  {name:<14} row {move["row"]:2} '
-                  f'col {move["column"]:2}' + (f'  (waited {waited:.1f}s for elixir)'
-                                               if waited > 0.15 else ''))
+                  f'col {move["column"]:2}' + (f'  (waited {waited:.1f}s {why})'
+                                               if why and waited > 0.15 else ''))
         return True
 
     # Hero ability buttons on the 1440x2560 device: centres ~(140, 1955) and ~(1300, 1955), just
@@ -1038,6 +1076,7 @@ class Bot:
                 handled_queue: set = set()
                 last_turn, in_flight, deferred = -10 ** 9, [], []
                 self._resend = []
+                self._dealt = {}
                 abilities_in_flight.clear()
                 latch.reset()
                 self.plays = 0
@@ -1048,6 +1087,7 @@ class Bot:
             local_account = next((a['lo'] for a in (accounts or [])
                                   if a and a.get('side') == side), None)
             deck = me['deck_card_ids']
+            self._note_hand(me['hand_deck_indices'], int(frame['game_tick']))
             with V.LOCK:
                 executed = list(V.STATE['plays'])
             in_flight = self._settle_in_flight(in_flight, queue, executed, local_account,
@@ -1059,13 +1099,13 @@ class Bot:
             # A tap chosen a moment before the client credits the elixir (frame age, rounding)
             # waits here, briefly, until the client can actually place it.
             for d in deferred:
-                if time.time() - d['since'] > DEFER_SECONDS and not latch.over:
+                if time.time() - d['since'] > self._wait_limit(d) and not latch.over:
                     name = V.CARDS.get(d['card'], {}).get('name', d['card'])
                     self.note(f'{name} decided for tick {d["turn"] + d["offset"]} was dropped: '
-                              f'{d.get("wait", "?")} after {DEFER_SECONDS:.1f} s')
+                              f'{d.get("wait", "?")} after {self._wait_limit(d):.1f} s')
                     self.trace('dropped', card=name, turn=d['turn'], offset=d['offset'], wait=d.get('wait'),
                                decided=d['since'], frame_tick=int(frame['game_tick']))
-            deferred = [d for d in deferred if time.time() - d['since'] <= DEFER_SECONDS
+            deferred = [d for d in deferred if time.time() - d['since'] <= self._wait_limit(d)
                         and not latch.over]
             for move in list(deferred):
                 if self._try_play(move, view_me, deck, reserved, in_flight, accounts, side, frame):
@@ -1251,6 +1291,10 @@ class Bot:
                                    'frame_tick': int(frame['game_tick']),
                                    'frame_us': frame.get('sample_monotonic_us'),
                                    'received': frame_time, 'began': turn_began, 'started': started}}
+                waiting = next((d for d in deferred if d['card'] == move['card'] and d.get('deal_wait')), None)
+                if waiting is not None:
+                    # chosen again while it waits for its deal: the newer tile, the earlier moment (it is overdue)
+                    move['not_before'] = min(move['not_before'], waiting['not_before'])
                 if not self._try_play(move, view_me, deck, reserved, in_flight, accounts, side,
                                       frame):
                     deferred = [d for d in deferred if d['card'] != move['card']] + [move]

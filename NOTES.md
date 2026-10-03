@@ -1806,14 +1806,41 @@ Marked games (the user on their phone against clapha:p3 on device 1, from 12:35;
 2026-10-02 night against friends), read with il/live_hogs.py, il/live_towers.py and il/timing.py.
 - **Timing is fine.** 4,625 decision turns: frame on its turn tick in 98%, deciding 33 ms median (99% 86),
   no turn missed. Plays that registered were issued on their tick or one late (tap -> issue 1-6 ticks).
-- **11% of taps never registered** (30 of 276; sent right after another gesture: 7 of 18). The gesture was
-  two 16 ms touches 8 ms apart, accepted in tap_bench's 4 trials (2026-09-25). A lost tap blocked its card
-  for 3 s with the model believing it on its way; the Cannon decision after each lost Cannon tap went to
-  the edge column (1 or 16), and once the next card's tile tap placed the still-selected Cannon on the
-  bridge. Most of the user's "Musketeer behind the Hog" pushes that did damage had a lost defensive tap.
-  **Fix:** touches of 34 ms, 20 ms apart, 70 ms between gestures (mac012/tapper.py); a tap not in the
-  queue after 12 ticks is sent again once, same card and tile (console LOST_AFTER_TICKS). Not yet measured
-  live: the timing record's lost count is the test.
+- **13% of taps never registered (35 of 276), and every one is explained** (corrected the same afternoon;
+  the first reading -- touch length -- was wrong and its change was taken back). A click counts as taken
+  when a command of that card is issued within 8 ticks of it:
+  - **29: the card was not in the game's hand yet.** The game deals the next card into a slot when the play
+    before it in that slot *executes* (issue + 21, ~1.1 s after its tap); when two plays execute within a
+    second, the second slot mostly stands empty until 20 ticks after the first deal. The client takes no tap
+    for a card before its deal: 27 of 27 sent before it were lost, and 2 of 2 sent on its tick; from two
+    ticks after it, 236 of 237 single taps registered. Our model's hand is the screen view (firstlight_obs.screen_view, il/SPEC.md): the next card
+    in at the tap. It was built for the human replays, where a play's decision turn is ~5 ticks before its
+    issue and so can fall before the deal; but with it the engine also *takes* a command issued before the
+    deal (it executes after it), so RL learned to use it: in pilot3's recordings 160 of the learner's 2,543
+    plays (6%, ~4 a game) were issued 1-12 ticks before their deal, and landed. Live the same habit is ~6
+    lost taps a game, mostly the card cycled to under pressure: 8 of them Cannons.
+  - **A lost tap put the console one card behind the game in that slot** (it held the card "in flight" for
+    3 s, so the screen view had the following card there): the next click in that slot put down the card
+    before it, on the tile meant for the other. Six such: the Cannon on the Hog's tile at the bridge (game 1,
+    3:03, the push that took the tower), a Log on the Cannon's tile, a Cannon on the Skeletons' tile (what
+    looked like the client moving a blocked Cannon from (9,9) to (12,9)), Skeletons on the Musketeer's, an
+    Ice Spirit on the Hog's, a Hog on the Skeletons' tile in our own half. And 1 click for a card such a
+    click had just used.
+  - **5: the second of two gestures written within 3 ms** (two plays in one turn): 5 of the 9 such.
+  - After a lost Cannon click (8) the Cannon came 3.4-3.9 s later on the edge column (4), was put down by
+    another card's click on that card's tile (2), or came 26-37 s later (2). In games 1, 4 and 5 the tower
+    that ended the match fell within 14 s of failed clicks (game 1: the lost Cannon, then the Cannon at the
+    bridge; game 5: four in a row).
+  **Fix (mac012/console.py DEALT_TICKS, loaded 14:25):** a play is tapped only where the game's own hand
+  holds its card, once it has held it 2 ticks; until then it waits (up to 2.5 s; a newer choice of the same
+  card replaces the tile and keeps the earlier moment). No slot is ever tapped for a card it does not hold.
+  Replayed over the 276 taps: 29 held, all 29 lost as played, none of the 241 registered ones touched; the
+  held ones would have gone out 2-26 ticks later (median 11). Gestures are now written 60 ms apart (the
+  one pair that day sent 100 ms apart registered; not shown to be enough yet). A tap not in the queue after
+  12 ticks is still sent again once (LOST_AFTER_TICKS). In the replay (il/live_games.py) each failed click
+  says why, and a card it put down instead is named in the plays.
+  **Left for training:** the engine must refuse what the client refuses -- a card not playable until its
+  deal (+2 ticks) -- or the model keeps planning on a Cannon it cannot have for another second.
 - **The "outright missed Cannons" of 2026-10-02 night were fl:general** (switched to at 20:15; no delay
   training): its Cannon came down 50-74 ticks after the Hog landed, p3's 26-48; a Cannon stops pulling
   around 55-75 ticks (it must be nearer the Hog than the tower is), so a third of General's did not pull.
@@ -1821,8 +1848,7 @@ Marked games (the user on their phone against clapha:p3 on device 1, from 12:35;
   arrival at the tower, which is later than this deadline: read its numbers ~30 ticks smaller.
 - **Decisions (p3, today's first three games: 21 Hogs, 29 hits):** after the Cannon is destroyed it only
   trickles cheap cards (6 Hogs, 14 hits); with the Cannon out of hand it does not cycle to it (2 Hogs, 9
-  hits, one with 9.5 elixir and the Cannon two cards away); once it had the Cannon and did not play it. A
-  Cannon asked on a tile another building blocks is moved by the client (asked (9,9), got (12,9)): the live
-  placement mask does not exclude it.
+  hits, one with 9.5 elixir and the Cannon two cards away); once it had the Cannon and did not play it.
+  These counts include pushes with a lost tap in them: to be read again from games played with the fix.
 - Open: the same pushes replayed in the engine against the same model (the user's commands as a scripted
   opponent), to separate what is left of the pipeline from the model for certain.

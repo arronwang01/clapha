@@ -44,15 +44,16 @@ class Tapper:
     def __init__(self, adb, serial, width: int, height: int):
         self.mode = os.environ.get('CR_TAP_MODE', 'place')
         drag = self.mode == 'drag'
-        # place gap 8 hold 16: 4/4 accepted, 41 ms (tap_bench, 2026-09-25). In live games on 2026-10-03, 30
-        # of 276 taps never registered, and the touch length was not the reason: 23 were for a card the game
-        # had not put in the hand yet (the screen view hands the next card over at the tap; the game draws
-        # it when the previous command executes, ~1 s later), 5 were sent right after another gesture, and
-        # 2 of 239 ordinary taps were lost. So the gesture stays as it was; `spacing` (ms a gesture waits
-        # after the previous one has ended) is there to try against the second kind, off by default.
+        # place gap 8 hold 16: 4/4 accepted, 41 ms (tap_bench, 2026-09-25). In live games on 2026-10-03, 35
+        # of 276 taps never registered, and the touch length was not the reason: 29 were sent before the
+        # game had dealt the card or on the tick it did (console.DEALT_TICKS), 1 was for a card one of those
+        # had already played, and 5 were the second of two gestures written within 3 ms of each other (5 of
+        # the 9 such; the other 237 taps all registered). So the gesture stays as it was, and a gesture
+        # waits `spacing` ms after the previous one has ended: 60, as in the one pair that day sent 100 ms
+        # apart, which registered. Not yet shown to be enough: the timing record of the next games says.
         self.gap = int(os.environ.get('CR_TAP_GAP_MS', '3' if drag else '8'))
         self.hold = int(os.environ.get('CR_TAP_HOLD_MS', '10' if drag else '16'))
-        self.spacing = int(os.environ.get('CR_TAP_SPACING_MS', '0'))
+        self.spacing = int(os.environ.get('CR_TAP_SPACING_MS', '60'))
         self.free_at = 0.0          # when the last gesture written will have ended, plus the spacing
         self.write_lock = threading.Lock()
         path, max_x, max_y = touch_device(adb, serial)
