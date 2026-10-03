@@ -1760,3 +1760,22 @@ Details: TRAINING.md journal.
   source files changed since it started (bot.code_changed, ours and FirstLight's), and the app says
   "press Start between battles" when there are any (or when a console is too old to report it). The
   decoding preference now survives a restart (build/console_settings_<port>.json).
+
+## 2026-10-02 night: what p3's plays depend on (il/sensitivity.py)
+
+25 engine Hog 2.6 mirrors (5 of p3 against the real hog2, 20 pilot3 league games), 1,654 plays: p3 (u520)
+decides each recorded play again from the game's own inputs, once as it was and once with one input changed.
+- **Memory is in effect 10-30 s.** Rebuilt from only the last 60 / 30 / 10 s of the match, its most likely
+  tile changes in 1 / 2 / 3% of plays (Cannon 5% at 10 s); whether it plays and which card barely move. It
+  does not adapt to how this opponent played earlier: placements and spells answer the present (board, the
+  opponent's card cycle and exact elixir, the queue) with habits from training.
+- **The opponent's queued plays (extras) carry much of its "prediction".** Something was queued in 19% of
+  plays (31% of Fireballs); hiding it changes the most likely tile in 15% of those plays (Cannon 20%,
+  Skeletons 22%), and for Cannon the card choice by 0.26.
+- **The Log -> Arrows hurts through what it plays and when, not where.** In the deck list alone (The Log
+  neither in hand nor next) and as the opponent's revealed card: under 1% top-tile change. With Arrows in
+  the hand (69% of plays): other cards' tiles stay (0-4%), but the card choice moves to Arrows -- in p3's own
+  games P(Log) 0.04 -> P(Arrows) 0.10 on other cards' turns; Arrows becomes its first choice over the card
+  it played on 23% of Musketeer turns, 29% of Ice Spirit turns, 7% of Fireball turns, no Cannon turns --
+  and its urge to play rises (+0.05 on average). Game results with Arrows were not measured (that needs
+  engine games).
