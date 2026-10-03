@@ -38,6 +38,8 @@ _faster_contracts()     # FirstLight's contract freezing, same results, ~2x less
 
 PORT = int(os.environ.get('CR_CONSOLE_PORT', '8777'))
 LOG_FILE = Path(__file__).resolve().parents[1] / 'build' / f'bot_{PORT}.log'
+# Times only, one line per decision turn and per play (il/timing.py reads it, for games the user marks).
+TIMING_FILE = Path(__file__).resolve().parents[1] / 'build' / f'timing_{PORT}.jsonl'
 X_TILES, Y_TILES = 18, 32
 # The game consumes a queued command this many ticks after its issue tick (measured 22 ticks
 # queue -> unit on every play; FirstLight's COMMAND_CONSUMPTION_STEPS = 21).
@@ -290,7 +292,21 @@ class Bot:
         self.told_delay: int | None = None
         self.late_plays = 0
         self.tapper = None
+        self._timing = None
+        self._battle_key = None
         self.opponent_intel = None
+
+    def trace(self, kind: str, **row) -> None:
+        """One line of the timing record: where each turn's and each play's time goes, from the frame
+        the policy saw to the game's issue tick (il/timing.py sums it up)."""
+        try:
+            if self._timing is None:
+                self._timing = open(TIMING_FILE, 'a', encoding='utf-8', buffering=1)
+            row = {k: (round(v, 4) if isinstance(v, float) else v) for k, v in row.items()}
+            self._timing.write(json.dumps({'kind': kind, 't': round(time.time(), 4), 'port': PORT,
+                                           'battle': self._battle_key, **row}) + '\n')
+        except OSError:
+            pass
 
     def _tap_lag(self) -> int:
         """Ticks from our tap (the frame we tapped on) to the game's issue tick: median of the last 9
@@ -476,12 +492,33 @@ class Bot:
                                   f'({self.late_plays} late so far)')
                 self._report_latency(flight)
                 self._report_placement(flight, entry)
+                self._trace_play(flight, entry['issue_tick'])
                 break
         now = time.time()
+        for flight in in_flight:
+            if flight.get('issue_tick') is None and now - flight['tap_time'] > IN_FLIGHT_SECONDS:
+                name = V.CARDS.get(flight['card'], {}).get('name', flight['card'])
+                self.note(f'tap for {name} never reached the game ({IN_FLIGHT_SECONDS:.0f} s): the play was lost')
+                self._trace_play(flight, None)
         return [f for f in in_flight
                 if (f.get('issue_tick') is None and now - f['tap_time'] <= IN_FLIGHT_SECONDS)
                 or (f.get('issue_tick') is not None
                     and tick < f['issue_tick'] + COMMAND_AGE_TICKS)]
+
+    def _trace_play(self, flight: dict, issue_tick: int | None) -> None:
+        """A play's line in the timing record: its moment, the issue tick it was held for, the one it
+        got, and every timestamp between the frame and the tap (issue_tick None: the tap was lost)."""
+        timing = dict(flight.get('timing') or {})
+        target = (flight['turn'] + flight['offset'] + TARGET_DELAY - COMMAND_AGE_TICKS + 1
+                  if flight.get('turn') is not None else None)
+        ack = (self.tapper.timing_of(timing['tap_n'])
+               if self.tapper is not None and timing.get('tap_n') else None) or {}
+        self.trace('play' if issue_tick is not None else 'lost',
+                   card=V.CARDS.get(flight['card'], {}).get('name', flight['card']), turn=flight.get('turn'),
+                   offset=flight.get('offset'), target_issue=target, issue_tick=issue_tick,
+                   late=(issue_tick - target) if issue_tick is not None and target is not None else None,
+                   elixir_wait=bool(flight.get('elixir_wait')), delay=TARGET_DELAY,
+                   gesture_ms=ack.get('gesture_ms'), ack_ms=ack.get('ack_ms'), **timing)
 
     def _report_placement(self, flight: dict, entry: dict) -> None:
         """Where the game put the command, against where the policy asked, both native.
@@ -652,15 +689,18 @@ class Bot:
         if any(f['card'] == card for f in in_flight):
             return True        # already on its way; the policy's state includes it
         if int(frame['game_tick']) < move.get('not_before', 0):
+            move['wait'] = 'held for its moment'
             return False       # its moment in the turn (the model's 0-4 tick offset) has not come
         positions = [pos for pos, index in enumerate(me['hand_deck_indices'])
                      if 0 <= index < len(deck) and deck[index] == card]
         if not positions:
+            move['wait'] = 'not in the hand'
             return False       # not in the hand (yet): the hand changed since the frame
         position = positions[0]
         cost = float(V.CARDS.get(card, {}).get('elixir') or 0)
         if me['elixir_raw'] / 10000.0 - reserved < cost - 1e-6:
             move['elixir_wait'] = True
+            move['wait'] = 'waiting for elixir'
             return False       # the client cannot place it yet
         cell = screen_cell(move['column'], move['row'], side)
         allowed, reason = scope_gate.check(accounts, side)
@@ -685,6 +725,9 @@ class Bot:
         timing = dict(move.get('timing') or {})
         if 'decided' in timing:
             timing['send_ms'] = (sent - timing['decided']) * 1000.0
+        timing.update(tap_sent=sent, tap_tick=int(frame['game_tick']), tap_us=frame.get('sample_monotonic_us'),
+                      not_before=move.get('not_before'), lag_used=self._tap_lag(),
+                      tap_n=self.tapper.count if self.tapper is not None and self.tapper.alive() else None)
         in_flight.append({'slot': me['hand_deck_indices'][position], 'card': card,
                           'form': int((getattr(self, '_hand_forms', None) or {}).get(card, 0)),
                           'cost': cost, 'tap_tick': int(frame['game_tick']),
@@ -960,6 +1003,7 @@ class Bot:
                     time.sleep(1.0)
                     continue
                 battle = frame['chain']['battle']
+                self._battle_key = str(battle)
                 handled_queue: set = set()
                 last_turn, in_flight, deferred = -10 ** 9, [], []
                 abilities_in_flight.clear()
@@ -980,6 +1024,13 @@ class Bot:
 
             # A tap chosen a moment before the client credits the elixir (frame age, rounding)
             # waits here, briefly, until the client can actually place it.
+            for d in deferred:
+                if time.time() - d['since'] > DEFER_SECONDS and not latch.over:
+                    name = V.CARDS.get(d['card'], {}).get('name', d['card'])
+                    self.note(f'{name} decided for tick {d["turn"] + d["offset"]} was dropped: '
+                              f'{d.get("wait", "?")} after {DEFER_SECONDS:.1f} s')
+                    self.trace('dropped', card=name, turn=d['turn'], offset=d['offset'], wait=d.get('wait'),
+                               decided=d['since'], frame_tick=int(frame['game_tick']))
             deferred = [d for d in deferred if time.time() - d['since'] <= DEFER_SECONDS
                         and not latch.over]
             for move in list(deferred):
@@ -1106,6 +1157,10 @@ class Bot:
                 self.note(f'decide failed: {error}')
                 self.status = f'{self.model}: DECIDE FAILING - {str(error)[:80]}'
                 continue
+            self.trace('turn', turn=turn, frame_tick=int(frame['game_tick']),
+                       frame_us=frame.get('sample_monotonic_us'), received=frame_time, began=turn_began,
+                       prep_ms=timing_now['prep_ms'], decide_ms=timing_now['decide_ms'], moves=len(moves),
+                       skipped=skipped)
             if skipped > 0:
                 # Where the time went, so the cause is in the log rather than guessed at: the
                 # previous turn's own cost, how long the loop was away between turns, and how
@@ -1158,7 +1213,10 @@ class Bot:
                         'timing': {'decided': decided,
                                    'inference_ms': (decided - started) * 1000.0,
                                    'frame_age_ms': (started - frame_time) * 1000.0,
-                                   'turn_wait_ms': turn_wait_ms}}
+                                   'turn_wait_ms': turn_wait_ms,
+                                   'frame_tick': int(frame['game_tick']),
+                                   'frame_us': frame.get('sample_monotonic_us'),
+                                   'received': frame_time, 'began': turn_began, 'started': started}}
                 if not self._try_play(move, view_me, deck, reserved, in_flight, accounts, side,
                                       frame):
                     deferred = [d for d in deferred if d['card'] != move['card']] + [move]

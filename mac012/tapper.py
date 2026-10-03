@@ -68,7 +68,8 @@ class Tapper:
             self.process.kill()
             raise RuntimeError('fast_tap on the device is out of date (rebuild: start-consoles.sh)')
         self.sent: deque[float] = deque()
-        self.timings: deque[dict] = deque(maxlen=200)   # {'gesture_ms', 'ack_ms'}
+        self.timings: deque[dict] = deque(maxlen=200)   # {'gesture_ms', 'ack_ms', 'n'}
+        self.count = 0          # commands written; the n-th ack answers the n-th command
         self.lock = threading.Lock()
         threading.Thread(target=self._acks, daemon=True).start()
 
@@ -76,17 +77,23 @@ class Tapper:
         return (f'fast_tap on {self.path}, {self.mode} gap {self.gap} ms hold {self.hold} ms')
 
     def _acks(self) -> None:
+        answered = 0
         for line in self.process.stdout:
             if not line.startswith('{'):
                 continue
             with self.lock:
                 sent = self.sent.popleft() if self.sent else None
+            answered += 1
             try:
                 body = json.loads(line)
             except ValueError:
                 continue
             self.timings.append({'gesture_ms': body.get('us', 0) / 1000.0,
-                                 'ack_ms': (time.time() - sent) * 1000.0 if sent else None})
+                                 'ack_ms': (time.time() - sent) * 1000.0 if sent else None, 'n': answered})
+
+    def timing_of(self, n: int) -> dict | None:
+        """The ack of the n-th command written, once it has come back."""
+        return next((t for t in reversed(self.timings) if t.get('n') == n), None)
 
     def alive(self) -> bool:
         return self.process.poll() is None
@@ -102,6 +109,7 @@ class Tapper:
         written = time.time()
         with self.lock:
             self.sent.append(written)
+            self.count += 1
         self.process.stdin.write(line)
         self.process.stdin.flush()
         return written
@@ -114,6 +122,7 @@ class Tapper:
         written = time.time()
         with self.lock:
             self.sent.append(written)
+            self.count += 1
         self.process.stdin.write(line)
         self.process.stdin.flush()
         return written
