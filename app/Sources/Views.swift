@@ -98,6 +98,7 @@ struct TopBar: View {
     @ObservedObject var device2: DeviceModel
     @Binding var showTools: Bool
     @Binding var overlayOn: Bool
+    @AppStorage("overlayOpponent") private var overlayOpponent = true
     @Environment(\.openWindow) private var openWindow
     // FirstLight's own console (Human vs Model) on CR_4k: tools/play_firstlight.sh
     @StateObject private var firstlight = TaskRunner(root: claphaRoot())
@@ -119,6 +120,10 @@ struct TopBar: View {
             Toggle(isOn: $overlayOn) { Label("Overlay on MuMu", systemImage: "circle.dashed") }
                 .toggleStyle(.button)
                 .help("Draws cards that are played but not landed yet on top of the MuMu window. Click-through.")
+            Toggle(isOn: $overlayOpponent) { Label("Opponent info", systemImage: "rectangle.stack.person.crop") }
+                .toggleStyle(.button)
+                .disabled(!overlayOn)
+                .help("On the MuMu overlay, for debugging: the deck guessed for the opponent before they play (gone once a card they play is not in it); the cards actually seen and the hand that follows from them; their elixir.")
             Button { openWindow(id: "games") } label: { Label("Training games", systemImage: "film") }
                 .help("Watch whole games the RL training recorded on the PC (model vs model).")
             Spacer()

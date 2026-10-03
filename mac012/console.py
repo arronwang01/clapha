@@ -149,6 +149,60 @@ HOG26_DECK = {26000021: 0,   # Hog Rider
               26000030: 0}   # Ice Spirit
 
 
+def opponent_view(frame: dict, health: dict, plays: list, queue: list, accounts, prior=None) -> dict | None:
+    """What is known of the other side, for the overlay on the game (debugging). Three things, kept apart:
+
+      guess     the deck held for theirs before any card is seen -- the one their own console published, or the
+                deck the API says they have equipped. Dropped (None) the moment a card they play is not in it.
+      revealed  the cards they have actually played, in the order first seen; and from the order of their
+                plays, their hand: a played card goes to the back of an eight-card cycle, so once they have
+                played four, the hand is every card of theirs that is not among their last four plays (a card
+                not seen yet is an unknown, None), and the oldest of those four is the next to come back.
+      elixir    theirs, exact, as the game holds it.
+
+    Their plays are the commands that have executed plus the ones still in the queue: a card is out of their
+    hand from the moment it is played, and their command shows in our queue ~10 ticks after that."""
+    side = health.get('local_side')
+    if side not in (0, 1):
+        return None
+    other = 1 - side
+    tick = int(frame.get('game_tick') or 0)
+
+    def info(card_id: int, form: int = 0) -> dict:
+        card = V.CARDS.get(card_id, {})
+        return {'card_id': int(card_id), 'name': str(card.get('name', card_id)), 'form': int(form or 0),
+                'elixir': card.get('elixir')}
+    sequence = [(int(p.get('issue_tick') if isinstance(p.get('issue_tick'), int) else p['tick'] - COMMAND_AGE_TICKS),
+                 int(p['card_id']), int(p.get('form_code') or 0))
+                for p in plays if p.get('side') == other and p.get('kind', 'card') == 'card']
+    executed = {(p.get('issue_tick'), p.get('seq')) for p in plays if p.get('side') == other}
+    for entry in queue or ():
+        issue = entry.get('issue_tick')
+        if (not isinstance(issue, int) or (issue, entry.get('seq')) in executed
+                or issue + COMMAND_AGE_TICKS <= tick or V.entry_side(entry, accounts) != other):
+            continue
+        card_id, form, kind = V.card_identity(int(entry.get('card_id') or 0))
+        if kind == 'card':
+            sequence.append((issue, card_id, form))
+    sequence.sort()
+    forms = {card: form for _issue, card, form in sequence}          # the form of its latest play
+    revealed = list(dict.fromkeys(card for _issue, card, _form in sequence))
+    hand = following = None
+    if len(sequence) >= 4:
+        last = [card for _issue, card, _form in sequence[-4:]]
+        held = [card for card in revealed if card not in last]
+        hand = [info(card, forms[card]) for card in held] + [None] * max(0, 4 - len(held))
+        following = info(last[0], forms[last[0]])
+    guess = source = None
+    if prior and prior.get('cards') and all(card in prior['cards'] for card in revealed):
+        guess = [info(card, form) for card, form in zip(prior['cards'], prior.get('forms') or [0] * 8)]
+        source = prior.get('source')
+    them = next((p for p in frame.get('players') or () if p.get('side') == other), None)
+    return {'elixir': None if them is None else (them.get('elixir_raw') or 0) / 10000.0,
+            'guess': guess, 'guess_source': source, 'plays': len(sequence),
+            'revealed': [info(card, forms[card]) for card in revealed], 'hand': hand, 'next': following}
+
+
 def pending_commands(queue: list, accounts, tick: int, local_side=None,
                      layout=None) -> list[dict]:
     """Every command in the queue, both sides, for the board's ghost markers.
@@ -320,8 +374,23 @@ class Bot:
         self._timing = None
         self._battle_key = None
         self._resend: list[dict] = []
+        self.opponent_prior: dict | None = None       # the deck their console published, for this battle
         self._dealt: dict[int, tuple[int, int]] = {}     # hand slot -> (deck index, device us it was first seen there)
         self.opponent_intel = None
+
+    def prior_deck(self, battle) -> dict | None:
+        """The deck held for the opponent's before they play, in this battle: the one their own console published
+        (a friendly between the user's accounts), else the deck the API says they have equipped."""
+        if not self.running or str(battle) != str(self._battle_key):
+            return None
+        if self.opponent_prior and self.opponent_prior.get('battle') == str(battle):
+            return self.opponent_prior
+        intel = self.opponent_intel
+        if intel and intel.get('deck') and len(intel['deck']) == 8:
+            return {'cards': [int(c['card_id']) for c in intel['deck']],
+                    'forms': [2 if c.get('hero') else 1 if c.get('evolution_level') else 0 for c in intel['deck']],
+                    'source': 'guess: the deck the API says they have equipped'}
+        return None
 
     def model_warning(self) -> str:
         """FirstLight's own checkpoints were trained with plays that land at once. Live a play lands ~1.3 s
@@ -1090,6 +1159,10 @@ class Bot:
                                  '(Training Camp, or the other console is not running)')
                 self.note(deck_note)
                 self.opponent_intel = None
+                self.opponent_prior = None if opponent is None else {
+                    'battle': str(frame['chain']['battle']), 'cards': [int(c) for c in opponent],
+                    'forms': [2 if int(f) & 2 else 1 if int(f) & 1 else 0 for f in (opponent_forms or [0] * 8)],
+                    'source': 'their deck, as their own console published it'}
                 self._lookup_opponent(accounts, side, frame['chain']['battle'])
                 observation, fl_battle = FLO.build(
                     frame, health, episode_id=str(frame['chain']['battle']))
@@ -1583,6 +1656,8 @@ class Handler(BaseHTTPRequestHandler):
                             health.get('local_side'), BOT.layout)
                         + landings_for_overlay(frame, health, plays, BOT.layout),
                         'session': V.SESSION.name, 'bot': bot, 'revealed': revealed,
+                        'opponent': opponent_view(frame, health, plays, queue, accounts,
+                                                  BOT.prior_deck(frame['chain']['battle'])),
                         **V.to_state(frame, health)}
             else:
                 body = {'ok': False, 'age': age, 'bot': bot,

@@ -50,6 +50,28 @@ struct PendingInfo: Decodable {
     let radiusY: Int?
 }
 
+/// A card of the other side, as the overlay shows it.
+struct OpponentCard: Decodable, Hashable {
+    let cardId: Int
+    let name: String
+    let form: Int?
+    let elixir: Double?
+}
+
+/// What is known of the other side (mac012/console.py opponent_view), three things kept apart: the deck held
+/// for theirs before they play (nil when there is none, and from the moment a card they play is not in it);
+/// the cards actually seen, with the hand that follows from the order of their plays (nil until they have
+/// played four; a nil entry is a card not seen yet); and their elixir.
+struct OpponentInfo: Decodable {
+    let elixir: Double?
+    let guess: [OpponentCard]?
+    let guessSource: String?
+    let plays: Int?
+    let revealed: [OpponentCard]
+    let hand: [OpponentCard?]?
+    let next: OpponentCard?
+}
+
 struct BotInfo: Decodable {
     let running: Bool
     let armed: Bool
@@ -80,6 +102,7 @@ struct DeviceState: Decodable {
     let entities: [EntityInfo]?
     let pendingCommands: [PendingInfo]?
     let localSide: Int?
+    let opponent: OpponentInfo?
 }
 
 // MARK: - One device: polls its engine and sends commands
