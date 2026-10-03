@@ -46,25 +46,34 @@ X_TILES, Y_TILES = 18, 32
 COMMAND_AGE_TICKS = 21
 # A tap that never reaches the queue (missed, or refused by the client) is given up on.
 IN_FLIGHT_SECONDS = 3.0
-# A tap the game took shows in its queue within 6 ticks (246 plays, 2026-10-03: 1-6); one that is not
-# there after this many is lost. It is sent again once, the same card on the same tile: waiting the 3 s
-# out left the card blocked, the model believing it was on its way, and its next choice for it somewhere
-# odd (after every lost Cannon tap that day the next one went to the edge column).
-LOST_AFTER_TICKS = 12
+# A tap the game took is issued 1-6 ticks after it, and its command first shows in the queue 1-12 ticks after
+# that issue tick: 4-17 ticks from the tap to our first sight of it (267 plays, 2026-10-03; over 12 in 9%).
+# One not there after this many is lost, and is sent again once, the same card on the same tile: waiting the
+# 3 s out left the card blocked, the model believing it on its way. (12 was too few: it would have called one
+# good tap in eleven lost.)
+LOST_AFTER_TICKS = 20
 # How long a play chosen against elixir the client has not credited yet may wait for it (and for
 # its moment: a play is held until it will land TARGET_DELAY ticks after its decision).
 DEFER_SECONDS = 0.8
-# The client lets a card be tapped only once the game itself has dealt it into the hand: when the play before
-# it in that slot executes, ~1.1 s after that play's tap. Our models' hand is the screen view, which has the
-# next card in at the tap -- as in their training, where the engine takes such a command and it lands (pilot3
-# recordings: 160 of the learner's 2,543 plays were issued before their deal) -- so the model picks a card up
-# to 21 ticks before it can be tapped. Live games of 2026-10-03: 27 of 27 taps sent before the deal never
-# registered, and 2 of 2 sent on the tick of the deal; 3 of 3 sent two ticks after it did. Each lost tap also
-# left the console one card behind the game in that slot, so its next taps there played the card before (a
-# Cannon on the Hog's tile at the bridge, a Log on the Cannon's). So a play is held until its card has been
-# in the game's own hand this many ticks, tapped where the game holds it, and may wait this long for it.
-DEALT_TICKS = 2
+# The client takes a touch on a hand slot only once the game has dealt the card into it, and a moment after
+# (docs/GAME_INTEGRATION.md; mac012/tap_probe.py, 2026-10-03, 139 timed taps): the game deals the next card
+# 21 ticks after the issue tick of the play before it in that slot (139 of 139); a touch that begins before the
+# deal does nothing (31 of 31) and selects nothing in advance (0 of 9); one that begins 100 ms or more after the
+# deal is first in memory is taken (38 of 38); in between, some (0-50 ms 1 of 18, 50-100 ms 19 of 52), and it
+# is the touch going down that counts (down early and held on: refused). Until the deal the slot is empty on
+# the screen. Our models' hand is the screen view, which has the next card in at the tap -- as in their
+# training, where the engine takes such a command and it lands (pilot3: 160 of the learner's 2,543 plays were
+# issued before their deal) -- so the model picks a card up to 21 ticks before it can be touched: 29 of the 35
+# lost taps in the live games of 2026-10-03, each of which also left the console a card behind in that slot,
+# so its next taps there put down the card before (the Cannon on the Hog's tile at the bridge).
+# So a play is tapped where the game's own hand holds its card, the touch going down DEALT_MS after we first
+# saw it there (on the device's clock: fast_tap starts the gesture then), and may wait DEAL_WAIT_SECONDS for it.
+DEALT_MS = 120                  # 100 measured from a 20 ms reader's first sight; ours can be the earlier one
 DEAL_WAIT_SECONDS = 2.5
+# The client takes no play in the first seconds of a battle: touches at ticks 70, 78, 86 refused, at 94 and 99
+# taken (and issued at tick 101, the first there is).
+FIRST_TAP_TICK = 95
+DEAL_MASK = os.environ.get('CR_DEAL_MASK') == '1'
 # Every play lands this many ticks after its moment (decision turn + the model's offset), counted
 # to its replay tick (issue + 20): the tap is held until then, less the measured tap -> issue lag,
 # so the landing does not wander with the pipeline's timing (the game is precise; the user,
@@ -311,7 +320,7 @@ class Bot:
         self._timing = None
         self._battle_key = None
         self._resend: list[dict] = []
-        self._dealt: dict[int, tuple[int, int]] = {}
+        self._dealt: dict[int, tuple[int, int]] = {}     # hand slot -> (deck index, device us it was first seen there)
         self.opponent_intel = None
 
     def model_warning(self) -> str:
@@ -656,7 +665,10 @@ class Bot:
         if not getattr(runner, 'clapha_inputs', False):
             return frame, me, sum(f['cost'] for f in in_flight)
         try:
-            view = FLO.screen_view(me, [f['card'] for f in in_flight])
+            # a model trained with the game's deal rule is offered only the cards the game has dealt
+            # (CR_DEAL_MASK=1: any of our models, to try it); for the others the tap waits (DEALT_MS)
+            view = FLO.screen_view(me, [f['card'] for f in in_flight],
+                                   deal_rule=getattr(runner, 'deal_rule', False) or DEAL_MASK)
         except ValueError:
             return frame, me, sum(f['cost'] for f in in_flight)
         side = me.get('side')
@@ -718,13 +730,13 @@ class Bot:
             runner.session.tensorizer, pending, opponent_elixir=(opponent.get('elixir_raw') or 0) / 10000.0,
             delay=delay, abilities=abilities)
 
-    def _note_hand(self, hand, tick: int) -> None:
-        """Since which tick each slot of the game's own hand has held its card (the hand the console first
-        sees in a battle: always)."""
+    def _note_hand(self, hand, sample_us: int) -> None:
+        """Since when (the device's clock) each slot of the game's own hand has held its card; the hand the
+        console first sees in a battle: always."""
         first = not self._dealt
         for position, index in enumerate(hand):
             if self._dealt.get(position, (None, 0))[0] != index:
-                self._dealt[position] = (index, -10 ** 9 if first else tick)
+                self._dealt[position] = (index, -10 ** 15 if first else int(sample_us))
 
     @staticmethod
     def _wait_limit(move: dict) -> float:
@@ -737,8 +749,8 @@ class Bot:
         should wait for elixir.
 
         `me` is the hand the model chose from (the screen view for our models: a card sent is out, the
-        next one in). The tap goes to the slot where the game's own hand in `frame` holds the card, and only
-        once it has held it DEALT_TICKS: before that the client does not take the tap (DEALT_TICKS above).
+        next one in). The tap goes to the slot where the game's own hand in `frame` holds the card, its first
+        touch DEALT_MS after the card was first seen there: before that the client may not take it (DEALT_MS).
         """
         card = move['card']
         name = V.CARDS.get(card, {}).get('name', str(card))
@@ -752,16 +764,28 @@ class Bot:
         if not positions:
             move['wait'] = 'not in the hand'
             return False       # not in the hand (yet): the hand changed since the frame
+        if int(frame['game_tick']) < FIRST_TAP_TICK:
+            move['wait'] = 'the battle has not opened'
+            return False
         own = next((p for p in frame['players'] if p.get('side') == side), None) or me
-        tick = int(frame['game_tick'])
         position = next((pos for pos, index in enumerate(own['hand_deck_indices'])
                          if 0 <= index < len(deck) and deck[index] == card
-                         and self._dealt.get(pos, (index, -10 ** 9))[0] == index
-                         and tick - self._dealt.get(pos, (index, -10 ** 9))[1] >= DEALT_TICKS), None)
+                         and self._dealt.get(pos, (index, 0))[0] == index), None)
         if position is None:
             move['wait'] = 'not dealt yet'
             move['deal_wait'] = True
             return False       # the game has not dealt it (the play before it in that slot has not executed)
+        # the first touch goes down DEALT_MS after the card was first seen in the game's hand, on the device's
+        # clock. A fast_tap that can start a gesture at a given time (version 3) is handed it one frame ahead;
+        # otherwise the play waits here until that time has passed.
+        ready_us = self._dealt[position][1] + DEALT_MS * 1000
+        now_us = int(frame.get('sample_monotonic_us') or 0)
+        timed = self.tapper is not None and self.tapper.alive() and getattr(self.tapper, 'version', 2) >= 3
+        if now_us and now_us < ready_us - (80_000 if timed else 0):
+            move['wait'] = 'not dealt yet'
+            move['deal_wait'] = True
+            return False
+        at_us = ready_us if now_us and now_us < ready_us else None
         cost = float(V.CARDS.get(card, {}).get('elixir') or 0)
         if me['elixir_raw'] / 10000.0 - reserved < cost - 1e-6:
             move['elixir_wait'] = True
@@ -780,7 +804,8 @@ class Bot:
         try:
             if self.tapper is not None and self.tapper.alive():
                 sent = self.tapper.play(self.layout.hand_point(position),
-                                        self.layout.deployment_point(cell, side))
+                                        self.layout.deployment_point(cell, side), at_us=at_us,
+                                        wait_ms=(at_us - now_us) / 1000.0 if at_us else 0.0)
             else:
                 send_card_taps(ADB, SERIAL, self.layout, position, cell, side=side)
                 sent = time.time()
@@ -792,7 +817,7 @@ class Bot:
             timing['send_ms'] = (sent - timing['decided']) * 1000.0
         timing.update(resend=bool(move.get('resend')),
                       tap_sent=sent, tap_tick=int(frame['game_tick']), tap_us=frame.get('sample_monotonic_us'),
-                      not_before=move.get('not_before'), lag_used=self._tap_lag(),
+                      not_before=move.get('not_before'), lag_used=self._tap_lag(), at_us=at_us,
                       tap_n=self.tapper.count if self.tapper is not None and self.tapper.alive() else None)
         in_flight.append({'slot': own['hand_deck_indices'][position], 'card': card,
                           'form': int((getattr(self, '_hand_forms', None) or {}).get(card, 0)),
@@ -1087,7 +1112,7 @@ class Bot:
             local_account = next((a['lo'] for a in (accounts or [])
                                   if a and a.get('side') == side), None)
             deck = me['deck_card_ids']
-            self._note_hand(me['hand_deck_indices'], int(frame['game_tick']))
+            self._note_hand(me['hand_deck_indices'], int(frame.get('sample_monotonic_us') or 0))
             with V.LOCK:
                 executed = list(V.STATE['plays'])
             in_flight = self._settle_in_flight(in_flight, queue, executed, local_account,

@@ -44,16 +44,14 @@ class Tapper:
     def __init__(self, adb, serial, width: int, height: int):
         self.mode = os.environ.get('CR_TAP_MODE', 'place')
         drag = self.mode == 'drag'
-        # place gap 8 hold 16: 4/4 accepted, 41 ms (tap_bench, 2026-09-25). In live games on 2026-10-03, 35
-        # of 276 taps never registered, and the touch length was not the reason: 29 were sent before the
-        # game had dealt the card or on the tick it did (console.DEALT_TICKS), 1 was for a card one of those
-        # had already played, and 5 were the second of two gestures written within 3 ms of each other (5 of
-        # the 9 such; the other 237 taps all registered). So the gesture stays as it was, and a gesture
-        # waits `spacing` ms after the previous one has ended: 60, as in the one pair that day sent 100 ms
-        # apart, which registered. Not yet shown to be enough: the timing record of the next games says.
+        # place gap 8 hold 16: 4/4 accepted, 41 ms (tap_bench, 2026-09-25). What the client takes is measured in
+        # docs/GAME_INTEGRATION.md (mac012/tap_probe.py, 2026-10-03): the touch length and the gap inside a
+        # gesture do not matter (2-34 ms holds, 0-33 ms gaps: 30 of 31 taken), so they stay as they were; a
+        # gesture that begins less than ~5 ms after the one before it ended is lost about one time in three
+        # (10 of 17 pairs whole, against 18 of 19 from 5 ms up), so gestures are written `spacing` ms apart.
         self.gap = int(os.environ.get('CR_TAP_GAP_MS', '3' if drag else '8'))
         self.hold = int(os.environ.get('CR_TAP_HOLD_MS', '10' if drag else '16'))
-        self.spacing = int(os.environ.get('CR_TAP_SPACING_MS', '60'))
+        self.spacing = int(os.environ.get('CR_TAP_SPACING_MS', '20'))
         self.free_at = 0.0          # when the last gesture written will have ended, plus the spacing
         self.write_lock = threading.Lock()
         path, max_x, max_y = touch_device(adb, serial)
@@ -75,6 +73,10 @@ class Tapper:
         if '"version"' not in version:
             self.process.kill()
             raise RuntimeError('fast_tap on the device is out of date (rebuild: start-consoles.sh)')
+        try:
+            self.version = int(json.loads(version).get('version', 2))      # 3: `at US <gesture>`
+        except ValueError:
+            self.version = 2
         self.sent: deque[float] = deque()
         self.timings: deque[dict] = deque(maxlen=200)   # {'gesture_ms', 'ack_ms', 'n'}
         self.count = 0          # commands written; the n-th ack answers the n-th command
@@ -82,7 +84,7 @@ class Tapper:
         threading.Thread(target=self._acks, daemon=True).start()
 
     def describe(self) -> str:
-        return (f'fast_tap on {self.path}, {self.mode} gap {self.gap} ms hold {self.hold} ms, '
+        return (f'fast_tap v{self.version} on {self.path}, {self.mode} gap {self.gap} ms hold {self.hold} ms, '
                 f'{self.spacing} ms between gestures')
 
     def _acks(self) -> None:
@@ -107,16 +109,21 @@ class Tapper:
     def alive(self) -> bool:
         return self.process.poll() is None
 
-    def play(self, hand_point, target_point) -> float:
-        """Queue one card placement; returns the time the command was written."""
+    def play(self, hand_point, target_point, at_us: int | None = None, wait_ms: float = 0.0) -> float:
+        """Queue one card placement; returns the time the command was written.
+        at_us: the device's monotonic time (the reader's sample_monotonic_us clock) the first touch goes down at,
+        `wait_ms` from now: fast_tap holds the gesture until then, so it lands on the device's clock and not on
+        ours (a card just dealt can be touched from 100 ms after its deal, not before)."""
         (x0, y0), (x1, y1) = hand_point, target_point
         sx, sy = self.scale
         x0, x1 = round(x0 * sx), round(x1 * sx)
         y0, y1 = round(y0 * sy), round(y1 * sy)
         verb = 'drag' if self.mode == 'drag' else 'placeh'
         line = f'{verb} {x0} {y0} {x1} {y1} {self.gap} {self.hold}\n'
+        if at_us is not None and self.version >= 3:
+            line = f'at {int(at_us)} {line}'
         duration = (self.gap + 1) * self.hold if self.mode == 'drag' else 2 * self.hold + self.gap
-        return self._send(line, duration)
+        return self._send(line, duration + max(0.0, wait_ms))
 
     def _write(self, line: str) -> None:
         with self.write_lock:

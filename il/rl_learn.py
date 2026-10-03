@@ -210,6 +210,7 @@ def save_policy(path: Path, policy, head, update_index: int, args) -> None:
                                  gamma_per_decision=args.gamma,
                                  extra={'recipe': 'clapha il.rl_learn: self-play, live path, our reward',
                                         'init': args.init, 'update': update_index, 'extras': True,
+                                        'deal': args.deal,
                                         **extras_payload(head)})
     for attempt in range(40):
         try:
@@ -254,6 +255,9 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument('--init', required=True, help='the starting policy (our extended checkpoint)')
     parser.add_argument('--games', required=True, type=Path, help='the collectors\' lane folder')
+    parser.add_argument('--deal', choices=('sim', 'hold', 'mask'), default='sim',
+                        help="the deal rule the collectors play the learner under (il.rl collect --deal); written "
+                             "into the checkpoint so the console gives the model the same legal cards")
     parser.add_argument('--out', required=True, type=Path)
     # 32 lanes of 2 per minibatch: next to the other user's job on the PC, 64 lanes took 8.7 GB of RAM
     # and 8 per minibatch ran the GPU out of memory (2026-09-27)

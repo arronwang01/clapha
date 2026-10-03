@@ -290,12 +290,16 @@ def collect(args) -> int:
         runners = {learner_side: learner, 1 - learner_side: opponent}
         delays = {learner_side: 'live', 1 - learner_side: opponent_delay}
         leads = {learner_side: 'auto', 1 - learner_side: 'auto' if opponent_delay == 'live' else 0}
+        # the game's deal rule (il.duel.DEAL_MODES): self-play has it on both sides; a fixed opponent that was
+        # trained without it plays as the console plays such a model (its tap waits for the deal)
+        deal = {learner_side: args.deal,
+                1 - learner_side: args.deal if not args.opponent else _old_model_deal(args.deal, opponent_delay)}
         started = time.time()
         try:
             result = D.play_match(native, runners, delays, leads, config, forms,
                                   rng, f'rl-{tag[:8]}-{index}', record=True,
                                   measured={learner_side: overheads['learner'], 1 - learner_side: overheads['opponent']},
-                                  target_delay=TARGET_DELAY)
+                                  target_delay=TARGET_DELAY, deal=deal)
         except Exception as error:  # noqa: BLE001  (one broken game must not end the collection)
             print(f'game {index + 1} failed: {type(error).__name__}: {error}', flush=True)
             for recorder in recorders.values():
@@ -339,6 +343,11 @@ def collect(args) -> int:
 
 
 LEAGUE = 'self=4,snap=2,anchor=1,hog2=1,general=2'
+
+
+def _old_model_deal(learner_deal: str, delay: str) -> str:
+    """The deal mode of an opponent trained before the rule, in a run whose learner has `learner_deal`."""
+    return 'sim' if learner_deal == 'sim' or delay != 'live' else 'hold'
 
 
 def _league(text: str) -> list[tuple[str, float]]:
@@ -433,13 +442,17 @@ def collect_remote(args) -> int:
         runners = {learner_side: learner, 1 - learner_side: opponent}
         delays = {learner_side: 'live', 1 - learner_side: opponent_delay}
         leads = {learner_side: 'auto', 1 - learner_side: 'auto' if opponent_delay == 'live' else 0}
+        # the game's deal rule (il.duel.DEAL_MODES): the learner and its own snapshots have it; the anchor
+        # (trained without it) plays as the console plays such a model; FirstLight's sandbox is left as it is
+        deal = {learner_side: args.deal,
+                1 - learner_side: args.deal if kind in ('self', 'snap') else _old_model_deal(args.deal, opponent_delay)}
         started = time.time()
         WAITED[0] = 0.0
         try:
             result = D.play_match(native, runners, delays, leads, config, forms, rng, f'rl-{tag[:8]}-{index}',
                                   record=True, measured={learner_side: overheads['learner'],
                                                          1 - learner_side: overheads['opponent']},
-                                  target_delay=TARGET_DELAY, decide_many=decide_many)
+                                  target_delay=TARGET_DELAY, decide_many=decide_many, deal=deal)
         except Exception as error:  # noqa: BLE001  (one broken game must not end the collection)
             print(f'game {index + 1} failed: {type(error).__name__}: {error}', flush=True)
             for runner in (learner, opponent):
@@ -500,7 +513,9 @@ def _finish_game(args, out: Path, run: Path, index: int, kind: str, tag: str, op
            'learner_version': learner.version, 'opponent_version': opponent.version, 'winner': winner,
            'learner_won': None if winner not in (0, 1) else winner == learner_side,
            'crowns': result['crowns'], 'end_tick': result['tick'], 'tower_hp': result.get('tower_hp'),
-           'seconds': round(time.time() - started, 1), 'timing': result.get('timing'), 'lanes': [], 'sides': {}}
+           'seconds': round(time.time() - started, 1), 'timing': result.get('timing'), 'lanes': [], 'sides': {},
+           # the deal rule the learner played under, and each side's plays that met it (il.duel counters)
+           'deal': getattr(args, 'deal', 'sim'), 'counters': result.get('counters')}
     trained = [('learner', learner_side, learner)] + ([('opponent', 1 - learner_side, opponent)] if kind == 'self' else [])
     for role, side, runner in [('learner', learner_side, learner), ('opponent', 1 - learner_side, opponent)]:
         decision_ticks = [runner.first_decision_tick + 5 * k for k in range(len(runner.last_steps))]
@@ -573,6 +588,9 @@ def main(argv: list[str]) -> int:
     c.add_argument('--port', type=int, default=26789)
     c.add_argument('--device', default='cpu')
     c.add_argument('--seed', type=int, default=7)
+    c.add_argument('--deal', choices=('sim', 'hold', 'mask'), default='sim',
+                   help="the game's deal rule for the learner (il.duel.DEAL_MODES): mask = a card the game has not "
+                        "dealt yet is not offered, as the client refuses its tap; sim = as every run up to pilot3")
     c.add_argument('--follow', action='store_true', help='reload --policy whenever it changes (the learner\'s latest.pt)')
     c.add_argument('--server', help='host:port of il.rl_serve: the models run there, the league picks opponents')
     c.add_argument('--league', default=LEAGUE, help='with --server: opponent weights, e.g. ' + LEAGUE)

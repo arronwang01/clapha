@@ -622,7 +622,7 @@ def own_runtime_states(player: dict, entities, side: int, tick: int, battle,
     return tuple(abilities), tuple(evolutions)
 
 
-def screen_view(player: dict, sent_cards, strict: bool = True) -> dict:
+def screen_view(player: dict, sent_cards, strict: bool = True, deal_rule: bool = False) -> dict:
     """The actor's own player row as its screen shows it (a copy; the reader row is left alone).
 
     The client takes a card out of the hand and its cost off the elixir bar at the tap; the game
@@ -637,6 +637,10 @@ def screen_view(player: dict, sent_cards, strict: bool = True) -> dict:
     strict: a sent card that is not in the hand raises ValueError (training: the in-flight list
     is wrong). Otherwise it is skipped: live or in a duel a policy can send a card that is not on
     screen yet (the second of two plays whose first was not sent); it cannot be tapped.
+    deal_rule: the row also says which of its hand cards the game itself has dealt ('hand_dealt', per
+    slot). A card put in by either step is not dealt: the game deals it when the play before it in that
+    slot executes, and until then the client takes no tap for it (27 of 27 lost live, 2026-10-03).
+    action_mask makes such a card illegal, so a policy can only choose what the game will take.
     """
     from native_runner.training.v4.factory import production_semantic_bundle
 
@@ -645,6 +649,7 @@ def screen_view(player: dict, sent_cards, strict: bool = True) -> dict:
     hand = list(player.get('hand_deck_indices') or [])
     cycle = list(player.get('cycle_deck_indices') or [])
     elixir = int(player.get('elixir_raw') or 0)
+    dealt = [slot >= 0 for slot in hand]
     for position, slot in enumerate(hand):
         if slot < 0 and len(cycle) > 4:
             hand[position] = cycle.pop(0)
@@ -656,11 +661,15 @@ def screen_view(player: dict, sent_cards, strict: bool = True) -> dict:
             continue
         position = hand.index(slot)
         hand[position] = cycle.pop(0)
+        dealt[position] = False
         cycle.append(slot)
         spec = specs.get(int(card))
         elixir -= int(round(float(getattr(spec, 'elixir_cost', 0) or 0) * 10000))
-    return {**player, 'hand_deck_indices': hand, 'cycle_deck_indices': cycle,
+    view = {**player, 'hand_deck_indices': hand, 'cycle_deck_indices': cycle,
             'next_deck_index': cycle[0] if cycle else -1, 'elixir_raw': max(0, elixir)}
+    if deal_rule:
+        view['hand_dealt'] = dealt
+    return view
 
 
 def legal_ability_sources(abilities, elixir: float, pending=()) -> tuple[int, ...]:
@@ -694,6 +703,9 @@ def action_mask(frame: dict, side: int, elixir: float, reserved: float = 0.0,
 
     hand_forms maps card id -> the form it would be played in (0 normal, 1 evolution, 2 hero).
     The entry's form_code must agree with hand_runtime_by_slot, or the tensorizer raises.
+
+    A player row with 'hand_dealt' (screen_view's deal_rule) makes a hand card the game has not dealt
+    yet illegal ('not_dealt'): it is on the screen's hand, the client takes no tap for it.
     """
     from native_runner.contracts import ActionKind, ActionMaskV1
     from native_runner.training.v4.factory import production_semantic_bundle
@@ -710,6 +722,7 @@ def action_mask(frame: dict, side: int, elixir: float, reserved: float = 0.0,
     reasons: dict[str, object] = {}
     if player:
         deck = player.get('deck_card_ids') or []
+        dealt = player.get('hand_dealt')
         for position, index in enumerate(player.get('hand_deck_indices') or []):
             if position > 3 or not (deck and 0 <= index < len(deck)):
                 continue
@@ -732,7 +745,9 @@ def action_mask(frame: dict, side: int, elixir: float, reserved: float = 0.0,
                      'form_code': form, 'native_form_code': form,
                      'source_native_hand_slot': position}
             masks[str(position)] = entry
-            if cost > available:
+            if dealt is not None and not dealt[position]:
+                reasons[str(position)] = 'not_dealt'
+            elif cost > available:
                 reasons[str(position)] = 'insufficient_elixir'
             elif not any(any(row) for row in entry['row_major']):
                 reasons[str(position)] = 'no_legal_placement'

@@ -155,8 +155,9 @@ def ability_rows(frame: dict, actor: int, clock, tick: int) -> list[tuple]:
 
 
 def reader_frame(frame: dict, actor: int, deck_forms: dict[int, list[int]], in_flight: list,
-                 strict: bool = True) -> dict:
-    """The frame the reader would give at this tick, own hand and elixir as the screen shows."""
+                 strict: bool = True, deal_rule: bool = False) -> dict:
+    """The frame the reader would give at this tick, own hand and elixir as the screen shows.
+    deal_rule: a hand card the engine has not dealt yet is not playable (firstlight_obs.screen_view)."""
     state = {p['owner']: p for p in frame['state']['players']}
     lean = {p['owner']: p for p in frame['players']}
     players = []
@@ -178,7 +179,8 @@ def reader_frame(frame: dict, actor: int, deck_forms: dict[int, list[int]], in_f
                         'cycle_deck_indices': cycle, 'deck_card_ids': deck, 'deck_form_flags': forms,
                         'evo_progress': progress})
             # as the screen shows it: drawn card in, sent cards out (the console does the same)
-            row = FLO.screen_view(row, [p.card_id for p in in_flight if p.kind == 'card'], strict=strict)
+            row = FLO.screen_view(row, [p.card_id for p in in_flight if p.kind == 'card'], strict=strict,
+                                  deal_rule=deal_rule)
         else:
             row.update({'next_deck_index': -1, 'hand_deck_indices': [-1, -1, -1, -1],
                         'cycle_deck_indices': [], 'deck_card_ids': [], 'deck_form_flags': [],
@@ -215,8 +217,10 @@ def revealed_cards(timeline, tick: int) -> dict[int, list[int]]:
 
 
 def actor_samples(header: dict, frames: list[dict], actor: int, stats: Counter, keep: bool = False,
-                  delay: int | None = None, extras: bool = False) -> list:
-    """Replay one actor's turns; returns (tick, frame batch, action sequence, label usable)."""
+                  delay: int | None = None, extras: bool = False, deal_rule: bool = False) -> list:
+    """Replay one actor's turns; returns (tick, frame batch, action sequence, label usable).
+    deal_rule: cards the engine has not dealt yet are illegal; a recorded play of one is then a label
+    that does not align (the turn is kept, without it)."""
     import torch
     from native_runner.training.v4.expert import (ExpertActionAlignmentError, TimedExpertActionV4,
                                                   build_expert_action_batch, replay_expert_actions)
@@ -273,7 +277,7 @@ def actor_samples(header: dict, frames: list[dict], actor: int, stats: Counter, 
         in_flight = sorted((p for p in own_plays if decision_tick(p.lands, delay) < tick <= p.lands),
                            key=lambda p: (p.lands, p.index))
         try:
-            raw = reader_frame(frame, actor, deck_forms, in_flight)
+            raw = reader_frame(frame, actor, deck_forms, in_flight, deal_rule=deal_rule)
         except ValueError:
             stats['screen hand: in-flight card not in the engine hand'] += 1
             return samples

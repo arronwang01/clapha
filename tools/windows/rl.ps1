@@ -16,6 +16,7 @@ param(
     [string]$League = 'self=4/snap=2/anchor=2/hog2=1/general=2',
     [string]$Ports = '',        # the engine ports to use, e.g. '26789/26790/26792' (default: -Engines from -BasePort)
     [string]$LearnArgs = '',
+    [string]$Deal = 'mask',     # the game's deal rule (il.duel.DEAL_MODES); 'sim' = as every run up to pilot3
     [switch]$NoLearn,
     [switch]$Stop
 )
@@ -56,7 +57,7 @@ if (-not (Test-Path 'runs\rl\deals.pkl')) {
 for ($k = 0; $k -lt $Servers; $k++) {
     Launch "serve-$k" "-m il.rl_serve --run $dir --device cuda --address 127.0.0.1:$(26900 + $k)"
 }
-if (-not $NoLearn) { Launch 'learn' "-m il.rl_learn --init $Init --games $dir\games --out $dir $LearnArgs" }
+if (-not $NoLearn) { Launch 'learn' "-m il.rl_learn --init $Init --games $dir\games --out $dir --deal $Deal $LearnArgs" }
 Start-Sleep 20      # the server loads its first models before the collectors ask
 if ($Ports) { $portList = @($Ports -split '[/, ]+' | Where-Object { $_ } | ForEach-Object { [int]$_ }) }
 else { $portList = @(0..($Engines - 1) | ForEach-Object { $BasePort + $_ }) }
@@ -64,5 +65,5 @@ else { $portList = @(0..($Engines - 1) | ForEach-Object { $BasePort + $_ }) }
 # replay the same first deals each time
 for ($i = 0; $i -lt $portList.Count; $i++) {
     $port = $portList[$i]
-    Launch "collect-$port" "-m il.rl collect --server 127.0.0.1:$(26900 + $i % $Servers) --policy $dir\latest.pt --anchor $Init --league $League --games 1000000 --out $dir\games --port $port --seed $(Get-Random -Maximum 1000000000)"
+    Launch "collect-$port" "-m il.rl collect --server 127.0.0.1:$(26900 + $i % $Servers) --policy $dir\latest.pt --anchor $Init --league $League --games 1000000 --out $dir\games --port $port --deal $Deal --seed $(Get-Random -Maximum 1000000000)"
 }

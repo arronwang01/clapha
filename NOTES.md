@@ -1831,14 +1831,9 @@ Marked games (the user on their phone against clapha:p3 on device 1, from 12:35;
     another card's click on that card's tile (2), or came 26-37 s later (2). In games 1, 4 and 5 the tower
     that ended the match fell within 14 s of failed clicks (game 1: the lost Cannon, then the Cannon at the
     bridge; game 5: four in a row).
-  **Fix (mac012/console.py DEALT_TICKS, loaded 14:25):** a play is tapped only where the game's own hand
-  holds its card, once it has held it 2 ticks; until then it waits (up to 2.5 s; a newer choice of the same
-  card replaces the tile and keeps the earlier moment). No slot is ever tapped for a card it does not hold.
-  Replayed over the 276 taps: 29 held, all 29 lost as played, none of the 241 registered ones touched; the
-  held ones would have gone out 2-26 ticks later (median 11). Gestures are now written 60 ms apart (the
-  one pair that day sent 100 ms apart registered; not shown to be enough yet). A tap not in the queue after
-  12 ticks is still sent again once (LOST_AFTER_TICKS). In the replay (il/live_games.py) each failed click
-  says why, and a card it put down instead is named in the plays.
+  **Fix, first form (14:25):** a play tapped only where the game's own hand holds its card, two ticks after
+  it appeared there; gestures 60 ms apart; a tap not in the queue after 12 ticks sent again. Replaced the
+  same afternoon by the measured rules (next section).
   **Left for training:** the engine must refuse what the client refuses -- a card not playable until its
   deal (+2 ticks) -- or the model keeps planning on a Cannon it cannot have for another second.
 - **The "outright missed Cannons" of 2026-10-02 night were fl:general** (switched to at 20:15; no delay
@@ -1852,3 +1847,48 @@ Marked games (the user on their phone against clapha:p3 on device 1, from 12:35;
   These counts include pushes with a lost tap in them: to be read again from games played with the fix.
 - Open: the same pushes replayed in the engine against the same model (the user's commands as a scripted
   opponent), to separate what is left of the pipeline from the model for certain.
+
+## 2026-10-03 afternoon: the client's rules for a play, measured tap by tap -> docs/GAME_INTEGRATION.md
+
+The user (both bots off, 7x-elixir friendlies between the two accounts, six battles): "collect info on how
+card registration and tapping work PRECISELY ... a big doc ... the cornerstone of the project. Then use this
+info to solve the tapping problem." Tools: `mac012/tap_probe.py` (touches placed on the device's own clock
+against 20 ms samples of the game's memory; `src/fast_tap.c` version 3 starts a gesture at a given monotonic
+time and reports each touch's time), `mac012/tap_probe_report.py`. Records: docs/measurements/.
+**The document is the reference; the headlines:**
+- The game deals the next card into a slot exactly 21 ticks after the issue tick of the play before it
+  (139 of 139). On the screen the slot is *empty* until then (the next card is only under "Next:") -- our
+  screen view, which has the next card in at the tap, is wrong about the screen too, not only about what
+  can be touched.
+- A touch that begins before the deal does nothing and selects nothing (0 of 31; 0 of 9); from 100 ms after
+  the deal it is always taken (38 of 38); in between sometimes (20 of 70). The touch going down is what
+  counts.
+- Touch length and the gap inside a gesture do not matter (30 of 31 over twelve shapes). Two gestures need
+  ~5 ms between them (18 of 19 from 5 ms; 10 of 17 under).
+- The client checks the screen's elixir (the fourth card of a full-bar burst refused, 2 of 2).
+- No play is taken before about tick 94 of a battle; the first issue tick is 101.
+- A tile a card may not take moves the card to the nearest it may (28 of 28, none refused); a building
+  asked onto a standing building goes three tiles away.
+- A command first shows in the queue 1-12 ticks after its issue tick: 4-17 ticks after the tap. **The
+  morning's "sent again after 12 ticks" would have called 9% of good taps lost**; it is 20 now. The same
+  short wait made the probe's own first results wrong (plays it called refused had been taken): the report
+  now decides from the whole queue record.
+- Normal elixir only: a play executing less than 20 ticks after the previous deal is mostly dealt late, 20
+  ticks after that deal (14 of 20). Not so in 7x.
+**Console now** (`DEALT_MS` 120, `FIRST_TAP_TICK` 95, `LOST_AFTER_TICKS` 20, `Tapper.spacing` 20): a play's
+first touch goes down 120 ms after the card was first seen in the game's own hand, started by fast_tap on
+the device's clock; never in a slot holding another card; nothing before tick 95.
+**Training** (written, not yet run in the engine -- CR_4k was kept off while the user tested): `il/duel.py`
+`deal` per side -- 'sim' (as before, and the default), 'hold' (the tap waits for the deal + 3 ticks),
+'mask' (and a card not dealt is not offered: `firstlight_obs.screen_view(deal_rule=True)`, mask reason
+`not_dealt`); `il.rl collect --deal`, `rl_learn --deal` (written into the checkpoint; the console gives such
+a model the mask), `rl.ps1 -Deal mask` by default for new runs. Old opponents play 'hold'. The counters
+`before_deal`, `held_for_deal`, `held_ticks`, `dropped_deal` are in every games.jsonl row.
+**The current model under the mask** (291 turns of 36 pilot3 games where it had played a card not yet
+dealt, decided again with that card not offered): waits in 79%, plays another card in 14% -- for the Cannon
+in half. So pilot3 keeps the hold; the mask is for the next model.
+- Training Camp, bot on, first form of the fix: 20 plays, none lost (one waited a tick for its deal, one
+  pair 100 ms apart). The measured form has not played a match yet.
+- Still to do: run `il/duel.py --a-deal hold|mask` in the engine (does it run; what the rule costs pilot3);
+  a friendly with the bot on to confirm no failed clicks; the next run with `-Deal mask`.
+

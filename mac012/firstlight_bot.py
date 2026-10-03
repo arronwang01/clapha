@@ -129,6 +129,7 @@ class FirstLightRunner:
         self.decision_ticks = POLICY_DECISION_TICKS
         self.first_decision_tick = FIRST_POLICY_DECISION_TICK
         self.clapha_inputs, self.has_extras, self.elixir_lead = False, False, 0
+        self.deal_rule = False
         if model is None:
             self.model = None
         else:
@@ -146,8 +147,12 @@ class FirstLightRunner:
             # Our checkpoints (il/train.py) were trained on the screen's hand and elixir, elixir
             # counted as of the tap, and (Stage B) the extras; the console builds their inputs
             # that way. FirstLight's own keep today's inputs exactly.
-            recipe = '' if str(model).startswith('fl:') else str(checkpoint_extra(path).get('recipe', ''))
+            extra = {} if str(model).startswith('fl:') else checkpoint_extra(path)
+            recipe = str(extra.get('recipe', ''))
             self.clapha_inputs = recipe.startswith('clapha')
+            # trained with the game's deal rule (il.rl --deal mask): a hand card the game has not dealt yet
+            # is not offered, live as in its training (firstlight_obs.screen_view deal_rule)
+            self.deal_rule = self.clapha_inputs and str(extra.get('deal', '')) == 'mask'
             self.has_extras = '_extras_head' in self.model.__dict__
             self.elixir_lead = 9 if self.clapha_inputs else 0    # median tap overhead 5 + window 4
         self.sample = bool(sample)

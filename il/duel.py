@@ -35,6 +35,16 @@ from il.params import (COMMAND_AGE_TICKS, DECISION_TICKS, OWN_OVERHEAD_TICKS, RE
                        elixir_lead, live_delay)
 
 DEFER_TICKS = 30        # a tap that cannot be afforded is dropped after this long (console: 1.5 s)
+# The game deals a card into the hand when the play before it in that slot executes; the client takes no
+# tap for it before that (live, 2026-10-03: 27 of 27 lost), and this engine was taking them: a command was
+# queued the tick before it executed, by when the card had been dealt. A side's `deal`:
+#   'sim'   as before (and as every model up to pilot3 was trained): any card on the screen hand can be sent
+#   'hold'  a tap waits until the engine's hand has held the card DEALT_TICKS (the console's DEALT_MS)
+#   'mask'  the same, and a card not dealt yet is not offered to the model (firstlight_obs deal_rule): what
+#           the game allows is what the model may choose, and its plays land when it means them to
+DEAL_MODES = ('sim', 'hold', 'mask')
+DEALT_TICKS = 3         # console.DEALT_MS (120 ms after the deal) in whole ticks
+DEAL_WAIT_TICKS = 50    # console.DEAL_WAIT_SECONDS
 
 
 @dataclass
@@ -55,6 +65,8 @@ class Command:
     hand_slot: int | None = None             # the engine hand index it was queued from
     moment: int = 0                          # decision tick + the model's offset: the tap without delay
     native_xy: tuple[int, int] | None = None  # a replayed play's exact point (tile centre otherwise)
+    before_deal: bool = False                # its tap came due before the engine had dealt the card
+    held: bool = False                       # ... and waited for the deal (deal 'hold' / 'mask')
 
 
 def _lead_arg(value: str):
@@ -69,8 +81,9 @@ def _overhead(rng: random.Random) -> int:
 def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id: str, record: bool = False,
                extra_delay: dict | None = None, measured: dict | None = None,
                script: dict[int, list[dict]] | None = None, target_delay: int | None = None,
-               decide_many=None) -> dict:
+               decide_many=None, deal: dict[int, str] | None = None) -> dict:
     """One battle to the end; returns the result and per-side counters.
+    deal: side -> DEAL_MODES (default 'sim').
 
     The engine is stepped to the next thing that happens: a decision turn (every 5 ticks), a tap
     coming due (checked for elixir at that tick; one that cannot be afforded is re-checked every
@@ -90,7 +103,29 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
     commands: list[Command] = []
     executed_rows: list[dict] = []
     counters = {side: {'decided': 0, 'tapped': 0, 'executed': 0, 'dropped_elixir': 0, 'dropped_hand': 0,
-                       'abilities': 0, 'abilities_dropped': 0} for side in (0, 1)}
+                       'abilities': 0, 'abilities_dropped': 0, 'before_deal': 0, 'held_for_deal': 0,
+                       'held_ticks': 0, 'dropped_deal': 0} for side in (0, 1)}
+    deal = {side: (deal or {}).get(side, 'sim') for side in (0, 1)}
+    dealt: dict[int, dict[int, int]] = {0: {}, 1: {}}    # side -> card -> the tick the engine dealt it
+    seen_hand = {0: False, 1: False}
+    last_look = [0]
+
+    def note_hands(state_players) -> None:
+        """Since when each card has been in the engine's hand. The engine is only looked at on some ticks, so
+        a card that appeared since the last look is dated to this side's play that executed in between."""
+        for player in state_players:
+            if 'hand' not in player:
+                continue
+            side, cards = player['owner'], {int(h['cardId']) for h in player['hand']}
+            known = dealt[side]
+            for card in [c for c in known if c not in cards]:
+                del known[card]
+            for card in cards - set(known):
+                between = [c.execute for c in (*commands, *done) if c.side == side and c.kind == 'card'
+                           and c.execute is not None and last_look[0] < c.execute <= tick]
+                known[card] = -10 ** 9 if not seen_hand[side] else (max(between) if between else tick)
+            seen_hand[side] = True
+        last_look[0] = tick
     tick, ended, seq = 0, False, 0
     # a replay opponent (script: side -> il.engine_convert.replay_commands card plays): the real
     # player's plays go in at their recorded ticks, as the conversion queues them; they sit in the
@@ -124,8 +159,24 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
         return logic_raw / 10000.0 - sum(c.cost for c in in_flight)
 
     def process_taps(state_players) -> None:
+        note_hands(state_players)
         for command in sorted((c for c in commands if c.execute is None and c.tap <= tick), key=lambda c: c.seq):
             logic = {p['owner']: p['elixirRaw'] for p in state_players}[command.side]
+            if command.kind == 'card' and not command.injected:
+                since = dealt[command.side].get(command.card_id)
+                early = since is None or tick - since < DEALT_TICKS
+                if early and not command.before_deal:
+                    command.before_deal = True
+                    counters[command.side]['before_deal'] += 1
+                if early and deal[command.side] != 'sim':
+                    if not command.held:
+                        command.held = True
+                        counters[command.side]['held_for_deal'] += 1
+                    counters[command.side]['held_ticks'] += 1
+                    if tick - command.tap > DEAL_WAIT_TICKS:
+                        counters[command.side]['dropped_deal'] += 1
+                        commands.remove(command)
+                    continue
             if screen_elixir(command.side, logic) >= command.cost - 1e-6:
                 command.execute = tick + COMMAND_AGE_TICKS
                 counters[command.side]['tapped'] += 1
@@ -223,7 +274,7 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
         clock = time.perf_counter()
         players = frames[-1]['state']['players'] if decision else native.observe()['players']
         timing['engine'] += time.perf_counter() - clock
-        process_taps(players if decision else [{'owner': p['owner'], 'elixirRaw': p['elixirRaw']} for p in players])
+        process_taps(players)
         inject_due()
         if not decision:
             continue
@@ -264,7 +315,7 @@ def play_match(native, runners, delays, leads, config, deck_forms, rng, match_id
             # sent from the turn after its decision (il/samples in_flight)
             sent = [_Sent(c.card_id) for c in sorted(commands, key=lambda c: c.seq) if c.side == side and c.kind == 'card']
             try:
-                raw = S.reader_frame(frame, side, deck_forms, sent, strict=False)
+                raw = S.reader_frame(frame, side, deck_forms, sent, strict=False, deal_rule=deal[side] == 'mask')
             except ValueError:
                 state = {p['owner']: p for p in frame['state']['players']}[side]
                 print('DEBUG tick', tick, 'side', side, 'hand', [(h['handIndex'], h['deckSlot'], h['cardId']) for h in state['hand']],
@@ -541,6 +592,11 @@ def main(argv: list[str]) -> int:
                              "Skeletons) at level 16, deal seeds --seed, --seed + 1, ... (il/vs_firstlight's games)")
     parser.add_argument('--plain', action='store_true',
                         help='with --specialist: no evolution or hero forms on either side (a deck as most players own it)')
+    parser.add_argument('--a-deal', choices=DEAL_MODES, default='sim',
+                        help="how a's plays meet the game's deal: sim = any card on the screen hand can be sent (the "
+                             "engine takes it; the client does not); hold = the tap waits for the deal; mask = and "
+                             "a card not dealt yet is not offered to the model")
+    parser.add_argument('--b-deal', choices=DEAL_MODES, default='sim')
     parser.add_argument('--together', action='store_true',
                         help='both sides decide from the same state, as the RL collectors do (il/rl_serve); '
                              'otherwise side 1 is prepared after side 0 has played this turn')
@@ -592,7 +648,8 @@ def main(argv: list[str]) -> int:
                                 target_delay=args.target_delay,
                                 decide_many=(lambda ready: {side: runner.decide(observation)
                                                             for side, runner, observation in ready})
-                                if args.together else None)
+                                if args.together else None,
+                                deal={a_side: args.a_deal, 1 - a_side: args.b_deal})
         except Exception as error:  # noqa: BLE001  (one broken match must not end the set)
             print(f'match {index + 1} failed: {type(error).__name__}: {error}', flush=True)
             for runner in runners.values():
@@ -608,6 +665,7 @@ def main(argv: list[str]) -> int:
         row = {'a': args.a, 'a_delay': args.a_delay, 'b': args.b, 'b_delay': args.b_delay, 'deck_from': tag,
                'a_lead': args.a_lead, 'b_lead': args.b_lead, 'a_extra_delay': args.a_extra_delay,
                'b_extra_delay': args.b_extra_delay, 'target_delay': args.target_delay,
+               'a_deal': args.a_deal, 'b_deal': args.b_deal,
                'a_side': a_side, 'result': label, 'crowns': result['crowns'], 'end_tick': result['tick'],
                'tower_hp': result['tower_hp'],
                'counters': result['counters'], 'seconds': round(time.time() - started)}

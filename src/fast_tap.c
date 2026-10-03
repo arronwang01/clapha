@@ -12,9 +12,14 @@
 //   place X0 Y0 X1 Y1 GAP_MS     card tap, gap, then placement tap (34 ms holds)
 //   placeh X0 Y0 X1 Y1 GAP_MS HOLD_MS   same, with the hold per tap given
 //   drag X0 Y0 X1 Y1 STEPS STEP_MS      one gesture: down on the card, move, up on the tile
-//   version                      -> {"version":2} (placeh/drag supported)
+//   taph X Y HOLD_MS             single tap with the hold given
+//   now                          -> {"now":US}: this device's monotonic clock, the reader's clock
+//   at US <command>              the command above, started when the monotonic clock reaches US
+//   version                      -> {"version":3} (2: placeh/drag; 3: taph/now/at, "t0" and "t" in replies)
 //   quit
-// Prints one line per command with the elapsed microseconds, so latency is measurable.
+// Prints one line per command with the elapsed microseconds, so latency is measurable; "t0" is the
+// monotonic time it started and "t" the time of each touch down and up (the clock of the reader's
+// sample_monotonic_us, so a touch can be placed against what the game's memory held when).
 //
 // usage: fast_tap /dev/input/eventN
 #define _GNU_SOURCE
@@ -72,10 +77,22 @@ static void touch_move(int x, int y) {
   sync_report();
 }
 
+static uint64_t stamps[8];
+static int stamp_count;
+
+static void print_stamps(void) {
+  printf(",\"t\":[");
+  for (int i = 0; i < stamp_count; ++i)
+    printf(i ? ",%llu" : "%llu", (unsigned long long)stamps[i]);
+  printf("]");
+}
+
 /* A touch that goes down and up inside one frame can be dropped, so hold briefly. */
 static void tap(int x, int y, int hold_ms) {
+  if (stamp_count < 7) stamps[stamp_count++] = now_us();
   touch_down(x, y);
   usleep((useconds_t)hold_ms * 1000);
+  if (stamp_count < 8) stamps[stamp_count++] = now_us();
   touch_up();
 }
 
@@ -86,16 +103,35 @@ int main(int argc, char **argv) {
   setvbuf(stdout, NULL, _IONBF, 0);
   printf("{\"ready\":\"%s\"}\n", path);
 
-  char line[256];
-  while (fgets(line, sizeof(line), stdin)) {
+  char buffer[256];
+  while (fgets(buffer, sizeof(buffer), stdin)) {
+    char *line = buffer;
+    unsigned long long when = 0;
+    int skip = 0;
+    if (sscanf(line, "at %llu %n", &when, &skip) == 1 && skip > 0) {
+      line += skip;
+      while (now_us() + 2000 < when) usleep(1000);     /* sleep to within 2 ms, then spin */
+      while (now_us() < when) {}
+    }
     uint64_t started = now_us();
+    stamp_count = 0;
     int x0, y0, x1, y1, gap, hold;
     if (sscanf(line, "placeh %d %d %d %d %d %d", &x0, &y0, &x1, &y1, &gap, &hold) == 6) {
       tap(x0, y0, hold);
       usleep((useconds_t)gap * 1000);
       tap(x1, y1, hold);
-      printf("{\"placeh\":[%d,%d,%d,%d],\"gap\":%d,\"hold\":%d,\"us\":%llu}\n", x0, y0, x1,
-             y1, gap, hold, (unsigned long long)(now_us() - started));
+      printf("{\"placeh\":[%d,%d,%d,%d],\"gap\":%d,\"hold\":%d,\"us\":%llu,\"t0\":%llu", x0, y0, x1,
+             y1, gap, hold, (unsigned long long)(now_us() - started), (unsigned long long)started);
+      print_stamps();
+      printf("}\n");
+    } else if (sscanf(line, "taph %d %d %d", &x0, &y0, &hold) == 3) {
+      tap(x0, y0, hold);
+      printf("{\"taph\":[%d,%d],\"hold\":%d,\"us\":%llu,\"t0\":%llu", x0, y0, hold,
+             (unsigned long long)(now_us() - started), (unsigned long long)started);
+      print_stamps();
+      printf("}\n");
+    } else if (!strncmp(line, "now", 3)) {
+      printf("{\"now\":%llu}\n", (unsigned long long)started);
     } else if (sscanf(line, "drag %d %d %d %d %d %d", &x0, &y0, &x1, &y1, &gap, &hold) == 6) {
       /* gap = number of move steps, hold = ms per step */
       int steps = gap < 1 ? 1 : gap;
@@ -119,7 +155,7 @@ int main(int argc, char **argv) {
       printf("{\"tap\":[%d,%d],\"us\":%llu}\n", x0, y0,
              (unsigned long long)(now_us() - started));
     } else if (!strncmp(line, "version", 7)) {
-      printf("{\"version\":2}\n");
+      printf("{\"version\":3}\n");
     } else if (!strncmp(line, "quit", 4)) {
       break;
     } else {
