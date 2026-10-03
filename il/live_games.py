@@ -242,7 +242,11 @@ def merge(data: dict) -> int:
             data['labels'].append(text)
         return index[text]
     data['games'] = [g for g in data['games'] if g.get('league') != 'live']
-    for game in store['games']:
+
+    def when(game) -> tuple:
+        _live, session, number = str(game.get('tag', 'live--0')).split('-')
+        return session, int(number)
+    for game in sorted(store['games'], key=when):          # each goes to the front: the newest ends up first
         game = json.loads(json.dumps(game))
         for frame in game['frames']:
             frame[3] = [remap(v) for v in frame[3]]
