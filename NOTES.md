@@ -1874,7 +1874,8 @@ time and reports each touch's time), `mac012/tap_probe_report.py`. Records: docs
   short wait made the probe's own first results wrong (plays it called refused had been taken): the report
   now decides from the whole queue record.
 - Normal elixir only: a play executing less than 20 ticks after the previous deal is mostly dealt late, 20
-  ticks after that deal (14 of 20). Not so in 7x.
+  ticks after that deal (14 of 20). Not so in 7x. It is the hand's refill timer (1000 ms; 500 in double
+  elixir, 350 in triple), as RoyaleSim measured it on 15.535.29; our reader's `refill_timer` reads 0 here.
 **Console now** (`DEALT_MS` 120, `FIRST_TAP_TICK` 95, `LOST_AFTER_TICKS` 20, `Tapper.spacing` 20): a play's
 first touch goes down 120 ms after the card was first seen in the game's own hand, started by fast_tap on
 the device's clock; never in a slot holding another card; nothing before tick 95.

@@ -76,11 +76,17 @@ Times from one play with the console's gesture (two 16 ms touches, 8 ms apart):
 - **The deal.** The game deals the cycle's first card into a slot when the card played from it executes:
   21 ticks after that play's issue tick, 139 of 139 single plays. In memory the slot goes from one card
   to the next within one sample, or stands empty for a tick or two (387 / 34 / 3 of 424 deals, 7x).
-- **Two plays close together.** 7x: each slot is dealt at its own issue + 21; two commands with the same
-  issue tick are dealt a tick apart (19 pairs). **Normal elixir** (the five live games of 2026-10-03): a
-  play that executes less than 20 ticks after the previous deal is usually dealt late -- 14 of 20 at 19-20
-  ticks after the previous deal, 2 ten ticks after it, 4 at once. So in a normal game a second card
-  played right after another can leave its slot empty for up to a second longer.
+- **Two plays close together: the refill timer.** One timer per player. When it reads 0, a played card's
+  slot is refilled as the play executes and the timer restarts at 1000 ms (500 ms in double elixir, 350 ms in
+  triple); a play that executes while it is running leaves its slot empty until it runs out; several waiting
+  slots fill one per period, the lowest slot first. This is RoyaleSim's measurement on client 15.535.29
+  (github.com/RoyaleGym/RoyaleSim, `tests/hand_refill.rs`), and our five normal-elixir games of 2026-10-03
+  fit it: of 20 plays that executed less than 20 ticks after the previous deal, 14 were dealt 19-20 ticks
+  after that deal, 2 ten ticks after it and 4 at once (the period being 10 or 7 ticks in double and triple
+  elixir). So a second card played right after another can leave its slot empty for up to a second longer.
+  7x: no wait at all -- each slot dealt at its own issue + 21, two commands with the same issue tick a tick
+  apart (19 pairs). Our reader's `refill_timer` field reads 0 on this build (it is read at the older
+  client's offset), so the console goes by the hand itself.
 - **On the screen** (`hand_during_play.jpg`): the played card's slot is empty, a blank frame, from the
   touch until the deal; then the new card pops in. Cards the bar cannot pay for are grey. A selected card
   is lifted with a bright edge.
@@ -159,7 +165,8 @@ Times from one play with the console's gesture (two 16 ms touches, 8 ms apart):
 
 - **Start.** One play at each of four ticks: touches at ticks 70, 78, 86 refused, at 94 taken; in two
   other battles touches at 37, 56, 87.5, 88.7 refused and 98.6, 99.5 taken. All the taken ones were issued
-  at tick 101. FirstLight's first decision tick is 90, whose earliest tap is tick 94.
+  at tick 101. FirstLight's first decision tick is 90, whose earliest tap is tick 94. RoyaleSim carries the
+  same lockout as 90 ticks (another user's reading of the real engine).
 - **End.** After the result is decided the client's clock runs on and it still takes touches, though no
   command executes (NOTES, friendly 2026-09-25): the console stops tapping when `battle_result` says the
   battle is over.
@@ -234,10 +241,10 @@ In ordinary games, with the bot playing: `il/timing.py` (lateness of every play)
 
 ## 13. Not known yet
 
-- The deal after two close plays at normal elixir: the 20-tick wait holds in 14 of 20 cases; what decides
-  the others is not known.
+- The refill timer's periods on this build (1000 / 500 / 350 ms are the 15.535 client's), its period in 7x,
+  and where it sits in memory here.
 - Whether the 100 ms after the deal is the same on another device or frame rate (it looks like an
   animation's length).
 - Building placement next to towers and other buildings: moved, but by what rule.
-- The tick a touch must come after at the start of a battle is between 87 and 94.
+- The tick a touch must come after at the start of a battle is between 89 and 94 (90 by RoyaleSim's note).
 - Nothing here was measured for hero and champion ability buttons.
