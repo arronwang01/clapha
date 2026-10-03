@@ -46,6 +46,11 @@ X_TILES, Y_TILES = 18, 32
 COMMAND_AGE_TICKS = 21
 # A tap that never reaches the queue (missed, or refused by the client) is given up on.
 IN_FLIGHT_SECONDS = 3.0
+# A tap the game took shows in its queue within 6 ticks (246 plays, 2026-10-03: 1-6); one that is not
+# there after this many is lost. It is sent again once, the same card on the same tile: waiting the 3 s
+# out left the card blocked, the model believing it was on its way, and its next choice for it somewhere
+# odd (after every lost Cannon tap that day the next one went to the edge column).
+LOST_AFTER_TICKS = 12
 # How long a play chosen against elixir the client has not credited yet may wait for it (and for
 # its moment: a play is held until it will land TARGET_DELAY ticks after its decision).
 DEFER_SECONDS = 0.8
@@ -294,7 +299,17 @@ class Bot:
         self.tapper = None
         self._timing = None
         self._battle_key = None
+        self._resend: list[dict] = []
         self.opponent_intel = None
+
+    def model_warning(self) -> str:
+        """FirstLight's own checkpoints were trained with plays that land at once. Live a play lands ~1.3 s
+        after its decision, so they act too late (2026-10-02, fl:general in friendlies: its Cannon came down
+        50-74 ticks after a Hog, ours 26-48; a third of them no longer pulled it)."""
+        if self.running and self.armed and str(self.model).startswith('fl:'):
+            return (f'{self.model} was trained without the game\'s 1.3 s command delay: its plays land later '
+                    f'than it expects (Cannon often too late to pull). The clapha models are trained for it.')
+        return ''
 
     def trace(self, kind: str, **row) -> None:
         """One line of the timing record: where each turn's and each play's time goes, from the frame
@@ -495,13 +510,27 @@ class Bot:
                 self._trace_play(flight, entry['issue_tick'])
                 break
         now = time.time()
+
+        def lost(flight: dict) -> bool:
+            return flight.get('issue_tick') is None and (tick - flight['tap_tick'] > LOST_AFTER_TICKS
+                                                         or now - flight['tap_time'] > IN_FLIGHT_SECONDS)
         for flight in in_flight:
-            if flight.get('issue_tick') is None and now - flight['tap_time'] > IN_FLIGHT_SECONDS:
-                name = V.CARDS.get(flight['card'], {}).get('name', flight['card'])
-                self.note(f'tap for {name} never reached the game ({IN_FLIGHT_SECONDS:.0f} s): the play was lost')
-                self._trace_play(flight, None)
+            if not lost(flight):
+                continue
+            name = V.CARDS.get(flight['card'], {}).get('name', flight['card'])
+            again = not flight.get('resent') and flight.get('row') is not None
+            self.note(f'tap for {name} never reached the game ({tick - flight["tap_tick"]} ticks): '
+                      + ('sending it again' if again else 'the play was lost'))
+            self._trace_play(flight, None)
+            if again:
+                self._resend.append({'card': flight['card'], 'row': flight['row'], 'column': flight['column'],
+                                     'since': now, 'turn': flight.get('turn'), 'offset': flight.get('offset', 0),
+                                     'not_before': 0, 'resend': True,
+                                     'timing': {k: v for k, v in (flight.get('timing') or {}).items()
+                                                if k in ('decided', 'inference_ms', 'frame_age_ms', 'turn_wait_ms',
+                                                         'frame_tick', 'frame_us', 'received', 'began', 'started')}})
         return [f for f in in_flight
-                if (f.get('issue_tick') is None and now - f['tap_time'] <= IN_FLIGHT_SECONDS)
+                if (f.get('issue_tick') is None and not lost(f))
                 or (f.get('issue_tick') is not None
                     and tick < f['issue_tick'] + COMMAND_AGE_TICKS)]
 
@@ -725,7 +754,8 @@ class Bot:
         timing = dict(move.get('timing') or {})
         if 'decided' in timing:
             timing['send_ms'] = (sent - timing['decided']) * 1000.0
-        timing.update(tap_sent=sent, tap_tick=int(frame['game_tick']), tap_us=frame.get('sample_monotonic_us'),
+        timing.update(resend=bool(move.get('resend')),
+                      tap_sent=sent, tap_tick=int(frame['game_tick']), tap_us=frame.get('sample_monotonic_us'),
                       not_before=move.get('not_before'), lag_used=self._tap_lag(),
                       tap_n=self.tapper.count if self.tapper is not None and self.tapper.alive() else None)
         in_flight.append({'slot': me['hand_deck_indices'][position], 'card': card,
@@ -734,6 +764,7 @@ class Bot:
                           'tap_time': sent, 'timing': timing,
                           'turn': move.get('turn'), 'offset': int(move.get('offset', 0)),
                           'elixir_wait': bool(move.get('elixir_wait')),
+                          'row': move['row'], 'column': move['column'], 'resent': bool(move.get('resend')),
                           'target': (move['column'] * 1000 + 500, move['row'] * 1000 + 500)})
         self.plays += 1
         self.last_play = f'{name} at row {move["row"]} col {move["column"]}'
@@ -1006,6 +1037,7 @@ class Bot:
                 self._battle_key = str(battle)
                 handled_queue: set = set()
                 last_turn, in_flight, deferred = -10 ** 9, [], []
+                self._resend = []
                 abilities_in_flight.clear()
                 latch.reset()
                 self.plays = 0
@@ -1020,6 +1052,8 @@ class Bot:
                 executed = list(V.STATE['plays'])
             in_flight = self._settle_in_flight(in_flight, queue, executed, local_account,
                                                side, frame['game_tick'])
+            deferred += self._resend
+            self._resend = []
             view_frame, view_me, reserved = self._input_view(runner, frame, me, in_flight)
 
             # A tap chosen a moment before the client credits the elixir (frame age, rounding)
@@ -1447,7 +1481,8 @@ class Handler(BaseHTTPRequestHandler):
                    'mode': ('off' if not BOT.running else 'play' if BOT.armed else 'watch'),
                    'serial': SERIAL, 'port': PORT,
                    'decoding': BOT.decoding, 'decoding_used': BOT.decoding_used,
-                   'deck_warning': BOT.deck_warning, 'code_changed': code_changed(),
+                   'deck_warning': ' '.join(filter(None, (BOT.model_warning(), BOT.deck_warning))),
+                   'code_changed': code_changed(),
                    'gate': BOT.gate, 'gate_ok': BOT.gate_ok, 'deduced': BOT.deduced,
                    'reader_error': reader_error}
             if frame and health and frame.get('battle_active'):

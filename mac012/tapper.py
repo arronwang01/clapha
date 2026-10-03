@@ -44,10 +44,16 @@ class Tapper:
     def __init__(self, adb, serial, width: int, height: int):
         self.mode = os.environ.get('CR_TAP_MODE', 'place')
         drag = self.mode == 'drag'
-        # place gap 8 hold 16: 4/4 accepted, 41 ms (tap_bench, 2026-09-25). gap 0 was also
-        # 4/4 at 33 ms; the 8 ms is margin for a slow frame, until more trials say otherwise.
-        self.gap = int(os.environ.get('CR_TAP_GAP_MS', '3' if drag else '8'))
-        self.hold = int(os.environ.get('CR_TAP_HOLD_MS', '10' if drag else '16'))
+        # place gap 8 hold 16 (41 ms) passed tap_bench's 4 trials on 2026-09-25, and in live games on
+        # 2026-10-03 the game never registered 23 of 258 single gestures (9%) and 7 of 18 sent right
+        # after another (39%): a 16 ms touch can begin and end inside one of the game's frames. Each
+        # touch now spans two frames (34 ms) with a frame between them, and a gesture waits `spacing`
+        # ms after the previous one has ended.
+        self.gap = int(os.environ.get('CR_TAP_GAP_MS', '3' if drag else '20'))
+        self.hold = int(os.environ.get('CR_TAP_HOLD_MS', '10' if drag else '34'))
+        self.spacing = int(os.environ.get('CR_TAP_SPACING_MS', '70'))
+        self.free_at = 0.0          # when the last gesture written will have ended, plus the spacing
+        self.write_lock = threading.Lock()
         path, max_x, max_y = touch_device(adb, serial)
         # MuMu reports the panel in screen pixels; scale in case another device does not.
         self.scale = ((max_x + 1) / width if max_x else 1.0,
@@ -74,7 +80,8 @@ class Tapper:
         threading.Thread(target=self._acks, daemon=True).start()
 
     def describe(self) -> str:
-        return (f'fast_tap on {self.path}, {self.mode} gap {self.gap} ms hold {self.hold} ms')
+        return (f'fast_tap on {self.path}, {self.mode} gap {self.gap} ms hold {self.hold} ms, '
+                f'{self.spacing} ms between gestures')
 
     def _acks(self) -> None:
         answered = 0
@@ -106,26 +113,38 @@ class Tapper:
         y0, y1 = round(y0 * sy), round(y1 * sy)
         verb = 'drag' if self.mode == 'drag' else 'placeh'
         line = f'{verb} {x0} {y0} {x1} {y1} {self.gap} {self.hold}\n'
-        written = time.time()
+        duration = (self.gap + 1) * self.hold if self.mode == 'drag' else 2 * self.hold + self.gap
+        return self._send(line, duration)
+
+    def _write(self, line: str) -> None:
+        with self.write_lock:
+            try:
+                self.process.stdin.write(line)
+                self.process.stdin.flush()
+            except (OSError, ValueError):
+                pass
+
+    def _send(self, line: str, duration_ms: float) -> float:
+        """Write a gesture now, or once the previous one has ended and `spacing` ms have passed;
+        returns the time it is written."""
         with self.lock:
-            self.sent.append(written)
+            now = time.time()
+            at = max(now, self.free_at)
+            self.free_at = at + (duration_ms + self.spacing) / 1000.0
+            self.sent.append(at)
             self.count += 1
-        self.process.stdin.write(line)
-        self.process.stdin.flush()
-        return written
+        if at <= now:
+            self._write(line)
+        else:
+            threading.Timer(at - now, self._write, (line,)).start()
+        return at
 
     def tap(self, point) -> float:
         """One tap (a hero ability button); returns the time the command was written."""
         x, y = point
         sx, sy = self.scale
         line = f'tap {round(x * sx)} {round(y * sy)}\n'
-        written = time.time()
-        with self.lock:
-            self.sent.append(written)
-            self.count += 1
-        self.process.stdin.write(line)
-        self.process.stdin.flush()
-        return written
+        return self._send(line, 34)
 
     def close(self) -> None:
         try:

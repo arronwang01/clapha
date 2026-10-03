@@ -1799,3 +1799,30 @@ decides each recorded play again from the game's own inputs, once as it was and 
   run, the training opponent fixed (training's hog2 lost 1-5 to the real one). The PC is down for about a
   week from 2026-10-03. A friend has an A100 on a machine with KVM disabled: no engines there as they run
   today (the Android VM needs it); it could take the learner, with engines elsewhere.
+
+## 2026-10-03: the live "delay" diagnosis -- lost taps, a model without delay training, decisions
+
+Marked games (the user on their phone against clapha:p3 on device 1, from 12:35; and the 2.6 mirrors of
+2026-10-02 night against friends), read with il/live_hogs.py, il/live_towers.py and il/timing.py.
+- **Timing is fine.** 4,625 decision turns: frame on its turn tick in 98%, deciding 33 ms median (99% 86),
+  no turn missed. Plays that registered were issued on their tick or one late (tap -> issue 1-6 ticks).
+- **11% of taps never registered** (30 of 276; sent right after another gesture: 7 of 18). The gesture was
+  two 16 ms touches 8 ms apart, accepted in tap_bench's 4 trials (2026-09-25). A lost tap blocked its card
+  for 3 s with the model believing it on its way; the Cannon decision after each lost Cannon tap went to
+  the edge column (1 or 16), and once the next card's tile tap placed the still-selected Cannon on the
+  bridge. Most of the user's "Musketeer behind the Hog" pushes that did damage had a lost defensive tap.
+  **Fix:** touches of 34 ms, 20 ms apart, 70 ms between gestures (mac012/tapper.py); a tap not in the
+  queue after 12 ticks is sent again once, same card and tile (console LOST_AFTER_TICKS). Not yet measured
+  live: the timing record's lost count is the test.
+- **The "outright missed Cannons" of 2026-10-02 night were fl:general** (switched to at 20:15; no delay
+  training): its Cannon came down 50-74 ticks after the Hog landed, p3's 26-48; a Cannon stops pulling
+  around 55-75 ticks (it must be nearer the Hog than the tower is), so a third of General's did not pull.
+  The console now warns when an fl: model is armed. il/hog_defence.py's "slack" measures to the Hog's
+  arrival at the tower, which is later than this deadline: read its numbers ~30 ticks smaller.
+- **Decisions (p3, today's first three games: 21 Hogs, 29 hits):** after the Cannon is destroyed it only
+  trickles cheap cards (6 Hogs, 14 hits); with the Cannon out of hand it does not cycle to it (2 Hogs, 9
+  hits, one with 9.5 elixir and the Cannon two cards away); once it had the Cannon and did not play it. A
+  Cannon asked on a tile another building blocks is moved by the client (asked (9,9), got (12,9)): the live
+  placement mask does not exclude it.
+- Open: the same pushes replayed in the engine against the same model (the user's commands as a scripted
+  opponent), to separate what is left of the pipeline from the model for certain.
