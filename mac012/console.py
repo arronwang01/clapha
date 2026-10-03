@@ -653,7 +653,7 @@ class Bot:
                   f'tap -> issued {ticks} ticks ({ticks * 50} ms), then 21 ticks to land')
 
     @staticmethod
-    def _input_view(runner, frame: dict, me: dict, in_flight: list[dict]):
+    def _input_view(runner, frame: dict, me: dict, in_flight: list[dict], holding=()):
         """(frame for the observation, own row to tap from, elixir reserved) for this runner.
 
         FirstLight's checkpoints get the game state, with in-flight taps' elixir reserved -- what
@@ -661,19 +661,33 @@ class Bot:
         already out of the hand, the next card in, their cost off the elixir (il/SPEC.md), built
         by the same firstlight_obs.screen_view as their training data; taps then find a card at
         its screen position. If the reader's hand does not fit the in-flight list, the game state
-        is used for this frame rather than a guess."""
+        is used for this frame rather than a guess.
+
+        holding: plays chosen and still waiting for the game to deal their card. Their elixir is as good as
+        spent -- the bar will not have it when they go out -- so it is taken off for every other choice (a
+        Cannon picked against elixir a waiting Musketeer was about to take was dropped, 2026-10-03)."""
+        held = sum(float(V.CARDS.get(m['card'], {}).get('elixir') or 0) for m in holding)
         if not getattr(runner, 'clapha_inputs', False):
-            return frame, me, sum(f['cost'] for f in in_flight)
+            return frame, me, sum(f['cost'] for f in in_flight) + held
         try:
             # a model trained with the game's deal rule is offered only the cards the game has dealt
             # (CR_DEAL_MASK=1: any of our models, to try it); for the others the tap waits (DEALT_MS)
             view = FLO.screen_view(me, [f['card'] for f in in_flight],
                                    deal_rule=getattr(runner, 'deal_rule', False) or DEAL_MASK)
         except ValueError:
-            return frame, me, sum(f['cost'] for f in in_flight)
+            return frame, me, sum(f['cost'] for f in in_flight) + held
+        if held:
+            view = {**view, 'elixir_raw': max(0, int(view['elixir_raw']) - int(round(held * 10000)))}
         side = me.get('side')
         players = [view if p.get('side') == side else p for p in frame['players']]
         return {**frame, 'players': players}, view, 0.0
+
+    @staticmethod
+    def _holding(deferred: list[dict], apart_from: dict | None = None) -> list[dict]:
+        """The deferred plays that wait for their card's deal, apart from the one being tried (and any other
+        entry for its card: a newer choice of a card replaces the waiting one)."""
+        return [d for d in deferred if d.get('deal_wait') and d is not apart_from
+                and (apart_from is None or d['card'] != apart_from['card'])]
 
     def _feed_extras(self, runner, frame: dict, side: int, in_flight: list[dict], queue: list,
                      accounts, hand_forms: dict, delay: int = COMMAND_AGE_TICKS - 1 + 5) -> None:
@@ -1119,7 +1133,6 @@ class Bot:
                                                side, frame['game_tick'])
             deferred += self._resend
             self._resend = []
-            view_frame, view_me, reserved = self._input_view(runner, frame, me, in_flight)
 
             # A tap chosen a moment before the client credits the elixir (frame age, rounding)
             # waits here, briefly, until the client can actually place it.
@@ -1133,9 +1146,10 @@ class Bot:
             deferred = [d for d in deferred if time.time() - d['since'] <= self._wait_limit(d)
                         and not latch.over]
             for move in list(deferred):
+                _f, view_me, reserved = self._input_view(runner, frame, me, in_flight, self._holding(deferred, move))
                 if self._try_play(move, view_me, deck, reserved, in_flight, accounts, side, frame):
                     deferred.remove(move)
-                    view_frame, view_me, reserved = self._input_view(runner, frame, me, in_flight)
+            view_frame, view_me, reserved = self._input_view(runner, frame, me, in_flight, self._holding(deferred))
 
             # One turn per five-tick window, and never a skipped one. decide() advances a
             # recurrent state and feeds its own chosen action into the next turn, so the
@@ -1320,10 +1334,11 @@ class Bot:
                 if waiting is not None:
                     # chosen again while it waits for its deal: the newer tile, the earlier moment (it is overdue)
                     move['not_before'] = min(move['not_before'], waiting['not_before'])
+                _f, view_me, reserved = self._input_view(runner, frame, me, in_flight, self._holding(deferred, move))
                 if not self._try_play(move, view_me, deck, reserved, in_flight, accounts, side,
                                       frame):
                     deferred = [d for d in deferred if d['card'] != move['card']] + [move]
-                view_frame, view_me, reserved = self._input_view(runner, frame, me, in_flight)
+                view_frame, view_me, reserved = self._input_view(runner, frame, me, in_flight, self._holding(deferred))
             ended = time.time()
             self._prev_turn_timing = {**timing_now, 'after_ms': (ended - decided) * 1000.0,
                                       'ended': ended}

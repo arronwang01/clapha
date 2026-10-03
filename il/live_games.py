@@ -44,7 +44,10 @@ def read(session: Path):
     battles, current = [], {}
     with open(session / 'frames.jsonl', encoding='utf-8') as handle:
         for line in handle:
-            row = json.loads(line)
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue                  # the line being written right now
             frame, health = row['frame'], row['health']
             side = health.get('local_side')
             if side not in (0, 1) or not frame.get('battle_active'):
@@ -274,7 +277,18 @@ def main(argv: list[str]) -> int:
     later = sorted(p.name for p in args.session.parent.iterdir() if p.name > args.session.name and len(p.name) == 16)
     ended = calendar.timegm(time.strptime(later[0], '%Y%m%dT%H%M%SZ')) if later else time.time()
     logged = clicks_from_log(args.port, started - 5, ended)
-    aligned = len(logged) == len(battles) and all(l['side'] == b['side'] for l, b in zip(logged, battles))
+
+    def fits(candidates) -> bool:
+        return len(logged) == len(candidates) and all(l['side'] == b['side'] for l, b in zip(logged, candidates))
+    if not fits(battles):
+        # two consoles started in the same second share a session folder: keep the device whose battles are
+        # the log's (the same battles seen from the other device have the other side)
+        for pid in {b['pid'] for b in battles}:
+            own = [b for b in battles if b['pid'] == pid]
+            if fits(own):
+                battles = own
+                break
+    aligned = fits(battles)
     print(f'{len(battles)} battles in the session, {len(logged)} in the log' + ('' if aligned else ': not matched, clicks left out'))
     numbered = list(enumerate(battles))
     if args.first:
