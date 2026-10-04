@@ -27,14 +27,13 @@ struct Snapshot {
             decoder.keyDecodingStrategy = .convertFromSnakeCase
             let board = BoardModel()
             board.state = try! decoder.decode(DeviceState.self, from: Data(contentsOf: URL(fileURLWithPath: args[2])))
-            // with a fifth argument "inside": no room beside the game, the panel inside its top left
-            let layout = OverlayLayout()
-            let inside = args.count > 4 && args[4] == "inside"
-            layout.game = CGRect(x: 0, y: 0, width: 540, height: 960)
-            layout.side = inside ? nil : CGRect(x: 548, y: 0, width: 320, height: 960)
-            let view = OverlayView(board: board, layout: layout)
-                .frame(width: inside ? 540 : 868, height: 960)
-                .background(Color(red: 0.25, green: 0.42, blue: 0.2))
+            // with a fifth argument, a battle screenshot drawn behind (to see what the overlay covers)
+            let picture = args.count > 4 ? NSImage(contentsOfFile: args[4]) : nil
+            let view = ZStack {
+                if let picture { Image(nsImage: picture).resizable() } else { Color(red: 0.25, green: 0.42, blue: 0.2) }
+                OverlayView(board: board)
+            }
+            .frame(width: 540, height: 960)
             write(view, to: args[3])
             return
         }

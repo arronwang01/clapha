@@ -66,6 +66,7 @@ struct OpponentInfo: Decodable {
     let elixir: Double?
     let guess: [OpponentCard]?
     let guessSource: String?
+    let guessKind: String?           // "published" (their own console's deck: exact) or "api" (a guess)
     let plays: Int?
     let revealed: [OpponentCard]
     let hand: [OpponentCard?]?

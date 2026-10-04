@@ -193,13 +193,16 @@ def opponent_view(frame: dict, health: dict, plays: list, queue: list, accounts,
         held = [card for card in revealed if card not in last]
         hand = [info(card, forms[card]) for card in held] + [None] * max(0, 4 - len(held))
         following = info(last[0], forms[last[0]])
-    guess = source = None
-    if prior and prior.get('cards') and all(card in prior['cards'] for card in revealed):
-        guess = [info(card, form) for card, form in zip(prior['cards'], prior.get('forms') or [0] * 8)]
-        source = prior.get('source')
+    # the deck held for theirs: shown for as long as nothing they have played contradicts it (ids compared as base
+    # cards: an evolution or hero form is the same card)
+    guess = source = kind = None
+    held_deck = [V.card_identity(int(card))[0] for card in (prior or {}).get('cards') or ()]
+    if held_deck and all(card in held_deck for card in revealed):
+        guess = [info(card, form) for card, form in zip(held_deck, prior.get('forms') or [0] * 8)]
+        source, kind = prior.get('source'), prior.get('kind')
     them = next((p for p in frame.get('players') or () if p.get('side') == other), None)
     return {'elixir': None if them is None else (them.get('elixir_raw') or 0) / 10000.0,
-            'guess': guess, 'guess_source': source, 'plays': len(sequence),
+            'guess': guess, 'guess_source': source, 'guess_kind': kind, 'plays': len(sequence),
             'revealed': [info(card, forms[card]) for card in revealed], 'hand': hand, 'next': following}
 
 
@@ -389,7 +392,7 @@ class Bot:
         if intel and intel.get('deck') and len(intel['deck']) == 8:
             return {'cards': [int(c['card_id']) for c in intel['deck']],
                     'forms': [2 if c.get('hero') else 1 if c.get('evolution_level') else 0 for c in intel['deck']],
-                    'source': 'guess: the deck the API says they have equipped'}
+                    'source': 'guess: the deck the API says they have equipped', 'kind': 'api'}
         return None
 
     def model_warning(self) -> str:
@@ -1162,7 +1165,7 @@ class Bot:
                 self.opponent_prior = None if opponent is None else {
                     'battle': str(frame['chain']['battle']), 'cards': [int(c) for c in opponent],
                     'forms': [2 if int(f) & 2 else 1 if int(f) & 1 else 0 for f in (opponent_forms or [0] * 8)],
-                    'source': 'their deck, as their own console published it'}
+                    'source': 'their deck, as their own console published it', 'kind': 'published'}
                 self._lookup_opponent(accounts, side, frame['chain']['battle'])
                 observation, fl_battle = FLO.build(
                     frame, health, episode_id=str(frame['chain']['battle']))
