@@ -31,3 +31,5 @@ if [ -f "$ROOT/landing-hud-kit.zip" ] && [ ! -d "$ROOT/build/hud/landing-hud-kit
 fi
 codesign --force --sign - "$APP" >/dev/null 2>&1 || true
 echo "built $APP"
+# the phone link helper: rebuilt only when its source changed (see build_phone.sh)
+"$HERE/build_phone.sh"

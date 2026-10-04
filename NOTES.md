@@ -1931,3 +1931,23 @@ not among their last four, unknown ones as "?"), and the next card back; their e
 made-up plays and an off-screen render (`build/clapha_snapshot --overlay state.json out.png`), not yet on a
 live battle.
 
+## 2026-10-03 night: the opponent panel moved inside the game picture; the game on a phone
+
+- **Opponent panel** (the user: "fit inside the emulator screen", and the guessed deck stays while nothing
+  contradicts it): two columns in the margins beside the arena (the outer 5.5% each side, where nothing of the
+  game stands) -- left: seen cards, hand, next; right: the deck held for theirs, their elixir. Inside the
+  picture so that a phone shown the picture gets it too. Guess ids are compared as base cards.
+- **The game on a phone** (the user remembered the Null's setup's phone link, cr-engine-extraction/macos-port/
+  phone: emulator gRPC frames -> JPEG -> the "Null's Viewer" app over `adb reverse`, touches back; "close to
+  no lag" on an OPPO A78 at 540x1200, 12 ms decode). MuMu has no such frame stream, so here the picture is taken
+  from the Mac's screen: `app/Phone/PhoneLink.swift` (build/ClaphaPhone.app, started by the **Phone** switch):
+  ScreenCaptureKit on the game picture's rectangle (the overlay is on it), JPEG at 540 wide by default (720 /
+  1080 by right-click), the same viewer app and protocol (phone/nulls-viewer.apk), touches to the MuMu
+  touchscreen through fast_tap's new `d` / `m` / `u` (version 4; `auto` finds the touchscreen). A helper of
+  its own so macOS's screen-recording permission is asked once for it and survives rebuilds of Clapha.app
+  (app/build_phone.sh rebuilds it only when its source changed).
+  **Tested here:** the helper started as the app starts it, with a made-up picture and a stand-in for the
+  phone app: config, frames with the two-in-flight window, touches arriving as input events (in a file), the
+  status the app reads. **Not tested:** the screen capture itself (this session may not record the screen;
+  the user allows the helper once in System Settings) and a real phone (none was connected).
+

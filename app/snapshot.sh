@@ -4,7 +4,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(dirname "$HERE")"
 swiftc -O -parse-as-library -target arm64-apple-macosx14.0 \
-  "$HERE/Sources/Backend.swift" "$HERE/Sources/Views.swift" "$HERE/Sources/Overlay.swift" "$HERE/Sources/Games.swift" "$HERE/Sources/Nulls.swift" \
+  "$HERE/Sources/Backend.swift" "$HERE/Sources/Views.swift" "$HERE/Sources/Overlay.swift" "$HERE/Sources/Games.swift" "$HERE/Sources/Nulls.swift" "$HERE/Sources/Phone.swift" \
   "$HERE/Snapshot/Snapshot.swift" \
   -o "$ROOT/build/clapha_snapshot"
 # app/snapshot.sh --games runs/viewer/games.json build/games_snapshot.png [game index]

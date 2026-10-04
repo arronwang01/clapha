@@ -31,6 +31,7 @@ struct ContentView: View {
     @State private var showTools = false
     @State private var overlayOn = false
     @State private var overlay = MuMuOverlay()
+    @StateObject private var phone = PhoneLinkControl()
     private let live: Bool
 
     @MainActor
@@ -43,8 +44,17 @@ struct ContentView: View {
     var body: some View {
         VStack(spacing: 0) {
             TopBar(tasks: tasks, page: $page, device1: device1, device2: device2, showTools: $showTools,
-                   overlayOn: $overlayOn)
+                   overlayOn: $overlayOn, phone: phone)
             Divider()
+            if !phone.note.isEmpty {
+                HStack(spacing: 8) {
+                    Image(systemName: "iphone").foregroundStyle(phone.good ? .green : .orange)
+                    Text(phone.note).font(.callout)
+                    Spacer()
+                }
+                .padding(.horizontal, 10).padding(.vertical, 6)
+                .background((phone.good ? Color.green : Color.orange).opacity(0.10))
+            }
             if !device1.reachable && !device2.reachable {
                 HStack(spacing: 10) {
                     Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
@@ -99,6 +109,8 @@ struct TopBar: View {
     @Binding var showTools: Bool
     @Binding var overlayOn: Bool
     @AppStorage("overlayOpponent") private var overlayOpponent = true
+    @ObservedObject var phone: PhoneLinkControl
+    @AppStorage("phoneWidth") private var phoneWidth = 540
     @Environment(\.openWindow) private var openWindow
     // FirstLight's own console (Human vs Model) on CR_4k: tools/play_firstlight.sh
     @StateObject private var firstlight = TaskRunner(root: claphaRoot())
@@ -120,6 +132,20 @@ struct TopBar: View {
             Toggle(isOn: $overlayOn) { Label("Overlay on MuMu", systemImage: "circle.dashed") }
                 .toggleStyle(.button)
                 .help("Draws cards that are played but not landed yet on top of the MuMu window. Click-through.")
+            Toggle(isOn: Binding(get: { phone.on }, set: { wanted in
+                let device = page == 1 ? device1 : device2
+                phone.set(wanted, serial: device.state?.bot.serial ?? (page == 1 ? "127.0.0.1:26624" : "127.0.0.1:26656"),
+                          width: phoneWidth)
+            })) { Label("Phone", systemImage: "iphone") }
+                .toggleStyle(.button)
+                .help("Shows this device's game (with the overlay on it) on a phone connected by USB, and sends the phone's touches to the game. Keep the MuMu window in view. Right-click for the picture size.")
+                .contextMenu {
+                    Picker("Picture sent to the phone", selection: $phoneWidth) {
+                        Text("540 wide: quickest").tag(540)
+                        Text("720 wide: sharper, a little slower").tag(720)
+                        Text("1080 wide: sharpest, slower").tag(1080)
+                    }
+                }
             Toggle(isOn: $overlayOpponent) { Label("Opponent info", systemImage: "rectangle.stack.person.crop") }
                 .toggleStyle(.button)
                 .disabled(!overlayOn)

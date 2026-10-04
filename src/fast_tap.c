@@ -13,18 +13,22 @@
 //   placeh X0 Y0 X1 Y1 GAP_MS HOLD_MS   same, with the hold per tap given
 //   drag X0 Y0 X1 Y1 STEPS STEP_MS      one gesture: down on the card, move, up on the tile
 //   taph X Y HOLD_MS             single tap with the hold given
+//   d ID X Y / m ID X Y / u ID   one finger going down, moving, coming up, as it happens (a person's touch
+//                                relayed from a phone); ID 0-9 is the finger. No reply: nothing waits on these.
 //   now                          -> {"now":US}: this device's monotonic clock, the reader's clock
 //   at US <command>              the command above, started when the monotonic clock reaches US
-//   version                      -> {"version":3} (2: placeh/drag; 3: taph/now/at, "t0" and "t" in replies)
+//   version                      -> {"version":4} (2: placeh/drag; 3: taph/now/at, "t0" and "t" in replies;
+//                                4: d/m/u, and "auto" for the device)
 //   quit
 // Prints one line per command with the elapsed microseconds, so latency is measurable; "t0" is the
 // monotonic time it started and "t" the time of each touch down and up (the clock of the reader's
 // sample_monotonic_us, so a touch can be placed against what the game's memory held when).
 //
-// usage: fast_tap /dev/input/eventN
+// usage: fast_tap /dev/input/eventN        (or: fast_tap auto -- the first device with multi-touch positions)
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <linux/input.h>
+#include <sys/ioctl.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -77,6 +81,49 @@ static void touch_move(int x, int y) {
   sync_report();
 }
 
+/* Fingers relayed one event at a time: protocol B slots, one per finger. */
+static int fingers_down;
+
+static void finger_down(int slot, int x, int y) {
+  emit(EV_ABS, ABS_MT_SLOT, slot);
+  emit(EV_ABS, ABS_MT_TRACKING_ID, tracking++);
+  emit(EV_ABS, ABS_MT_POSITION_X, x);
+  emit(EV_ABS, ABS_MT_POSITION_Y, y);
+  if (fingers_down++ == 0) emit(EV_KEY, BTN_TOUCH, 1);
+  sync_report();
+}
+
+static void finger_move(int slot, int x, int y) {
+  emit(EV_ABS, ABS_MT_SLOT, slot);
+  emit(EV_ABS, ABS_MT_POSITION_X, x);
+  emit(EV_ABS, ABS_MT_POSITION_Y, y);
+  sync_report();
+}
+
+static void finger_up(int slot) {
+  emit(EV_ABS, ABS_MT_SLOT, slot);
+  emit(EV_ABS, ABS_MT_TRACKING_ID, -1);
+  if (fingers_down > 0 && --fingers_down == 0) emit(EV_KEY, BTN_TOUCH, 0);
+  sync_report();
+}
+
+/* The first input device that reports multi-touch positions (the touchscreen). */
+static int find_touchscreen(char *path, size_t size) {
+  for (int i = 0; i < 16; ++i) {
+    snprintf(path, size, "/dev/input/event%d", i);
+    int probe = open(path, O_RDONLY | O_CLOEXEC);
+    if (probe < 0) continue;
+    unsigned long bits[(ABS_MAX + 8 * sizeof(unsigned long)) / (8 * sizeof(unsigned long))];
+    memset(bits, 0, sizeof(bits));
+    int found = ioctl(probe, EVIOCGBIT(EV_ABS, sizeof(bits)), bits) >= 0 &&
+                (bits[ABS_MT_POSITION_X / (8 * sizeof(unsigned long))] >>
+                 (ABS_MT_POSITION_X % (8 * sizeof(unsigned long)))) & 1UL;
+    close(probe);
+    if (found) return 1;
+  }
+  return 0;
+}
+
 static uint64_t stamps[8];
 static int stamp_count;
 
@@ -98,6 +145,11 @@ static void tap(int x, int y, int hold_ms) {
 
 int main(int argc, char **argv) {
   const char *path = argc > 1 ? argv[1] : "/dev/input/event1";
+  char found[64];
+  if (!strcmp(path, "auto")) {
+    if (!find_touchscreen(found, sizeof(found))) { fprintf(stderr, "no multi-touch device\n"); return 2; }
+    path = found;
+  }
   fd = open(path, O_WRONLY | O_CLOEXEC);
   if (fd < 0) { perror(path); return 2; }
   setvbuf(stdout, NULL, _IONBF, 0);
@@ -130,6 +182,12 @@ int main(int argc, char **argv) {
              (unsigned long long)(now_us() - started), (unsigned long long)started);
       print_stamps();
       printf("}\n");
+    } else if (sscanf(line, "d %d %d %d", &gap, &x0, &y0) == 3) {
+      finger_down(gap, x0, y0);
+    } else if (sscanf(line, "m %d %d %d", &gap, &x0, &y0) == 3) {
+      finger_move(gap, x0, y0);
+    } else if (sscanf(line, "u %d", &gap) == 1) {
+      finger_up(gap);
     } else if (!strncmp(line, "now", 3)) {
       printf("{\"now\":%llu}\n", (unsigned long long)started);
     } else if (sscanf(line, "drag %d %d %d %d %d %d", &x0, &y0, &x1, &y1, &gap, &hold) == 6) {
@@ -155,7 +213,7 @@ int main(int argc, char **argv) {
       printf("{\"tap\":[%d,%d],\"us\":%llu}\n", x0, y0,
              (unsigned long long)(now_us() - started));
     } else if (!strncmp(line, "version", 7)) {
-      printf("{\"version\":3}\n");
+      printf("{\"version\":4}\n");
     } else if (!strncmp(line, "quit", 4)) {
       break;
     } else {
