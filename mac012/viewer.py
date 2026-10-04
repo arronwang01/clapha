@@ -9,6 +9,7 @@ prior project's note that owner-0 games come out mirrored otherwise).
 from __future__ import annotations
 
 import json
+import os
 import sys
 import subprocess
 import threading
@@ -32,6 +33,13 @@ DECKS = CLAPHA / 'build' / 'decks'
 LOCK = threading.Lock()
 SESSION = CLAPHA / 'artifacts' / 'viewer-sessions' / time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
 
+# Poll intervals. The game ticks every 50 ms, so 50 means every tick is seen; at 100 a frame
+# can already be two ticks old when it arrives. Raise them if the device cannot keep up (the
+# console shows the reader's lag).
+READER_MS = int(os.environ.get('CR_READER_MS', '50'))
+QUEUE_MS = int(os.environ.get('CR_QUEUE_MS', '50'))
+
+
 # In Training Camp the trainer's commands carry account_lo -1 / seq -1, so a non-negative
 # account is ours. In a friendly battle against another account this no longer holds --
 # read the local side's avatar account id before relying on it there.
@@ -48,6 +56,44 @@ def catalog() -> dict[int, dict]:
 
 
 CARDS = catalog()
+
+# A champion or hero ability activation passes through the command queue with this id.
+ABILITY_COMMAND_ID = 65535
+
+
+def _forms() -> dict[int, tuple[int, int]]:
+    """form id -> (base card id, form code): evolution 13xxxxxx -> 1, hero 203xxxxxx -> 2."""
+    if not CATALOG.is_file():
+        return {}
+    table = {}
+    for row in json.loads(CATALOG.read_text()).get('cards', []):
+        if row.get('evolution_form_id'):
+            table[int(row['evolution_form_id'])] = (int(row['card_id']), 1)
+        if row.get('hero_form_id'):
+            table[int(row['hero_form_id'])] = (int(row['card_id']), 2)
+    return table
+
+
+FORMS = _forms()
+
+
+def card_identity(raw_id: int) -> tuple[int, int, str]:
+    """A command's card id -> (base card id, form code, kind).
+
+    kind is 'card', 'ability' (the 65535 activation id) or 'unknown': an id that is neither a
+    card nor a form in this build's catalog -- after a game update, a new card. Unknown ids
+    must be reported, never guessed: the old test ("not in 25M..30M -> ability") filed every
+    evolution or hero form id as an ability, and the play vanished without a word.
+    """
+    raw_id = int(raw_id)
+    if raw_id in CARDS:
+        return raw_id, 0, 'card'
+    if raw_id in FORMS:
+        base, form = FORMS[raw_id]
+        return base, form, 'card'
+    if raw_id == ABILITY_COMMAND_ID:
+        return raw_id, 0, 'ability'
+    return raw_id, 0, 'unknown'
 
 
 def to_state(frame: dict, health: dict) -> dict:
@@ -71,13 +117,15 @@ def to_state(frame: dict, health: dict) -> dict:
     entities = []
     for entity in frame.get('entities', []):
         info = CARDS.get(entity['card_id'], {})
-        tower = entity['card_id'] == -1
+        # card -1 is a tower only for tower objects; a tower's shots are card -1 too (kind 0)
+        effect = entity.get('kind') == 0
+        tower = entity['card_id'] == -1 and not effect
         entities.append({'x': entity['x'], 'y': entity['y'], 'side': entity['side'],
                          'hp': entity['hp'], 'max_hp': entity['max_hp'],
                          'card_id': entity['card_id'], 'level': entity['level'],
                          'name': 'King' if tower and entity['kind'] == 12 else
                                  ('Tower' if tower else info.get('name', str(entity['card_id']))),
-                         'tower': tower})
+                         'tower': tower, 'effect': effect})
     return {'tick': frame.get('game_tick'), 'players': players, 'entities': entities,
             'local_side': local_side, 'status': health.get('status'),
             'coherent': frame.get('coherent'), 'read_us': frame.get('read_us'),
@@ -97,7 +145,8 @@ def pump() -> None:
             # that is merely between battles. install_reader is the repo's own installer: it
             # checks the SHA and refuses to overwrite a reader another observer is using.
             install_reader(ADB, SERIAL, READER)
-            process = start_reader(ADB, SERIAL, runtime['pid'], interval_ms=100, max_frames=0)
+            process = start_reader(ADB, SERIAL, runtime['pid'], interval_ms=READER_MS,
+                                   max_frames=0)
             for line in process.stdout:
                 if '"mumu_live_frame"' not in line:
                     continue
@@ -114,8 +163,20 @@ def pump() -> None:
                     log.write(json.dumps({'frame': frame, 'health': health}) + '\n')
                     log.flush()
         except Exception as error:  # keep serving; the game may be in a menu or restarting
+            message = f'{type(error).__name__}: {error}'
+            try:
+                # 'ADB failed' is what verify_runtime reports when pidof finds nothing: say so.
+                running = subprocess.run([str(ADB), '-s', SERIAL, 'shell', 'pidof',
+                                          'com.supercell.clashroyale'], capture_output=True,
+                                         text=True, timeout=10).stdout.strip()
+                if not running and 'device' in subprocess.run(
+                        [str(ADB), '-s', SERIAL, 'get-state'], capture_output=True, text=True,
+                        timeout=10).stdout:
+                    message = 'Clash Royale is not running on this device - open the game'
+            except Exception:  # noqa: BLE001
+                pass
             with LOCK:
-                STATE['error'] = f'{type(error).__name__}: {error}'
+                STATE['error'] = message
             # A TCP adb device drops out on its own (sleep, emulator restart) and nothing else
             # brings it back, so the console would sit on "no battle" until relaunched.
             if ':' in SERIAL:
@@ -125,6 +186,20 @@ def pump() -> None:
                 except Exception:  # noqa: BLE001  - reconnecting is best effort
                     pass
             time.sleep(2)
+
+
+def entry_side(entry: dict, accounts) -> int | None:
+    """The side a command-queue entry belongs to, from its account.
+
+    The queue probe maps accounts to sides; a trainer's commands carry account -1 and belong
+    to whichever side is not the one real account present.
+    """
+    sides = {a['lo']: a['side'] for a in (accounts or []) if a}
+    side = sides.get(entry.get('account_lo'))
+    if side is None:
+        real = [s for lo, s in sides.items() if lo is not None and lo > 0]
+        side = 1 - real[0] if len(real) == 1 else None
+    return side
 
 
 def executed_plays(row: dict, entries: list, pending: dict) -> list[dict]:
@@ -140,7 +215,6 @@ def executed_plays(row: dict, entries: list, pending: dict) -> list[dict]:
     tick = row.get('tick_0x60')
     if tick is None:
         return []
-    sides = {a['lo']: a['side'] for a in (row.get('accounts') or []) if a}
     current = {(e.get('account_lo'), e.get('seq'), e.get('issue_tick'), e.get('card_id')): e
                for e in entries if e.get('card_id', 0) > 0}
     played = []
@@ -148,18 +222,15 @@ def executed_plays(row: dict, entries: list, pending: dict) -> list[dict]:
         if key in current:
             continue
         del pending[key]
-        side = sides.get(entry.get('account_lo'))
-        if side is None:
-            # A trainer's commands carry no real account: they belong to the side that is not
-            # the one real account present.
-            real = [s for lo, s in sides.items() if lo is not None and lo > 0]
-            side = 1 - real[0] if len(real) == 1 else None
-        if side is None:
-            continue
-        card_id = int(entry['card_id'])
+        side = entry_side(entry, row.get('accounts'))
+        raw_id = int(entry['card_id'])
         # A champion's ability activation also passes through the command queue, with no
         # card behind it (id 65535). It is not a card play and must not move the card cycle.
-        kind = 'card' if 25000000 <= card_id < 30000000 else 'ability'
+        # Evolution / hero form ids are the same play as their base card.
+        card_id, form_code, kind = card_identity(raw_id)
+        if side is None:
+            # Kept, not dropped: the console reports plays it could not attribute.
+            kind = 'unattributed'
         # The game consumes a command a fixed 21 ticks after issue (measured: queued -> unit
         # 22 ticks on every play; FirstLight's COMMAND_CONSUMPTION_STEPS = 21). Dating the play
         # from its issue tick is exact; dating it from when we noticed the entry gone depends
@@ -167,7 +238,9 @@ def executed_plays(row: dict, entries: list, pending: dict) -> list[dict]:
         issue = entry.get('issue_tick')
         executed = int(issue) + 21 if isinstance(issue, int) and issue + 21 <= int(tick) \
             else int(tick)
-        played.append({'tick': executed, 'side': int(side), 'card_id': card_id, 'kind': kind,
+        played.append({'tick': executed, 'side': -1 if side is None else int(side),
+                       'card_id': card_id, 'raw_card_id': raw_id, 'form_code': form_code,
+                       'kind': kind,
                        'x': entry.get('x'), 'y': entry.get('y'), 'seq': entry.get('seq'),
                        'issue_tick': entry.get('issue_tick')})
     for key, entry in current.items():
@@ -211,7 +284,7 @@ def pump_queue() -> None:
         try:
             runtime = verify_runtime(ADB, SERIAL)
             command = (f'/data/local/tmp/queue_probe {runtime["pid"]} '
-                       f'{hex(MANAGER_RVA)} {hex(ROOT_CONTEXT_OFFSET)} 0 100')
+                       f'{hex(MANAGER_RVA)} {hex(ROOT_CONTEXT_OFFSET)} 0 {QUEUE_MS}')
             process = subprocess.Popen([str(ADB), '-s', SERIAL, 'shell', command],
                                        stdout=subprocess.PIPE, text=True, bufsize=1)
             pending: dict = {}

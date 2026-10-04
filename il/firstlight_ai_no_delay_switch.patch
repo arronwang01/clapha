@@ -1,0 +1,26 @@
+--- a/native_runner/training/v4/offline_agent.py	2026-09-25 19:10:09
++++ b/native_runner/training/v4/offline_agent.py	2026-09-25 19:10:09
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import argparse
++import os
+ from dataclasses import asdict, fields, replace
+ import json
+ from pathlib import Path
+@@ -31,6 +32,15 @@
+ def _rendered_action(action: ActionV1) -> ActionV1:
+     if action.kind != ActionKind.PLAY_CARD:
+         return action
++    if os.environ.get("CR_AI_NO_DELAY") == "1":
++        # clapha comparison switch: upstream FirstLight's behaviour (3ade158). The queue backdates
++        # the command age, so the AI's card applies on the next tick -- the condition the models
++        # were trained in, and not possible in the live game. Unset = the realistic delay below.
++        return replace(
++            action,
++            execute_offset_ticks=1,
++            metadata={**action.metadata, "execute_offset_ticks": 1, "model_delay_ignored": True},
++        )
+     # Match manual play: command age is 20 ticks, followed by consumption.
+     # Keep the model's chosen within-turn offset in addition to that delay.
+     offset = action.execute_offset_ticks + COMMAND_CONSUMPTION_STEPS

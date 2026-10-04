@@ -1,0 +1,91 @@
+#!/bin/bash
+# Startup script for an unattended il.train run on one GCP GPU VM (tools/gcp/launch.sh).
+# Pulls code, the fl:il checkpoint and the converted replays from the bucket, trains, copies
+# logs every minute and checkpoints every five to the bucket, writes out/DONE, and deletes this
+# VM. The VM is also created with a hard max-run-duration, so a hang cannot keep billing.
+# Needs the VM's service account to read and write the bucket (roles/storage.objectAdmin on
+# it); the project's default compute account has no roles here unless granted.
+# Instance metadata: clapha-bucket, clapha-mode (smoke | full), clapha-args (il.train flags), and
+# optionally clapha-prep: a module and flags run first (e.g. "il.teacher --workers 28"); the teacher
+# labels it writes go to the bucket (conv-hog26/teacher) as they are made, so a later VM reuses them;
+# and optionally clapha-init: a gs:// checkpoint copied to runs/init.pt (pass --init runs/init.pt).
+# the log goes to the serial console too: readable with get-serial-port-output even when the VM
+# cannot reach the bucket
+exec > >(tee -a /var/log/clapha-train.log > /dev/ttyS0) 2>&1
+set -x
+meta() { curl -s -H 'Metadata-Flavor: Google' "http://metadata.google.internal/computeMetadata/v1/instance/$1"; }
+B=$(meta attributes/clapha-bucket)
+MODE=$(meta attributes/clapha-mode)
+ARGS=$(meta attributes/clapha-args)
+PREP=$(meta attributes/clapha-prep)
+INIT_URL=$(meta attributes/clapha-init)
+NAME=$(meta name)
+ZONE=$(meta zone | awk -F/ '{print $NF}')
+OUT="$B/out/$NAME"
+W=/opt/clapha-train
+mkdir -p "$W" && cd "$W"
+
+finish() {
+  gcloud storage cp /var/log/clapha-train.log "$OUT/startup.log" -q
+  [ -d "$W/clapha/runs/train" ] && gcloud storage rsync -r "$W/clapha/runs/train" "$OUT/train" -q
+  echo "$1 $(date -u +%FT%TZ)" | gcloud storage cp - "$OUT/DONE" -q
+  echo "CLAPHA-TRAIN-DONE $1"
+  # the launching Mac deletes the VM when it sees DONE (tools/gcp/watch.sh); this is
+  # the fallback when the VM's own account may delete it; max-run-duration is the last resort
+  gcloud compute instances delete "$NAME" --zone "$ZONE" --quiet || true
+}
+
+( while true; do
+    # RAM and GPU headroom once a minute (resources.log), to tune workers and batch size from here
+    echo "$(date -u +%T) ram_used_gb=$(free -g | awk '/Mem:/{print $3"/"$2}') gpu=$(nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader 2>/dev/null)" >> /var/log/clapha-resources.log
+    gcloud storage cp /var/log/clapha-resources.log "$OUT/resources.log" -q
+    gcloud storage cp /var/log/clapha-train.log "$OUT/startup.log" -q
+    [ -f "$W/clapha/runs/train.log" ] && gcloud storage cp "$W/clapha/runs/train.log" "$OUT/train.log" -q
+    sleep 60
+  done ) &
+( while true; do
+    sleep 300
+    [ -d "$W/clapha/runs/train" ] && gcloud storage rsync -r "$W/clapha/runs/train" "$OUT/train" -q
+    [ -d "$W/clapha/runs/conv-hog26/teacher" ] && gcloud storage rsync -r "$W/clapha/runs/conv-hog26/teacher" "$B/conv-hog26/teacher" -q
+    [ -f "$W/clapha/runs/prep.log" ] && gcloud storage cp "$W/clapha/runs/prep.log" "$OUT/prep.log" -q
+  done ) &
+
+for _ in $(seq 1 60); do nvidia-smi && break; sleep 10; done
+nvidia-smi || { finish "no-gpu"; exit 1; }
+
+# a Python 3.11+ that already has CUDA torch (the image's: the system python3, whose venv module
+# is not installed); our three extra packages go straight into it -- the VM is thrown away after
+PY=""
+for candidate in /opt/conda/bin/python /usr/bin/python3 $(ls /opt/*/bin/python 2>/dev/null); do
+  "$candidate" -c "import sys, torch; assert sys.version_info >= (3, 11) and torch.cuda.is_available()" && { PY=$candidate; break; }
+done
+[ -n "$PY" ] || { finish "no-python-with-cuda-torch"; exit 1; }
+"$PY" -m pip --version || { apt-get update -qq && apt-get install -y -qq python3-pip; } || { finish "no-pip"; exit 1; }
+"$PY" -m pip install -q --break-system-packages orjson zstandard safetensors || { finish "pip"; exit 1; }
+"$PY" -c "import torch, orjson, zstandard; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())" || { finish "imports"; exit 1; }
+
+gcloud storage cp "$B/clapha-train-code.zip" . -q && python3 -m zipfile -e clapha-train-code.zip . || { finish "code"; exit 1; }
+mkdir -p clapha/ref-firstlight/checkpoints/IL clapha/runs/conv-hog26
+gcloud storage cp "$B/ckpt/IL/checkpoint-step-00029396.pt" clapha/ref-firstlight/checkpoints/IL/ -q
+gcloud storage rsync -r "$B/conv-hog26" clapha/runs/conv-hog26 -q || { finish "data"; exit 1; }
+cd clapha
+if [ -n "$INIT_URL" ] && [ "$INIT_URL" != "none" ]; then
+  gcloud storage cp "$INIT_URL" runs/init.pt -q || { finish "init-checkpoint"; exit 1; }
+fi
+if [ -n "$PREP" ] && [ "$PREP" != "none" ]; then
+  # metadata values are not shell code: only "module flags...", run with the training Python
+  read -r -a PREP_WORDS <<< "$PREP"
+  "$PY" -m "${PREP_WORDS[@]}" > runs/prep.log 2>&1
+  prep_status=$?
+  gcloud storage cp runs/prep.log "$OUT/prep.log" -q
+  [ -d runs/conv-hog26/teacher ] && gcloud storage rsync -r runs/conv-hog26/teacher "$B/conv-hog26/teacher" -q
+  [ "$prep_status" = 0 ] || { finish "prep-exit-$prep_status"; exit 1; }
+fi
+if [ "$MODE" = smoke ]; then
+  "$PY" -m il.train --frames runs/conv-hog26 --out runs/train --smoke $ARGS > runs/train.log 2>&1
+else
+  "$PY" -m il.train --frames runs/conv-hog26 --out runs/train $ARGS > runs/train.log 2>&1
+fi
+status=$?
+gcloud storage cp runs/train.log "$OUT/train.log" -q
+finish "exit-$status"

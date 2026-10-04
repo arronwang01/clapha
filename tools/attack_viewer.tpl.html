@@ -1,0 +1,97 @@
+<h2 class="sr-only">Step-through replay of twelve attacks detected on the Hog 2.6 side in real games, for checking the attack detection.</h2>
+<div style="display:flex;align-items:center;gap:8px;margin:0 0 12px">
+<button id="prev" aria-label="Previous example"><i class="ti ti-chevron-left" aria-hidden="true"></i></button>
+<div style="flex:1;min-width:0"><div id="title" style="font-weight:500;font-size:15px"></div><div id="sub" style="font-size:13px;color:var(--text-secondary)"></div></div>
+<button id="next" aria-label="Next example"><i class="ti ti-chevron-right" aria-hidden="true"></i></button>
+</div>
+<div style="display:grid;grid-template-columns:252px minmax(0,1fr);gap:16px;align-items:start">
+<canvas id="c" width="504" height="896" style="width:252px;height:448px;border-radius:8px;border:0.5px solid var(--border)"></canvas>
+<div style="font-size:13px;line-height:1.6">
+<div id="phase" style="display:inline-block;padding:2px 10px;border-radius:var(--radius);font-size:12px;margin-bottom:10px"></div>
+<div style="display:grid;grid-template-columns:auto minmax(0,1fr);column-gap:12px;row-gap:4px">
+<span style="color:var(--text-secondary)">Time</span><span id="time"></span>
+<span style="color:var(--text-secondary)">Attack</span><span id="atk"></span>
+<span style="color:var(--text-secondary)">Defense</span><span id="def"></span>
+<span style="color:var(--text-secondary)">Tower HP lost</span><span id="lost"></span>
+</div>
+<div style="margin-top:14px;color:var(--text-secondary);font-size:12px;line-height:1.7">
+<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#1D9E75;vertical-align:-1px"></span> Hog 2.6 side, defending (bottom)<br>
+<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#D85A30;vertical-align:-1px"></span> Attacker (top)<br>
+Shaded: the defender's half. An attack runs while an attacker troop is on it, and ends after 1.5 s without one. The bar under the slider marks it.
+</div>
+</div>
+</div>
+<div style="display:flex;align-items:center;gap:8px;margin-top:12px">
+<button id="play" aria-label="Play"><i id="pi" class="ti ti-player-play" aria-hidden="true"></i></button>
+<div style="flex:1;min-width:0">
+<input type="range" id="t" min="0" max="0" step="1" value="0" style="width:100%">
+<div style="position:relative;height:6px;background:var(--surface-1);border-radius:3px;margin-top:2px"><div id="win" style="position:absolute;top:0;bottom:0;background:#D85A30;opacity:0.45;border-radius:3px"></div></div>
+</div>
+</div>
+<script>
+const D = __DATA__;
+const cv = document.getElementById('c'), g = cv.getContext('2d');
+g.scale(2, 2);
+let ex = 0, fi = 0, timer = null;
+const S = 1.4, TEAL = '#1D9E75', CORAL = '#D85A30';
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const px = x => x * S, py = y => (320 - y) * S;
+function short(name) { const w = name.split(' '); return (w.length > 1 && w[0].length < 4 ? w.slice(0, 2).join(' ') : w[0]).slice(0, 10); }
+function draw() {
+  const e = D.examples[ex], f = e.frames[fi];
+  const text = css('--text-primary') || '#222';
+  g.clearRect(0, 0, 252, 448);
+  g.fillStyle = 'rgba(29,158,117,0.10)'; g.fillRect(0, py(150), 252, 448 - py(150));
+  g.fillStyle = 'rgba(55,138,221,0.18)'; g.fillRect(0, py(170), 252, py(150) - py(170));
+  g.font = '11px sans-serif'; g.textBaseline = 'middle';
+  for (const o of f[1]) {
+    if (o[4] < 0) continue;
+    const king = D.labels[o[1]] === 'King', w = (king ? 40 : 30) * S;
+    const col = o[0] === 0 ? TEAL : CORAL;
+    g.globalAlpha = 0.22; g.fillStyle = col; g.fillRect(px(o[2]) - w / 2, py(o[3]) - w / 2, w, w);
+    g.globalAlpha = 1; g.strokeStyle = col; g.lineWidth = 1; g.strokeRect(px(o[2]) - w / 2, py(o[3]) - w / 2, w, w);
+    g.fillStyle = text; g.textAlign = 'center'; g.fillText(o[4] + '%', px(o[2]), py(o[3]));
+  }
+  g.textAlign = 'left';
+  for (const o of f[1]) {
+    if (o[4] >= 0) continue;
+    const x = px(o[2]), y = py(o[3]);
+    g.fillStyle = o[0] === 0 ? TEAL : CORAL;
+    g.beginPath(); g.arc(x, y, 5, 0, 7); g.fill();
+    g.fillStyle = text; g.fillText(short(D.labels[o[1]]), x + 7, y);
+  }
+  const t = (f[0] - e.start) / 20, ph = document.getElementById('phase');
+  const inside = f[0] >= e.start && f[0] <= e.end;
+  ph.textContent = f[0] < e.start ? 'Before the attack' : inside ? 'Attack detected' : 'After the attack';
+  ph.style.background = inside ? 'var(--bg-warning)' : 'var(--surface-1)';
+  ph.style.color = inside ? 'var(--text-warning)' : 'var(--text-secondary)';
+  document.getElementById('time').textContent = (t >= 0 ? '+' : '') + t.toFixed(1) + ' s from the first crossing';
+  document.getElementById('t').value = fi;
+}
+function load(i) {
+  ex = (i + D.examples.length) % D.examples.length; fi = 0; stop();
+  const e = D.examples[ex], n = e.frames.length;
+  document.getElementById('title').textContent = e.title + ' — ' + (ex + 1) + ' of ' + D.examples.length;
+  document.getElementById('sub').textContent = 'Crossed: ' + e.cards.join(', ') + ' · lasted ' + ((e.end - e.start) / 20).toFixed(1) + ' s';
+  document.getElementById('atk').textContent = Math.round(e.attack_elixir) + ' elixir';
+  document.getElementById('def').textContent = Math.round(e.defense_elixir) + ' elixir' + (e.defense.length ? ': ' + e.defense.join(', ') : '');
+  document.getElementById('lost').textContent = Math.round(e.lost).toLocaleString();
+  const s = document.getElementById('t'); s.max = n - 1;
+  const a = e.frames.findIndex(f => f[0] >= e.start), b = e.frames.findIndex(f => f[0] > e.end);
+  const w = document.getElementById('win'), last = Math.max(1, n - 1), end = b < 0 ? n - 1 : b - 1;
+  w.style.left = (100 * a / last) + '%'; w.style.width = Math.max(1, 100 * (end - a) / last) + '%';
+  draw();
+}
+function stop() { if (timer) { clearInterval(timer); timer = null; } document.getElementById('pi').className = 'ti ti-player-play'; }
+document.getElementById('prev').onclick = () => load(ex - 1);
+document.getElementById('next').onclick = () => load(ex + 1);
+document.getElementById('t').oninput = ev => { fi = +ev.target.value; draw(); };
+document.getElementById('play').onclick = () => {
+  if (timer) { stop(); return; }
+  const n = D.examples[ex].frames.length;
+  if (fi >= n - 1) fi = 0;
+  document.getElementById('pi').className = 'ti ti-player-pause';
+  timer = setInterval(() => { if (fi >= n - 1) { stop(); return; } fi++; draw(); }, 160);
+};
+load(0);
+</script>

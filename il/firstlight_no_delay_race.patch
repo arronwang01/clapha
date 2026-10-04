@@ -1,0 +1,62 @@
+--- a/native_runner/cr_native_env.py	2026-10-02 13:22:10
++++ b/native_runner/cr_native_env.py	2026-10-02 13:22:10
+@@ -2869,6 +2869,26 @@
+         if len(payload.encode("utf-8")) >= 2048:
+             raise ValueError("native command exceeds the probe's 2 KiB limit")
+         return self._request(f"inject {payload}")
++
++    def queue_hand_action_next_tick(self, action: HandAction) -> dict[str, Any]:
++        """Queue a model play for the next tick without a live-render clock race.
++
++        clapha (2026-10-02, after upstream's method of the same name): with CR_AI_NO_DELAY the AI's
++        card goes in on the next tick, but the stock renderer keeps running while the request is
++        made, and on a busy machine the tick passed first -- queue_hand_action_at raised and the
++        whole match ended mid-game. Holding the renderer for the queueing removes the race; a
++        renderer the user had paused stays paused.
++        """
++
++        with self._lock:
++            was_paused = bool(self.status().get("paused"))
++            if not was_paused:
++                self.pause()
++            try:
++                return self.queue_hand_action_at(action, execute_in_ticks=1)
++            finally:
++                if not was_paused:
++                    self.resume()
+ 
+     def queue_hand_action_at(
+         self, action: HandAction, *, execute_tick: int | None = None, execute_in_ticks: int | None = None
+--- a/native_runner/battle_env.py	2026-10-02 13:22:10
++++ b/native_runner/battle_env.py	2026-10-02 13:22:10
+@@ -2527,7 +2527,29 @@
+                 x, y = self._world_target(action)
+                 execute_in = max(1, action.execute_offset_ticks or 1)
+                 hand_action = HandAction(action.owner, action.hand_slot, x, y)
+-                queued = self.native.queue_hand_action_at(hand_action, execute_in_ticks=execute_in)
++                try:
++                    if (
++                        action.metadata.get("model_delay_ignored") is True
++                        and self.episode_config is not None
++                        and self.episode_config.render_mode == "native-render"
++                    ):
++                        # clapha: CR_AI_NO_DELAY plays, race-free (cr_native_env.queue_hand_action_next_tick)
++                        queued = self.native.queue_hand_action_next_tick(hand_action)
++                    else:
++                        queued = self.native.queue_hand_action_at(hand_action, execute_in_ticks=execute_in)
++                except RunnerError as error:
++                    if self.episode_config is None or self.episode_config.render_mode != "native-render":
++                        raise
++                    # clapha: in a rendered match one play that cannot be queued (the renderer moved
++                    # on) is dropped and logged, instead of ending the whole match mid-game
++                    self._emit_event(
++                        tick=self._canonical_tick(before_native_tick),
++                        event_type="action_dropped_live",
++                        owner=action.owner,
++                        card_id=card_id,
++                        data={"action_id": action.action_id, "error": str(error)},
++                    )
++                    continue
+                 if bool(queued.get("terminalCanceled")):
+                     self._emit_event(
+                         tick=self._canonical_tick(int(queued["executeTick"])),

@@ -20,10 +20,16 @@ sees are in the frame it was trained in.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
-FIRSTLIGHT = Path.home() / 'Documents/GitHub/FirstLight_CR'
+# The up-to-date upstream clone kept in the project (update_check reports when it falls behind),
+# else the user's own download.
+_CLONE = Path(__file__).resolve().parents[1] / 'ref-firstlight'
+FIRSTLIGHT = Path(os.environ.get('FIRSTLIGHT_ROOT')
+                  or (_CLONE if (_CLONE / 'native_runner').is_dir()
+                      else Path.home() / 'Documents/GitHub/FirstLight_CR'))
 if str(FIRSTLIGHT) not in sys.path:
     sys.path.insert(0, str(FIRSTLIGHT))
 
@@ -66,6 +72,51 @@ def timeline():
 def gameplay_end_tick() -> int:
     from native_runner.match_factory import NATIVE_GAMEPLAY_END_TICK
     return int(NATIVE_GAMEPLAY_END_TICK)
+
+
+def regular_end_tick() -> int:
+    """First overtime tick on the standard timeline (3600: three minutes at 20 Hz)."""
+    end = gameplay_end_tick()
+    low, high = 0, end
+    while low < high:
+        middle = (low + high) // 2
+        if timeline().phase(middle)[0] == 'normal':
+            low = middle + 1
+        else:
+            high = middle
+    return low
+
+
+def battle_result(battle: 'Battle', tick: int) -> tuple[int | None, str] | None:
+    """(winning side or None for a draw, reason) once the battle is decided; else None.
+
+    Standard 1v1 rules on the towers this battle has seen fall: a king tower ends it at any
+    time; at full time (and on every tower after it -- sudden death) unequal crowns end it;
+    at the end of overtime it goes to the tiebreak. The live client keeps the clock running
+    for a few seconds after the end and accepts taps it will never execute, so the console
+    stops acting on this rather than on the clock stopping.
+    """
+    if battle.start_tick is None or tick <= battle.start_tick:
+        # A clock that has not moved since we started watching is a battle already over: its
+        # frozen end state or its teardown, which frees tower objects one by one (a finished
+        # 2026-09-25 win read as a loss that way). Its towers were never seen fall; no verdict.
+        return None
+    down = battle.towers_down
+    kings = {TOWERS[index][2] for index in down if TOWERS[index][3] == 'king'}
+    if kings:
+        return (None, 'both king towers destroyed') if len(kings) == 2 else \
+            (1 - kings.pop(), 'king tower destroyed')
+    crowns = {0: 0, 1: 0}
+    for index in down:
+        crowns[1 - TOWERS[index][2]] += 1
+    if tick >= regular_end_tick() and crowns[0] != crowns[1]:
+        winner = 0 if crowns[0] > crowns[1] else 1
+        last_fall = max(battle.tower_down_tick.get(index, 0) for index in down)
+        when = 'in overtime' if last_fall >= regular_end_tick() else 'at full time'
+        return winner, f'{crowns[winner]}-{crowns[1 - winner]} on crowns {when}'
+    if tick >= gameplay_end_tick():
+        return None, f'{crowns[0]}-{crowns[1]} at the end of overtime (tiebreak on tower health)'
+    return None
 
 
 _GLOBAL_BY_CARD: dict[int, int] | None = None
@@ -164,19 +215,42 @@ def archetype_by_card() -> dict[int, tuple[int, str]]:
         by_vocab: dict[int, int] = {}
         for global_id, vocab in catalog._runtime_vocab_by_global_id.items():
             by_vocab.setdefault(int(vocab), int(global_id))
+        # The unit an evolution summons is named by FirstLight's own card spec
+        # (evolution Transform effect 'summoned_form', e.g. Skeleton_EV1). Our catalog's
+        # 'evolution_form' is the CARD-level name (Skeletons_EV1), which matches only where
+        # card and unit share a name -- Evo Skeletons, Barbarians, Bats, Recruits, Royal Hogs
+        # and Wall Breakers were all invisible to the model.
+        specs = production_semantic_bundle().card_specs
+        unit_form: dict[int, str] = {}
+        for card_id, spec in specs.items():
+            for effect in (spec.evolution.effects if spec.evolution is not None else ()):
+                name = effect.parameters.get('summoned_form') if effect.parameters else None
+                if name:
+                    unit_form[int(card_id)] = str(name)
         for info in CARDS.values():
-            for form_id_key, form_name_key in (('hero_form_id', 'hero_character'),
-                                               ('evolution_form_id', 'evolution_form')):
-                form_id, form_name = info.get(form_id_key), info.get(form_name_key)
-                if not form_id or not form_name or int(form_id) in table:
+            for form_id_key, names in (
+                    ('hero_form_id', (info.get('hero_character'),)),
+                    ('evolution_form_id', (unit_form.get(int(info['card_id'])),
+                                           info.get('evolution_form'),
+                                           # the summoned unit's name: evo Elite Barbarians is
+                                           # AngryBarbarian_EV1 in their catalog, while the card
+                                           # is AngryBarbarians_EV1 and its spec names no unit
+                                           f"{info['summon_character']}_EV1"
+                                           if info.get('summon_character') else None))):
+                form_id = info.get(form_id_key)
+                if not form_id or int(form_id) in table:
                     continue
-                vocab = catalog.form_vocab_id(form_name)
-                if vocab <= 1 or vocab not in by_vocab:
-                    continue
-                metadata = catalog.metadata_for_vocab_id(vocab)
-                kind = _ENTITY_KIND.get(str(metadata.child_kind))
-                if metadata.child_kind_known and kind is not None:
-                    table[int(form_id)] = (by_vocab[vocab], kind)
+                for form_name in names:
+                    if not form_name:
+                        continue
+                    vocab = catalog.form_vocab_id(form_name)
+                    if vocab <= 1 or vocab not in by_vocab:
+                        continue
+                    metadata = catalog.metadata_for_vocab_id(vocab)
+                    kind = _ENTITY_KIND.get(str(metadata.child_kind))
+                    if metadata.child_kind_known and kind is not None:
+                        table[int(form_id)] = (by_vocab[vocab], kind)
+                        break
         _ARCHETYPE = table
     return _ARCHETYPE
 
@@ -222,8 +296,14 @@ class Battle:
         self.previous: dict[str, tuple[int, int, int]] = {}
         self.tower_max: dict[int, float] = {}
         self.tower_seen: set[int] = set()
+        self.towers_down: set[int] = set()      # TOWERS indices seen alive, now destroyed
+        self.tower_hp: dict[int, float] = {}     # last readable health per tower
+        self.tower_down_tick: dict[int, int] = {}  # when each destroyed tower was first seen down
+        self.unreadable_hp = 0                   # unit readings left out: health read as < 0
         self.unresolved: dict[int, int] = {}
+        self.form_fallbacks: set[int] = set()   # forms shown as their base unit
         self.untracked_plays: set[tuple[int, int]] = set()
+        self.unresolved_abilities: set[int] = set()
 
     def tick(self, raw_tick: int) -> int:
         """The battle clock, already on FirstLight's own 0..6000 timeline.
@@ -347,7 +427,7 @@ def placement_context(tower_states, frame: dict, owner: int):
     occupied: dict = {}
     unknown: set[int] = set()
     for e in frame['entities']:
-        if e['card_id'] == -1 or (e.get('hp') or 0) <= 0:
+        if e['card_id'] == -1 or is_effect(e) or (e.get('hp') or 0) <= 0:
             continue
         spec = specs.get(e['card_id'])
         if spec is None or spec.kind.value != 'building':
@@ -367,20 +447,274 @@ def placement_context(tower_states, frame: dict, owner: int):
     return lanes, towers, tuple(occupied[k] for k in sorted(occupied)), tuple(sorted(unknown))
 
 
+# FirstLight's exact ability button enum (rich_telemetry_adapter.ABILITY_BUTTON_STATE_LABELS and
+# _ability_phase). Every value the device showed fits it: 0 no match, 1 ChampionAbsent, 2 Ready,
+# 6 AllChargesConsumed, 9 NotEnoughElixir. Only Ready and LimitedAvailability are queueable.
+ABILITY_QUEUEABLE_BUTTON_STATES = frozenset((2, 4))
+_ABILITY_PHASE_BY_BUTTON = {1: 'unavailable', 2: 'ready', 4: 'ready', 6: 'exhausted',
+                            8: 'cooldown', 9: 'unavailable', 10: 'casting', 11: 'unavailable',
+                            12: 'unavailable', 13: 'unavailable'}
+_HERO_CARD_BY_CHARACTER: dict[int, int] | None = None
+_ABILITY_BY_CARD: dict[int, tuple[str, object]] | None = None
+
+
+def hero_card_by_character() -> dict[int, int]:
+    """hero character data global id -> base card id.
+
+    A controller names its hero by the character data it selected (+0x90 -> +0x40); the device
+    showed 130283371 for Hero Musketeer and 2979504115 for Hero Ice Golem, which are exactly the
+    archetype ids FirstLight's catalog gives those hero forms. Hero form -> base card is
+    FirstLight's own HERO_FORM_TO_BASE_CARD.
+    """
+    global _HERO_CARD_BY_CHARACTER
+    if _HERO_CARD_BY_CHARACTER is None:
+        from native_runner.training.v4.native_actions import HERO_FORM_TO_BASE_CARD
+        table: dict[int, int] = {}
+        for form_id, (global_id, _kind) in archetype_by_card().items():
+            base = HERO_FORM_TO_BASE_CARD.get(int(form_id))
+            if base is None and 203000000 <= int(form_id) < 204000000:
+                base = base_card(int(form_id))
+            if base is not None:
+                table[int(global_id) & 0xFFFFFFFF] = int(base)
+        _HERO_CARD_BY_CHARACTER = table
+    return _HERO_CARD_BY_CHARACTER
+
+
+_ABILITY_CARD_BY_CHARACTER: dict[int, tuple[int, int]] | None = None
+
+
+def ability_card_by_character() -> dict[int, tuple[int, int]]:
+    """controller character (the unit's data global id, as the reader names it) -> (card, form):
+    a hero's base card in form 2 (hero_card_by_character), a champion's own card in form 0 -- any
+    card with exactly one ability, by its unit's archetype id. The model's ability inputs (il/extras)
+    take both players' controllers this way; training joins the engine's ability id to the same card."""
+    global _ABILITY_CARD_BY_CHARACTER
+    if _ABILITY_CARD_BY_CHARACTER is None:
+        table = {character: (card, 2) for character, card in hero_card_by_character().items()}
+        archetypes = archetype_by_card()
+        for card in ability_by_card():
+            found = archetypes.get(card)
+            if found is not None:
+                table.setdefault(int(found[0]) & 0xFFFFFFFF, (int(card), 0))
+        _ABILITY_CARD_BY_CHARACTER = table
+    return _ABILITY_CARD_BY_CHARACTER
+
+
+def ability_by_card() -> dict[int, tuple[str, object]]:
+    """base card -> (ability id, AbilitySpec), only where the card has exactly one ability --
+    the same unique catalog join their adapter requires before it emits an ability state."""
+    global _ABILITY_BY_CARD
+    if _ABILITY_BY_CARD is None:
+        from native_runner.training.v4.factory import production_semantic_bundle
+        seen: dict[int, list] = {}
+        for ability_id, spec in production_semantic_bundle().ability_specs.items():
+            card = getattr(spec, 'source_card_id', None)
+            if card is not None:
+                seen.setdefault(int(card), []).append((str(ability_id), spec))
+        _ABILITY_BY_CARD = {card: rows[0] for card, rows in seen.items() if len(rows) == 1}
+    return _ABILITY_BY_CARD
+
+
+def _state_provenance(fields, filled: dict, tick: int, notes: tuple[str, ...]):
+    from native_runner.contracts import SemanticEvidenceLevel, SemanticProvenanceV1
+    evidence = dict(SemanticProvenanceV1.unknown_all(fields).field_evidence)
+    sources = {}
+    for name, (level, origin) in filled.items():
+        evidence[name] = level
+        sources[name] = origin
+    return SemanticProvenanceV1(field_evidence=evidence, source_fields=sources,
+                                observed_tick=tick, notes=notes)
+
+
+def own_runtime_states(player: dict, entities, side: int, tick: int, battle,
+                       evo_required: dict | None = None):
+    """(ability_runtime_states, evolution_runtime_states) for the actor, from memory.
+
+    Abilities: one per bound hero controller, joined controller -> selected hero character ->
+    base card -> the card's single ability spec (id, elixir cost). The source entity is our
+    live unit with that character's archetype. Phase and `available` follow their button enum.
+    Evolutions: the player's per-deck-slot progress vector, for slots whose form flag has the
+    evolution bit; ready = progress >= FirstLight's cycles required, exactly as their probe.
+    """
+    from native_runner.contracts import (ABILITY_RUNTIME_STATE_FIELDS,
+                                         EVOLUTION_RUNTIME_STATE_FIELDS, AbilityPhase,
+                                         AbilityRuntimeStateV1, EvolutionPhase,
+                                         EvolutionRuntimeStateV1, SemanticEvidenceLevel)
+    from native_runner.training.v4.factory import production_semantic_bundle
+
+    native = SemanticEvidenceLevel.NATIVE_DERIVED
+    static = SemanticEvidenceLevel.STATIC_DECLARED
+    abilities = []
+    heroes = hero_card_by_character()
+    by_card = ability_by_card()
+    for raw in player.get('abilities') or ():
+        character = int(raw.get('character_id') or 0) & 0xFFFFFFFF
+        if not character:
+            continue
+        card = heroes.get(character)
+        joined = by_card.get(card) if card is not None else None
+        if joined is None:
+            battle.unresolved_abilities.add(character)
+            continue
+        ability_id, spec = joined
+        sources = [e.entity_id for e in entities
+                   if e.owner == side and (int(e.native_data_global_id or 0) & 0xFFFFFFFF) == character]
+        source_entity = sources[0] if len(sources) == 1 else None
+        button = int(raw.get('button', 0))
+        phase = AbilityPhase(_ABILITY_PHASE_BY_BUTTON.get(button, 'unknown'))
+        charges_raw = int(raw.get('charges', -1))
+        cost = getattr(spec, 'elixir_cost', None)
+        filled = {
+            'phase': (native if phase != AbilityPhase.UNKNOWN else SemanticEvidenceLevel.UNKNOWN,
+                      ('controller+0x98 button state',)),
+            'available': (native, ('controller+0x98 button state',)),
+            'cooldown_ms': (native, ('controller+0x7c',)),
+            'remaining_cooldown_ms': (native, ('controller+0x78',)),
+            'charges': (native, ('controller+0x80',)),
+        }
+        if cost is not None:
+            filled['elixir_cost'] = (static, ('AbilitySpecV1.elixir_cost',))
+        if source_entity is not None:
+            filled['source_entity'] = (native, ('live unit with the controller character',))
+        abilities.append(AbilityRuntimeStateV1(
+            ability_id=ability_id, source_entity=source_entity, phase=phase,
+            elixir_cost=float(cost) if cost is not None else None,
+            cooldown_ms=int(raw.get('configured_ms', 0)),
+            remaining_cooldown_ms=max(0, int(raw.get('cooldown_ms', 0))),
+            charges=None if charges_raw == -1 else charges_raw,
+            available=button in ABILITY_QUEUEABLE_BUTTON_STATES,
+            attributes={'controller_slot': int(raw['controller_slot']),
+                        'source_card_id': int(card), 'button_state': button,
+                        'selected_character_data_global_id': character,
+                        'remaining_charges_raw': charges_raw,
+                        'classification': 'exact_catalog_runtime_join'},
+            provenance=_state_provenance(ABILITY_RUNTIME_STATE_FIELDS, filled, tick,
+                                         (f'raw ability enum={button}',))))
+
+    evolutions = []
+    deck = player.get('deck_card_ids') or []
+    flags = player.get('deck_form_flags') or []
+    progress = player.get('evo_progress') or []
+    specs = production_semantic_bundle().card_specs
+    if len(progress) == len(deck) == len(flags) == 8:
+        for slot, (card, flag, value) in enumerate(zip(deck, flags, progress)):
+            spec = specs.get(int(card))
+            evolution = getattr(spec, 'evolution', None) if spec is not None else None
+            if not int(flag or 0) & 0x1 or evolution is None or not evolution.cycle_required:
+                continue
+            required = int((evo_required or {}).get(int(card), evolution.cycle_required))
+            value = max(0, int(value))
+            ready = value >= required
+            phase = (EvolutionPhase.READY if ready else
+                     EvolutionPhase.BASE if value == 0 else EvolutionPhase.CYCLING)
+            filled = {name: (native, ('player+0x2e8 progress vector',)) for name in
+                      ('deck_slot', 'phase', 'cycle_required', 'cycle_remaining', 'ready',
+                       'deployments_in_cycle')}
+            filled['base_form_id'] = (static, ('CardSpecV1.evolution.base_form_id',))
+            filled['next_form_id'] = (static, ('CardSpecV1.evolution.evolution_form_id',))
+            evolutions.append(EvolutionRuntimeStateV1(
+                card_id=int(card), deck_slot=slot, phase=phase,
+                base_form_id=evolution.base_form_id, next_form_id=evolution.evolution_form_id,
+                cycle_required=required, cycle_remaining=max(0, required - value),
+                ready=ready, deployments_in_cycle=value,
+                attributes={'raw_progress': value, 'classification': 'exact_catalog_runtime_join'},
+                provenance=_state_provenance(EVOLUTION_RUNTIME_STATE_FIELDS, filled, tick, ())))
+    return tuple(abilities), tuple(evolutions)
+
+
+def screen_view(player: dict, sent_cards, strict: bool = True, deal_rule: bool = False) -> dict:
+    """The actor's own player row as its screen shows it (a copy; the reader row is left alone).
+
+    The client takes a card out of the hand and its cost off the elixir bar at the tap; the game
+    state does that ~1 s later, when the command executes, and the reader reads the game state.
+    Two steps, in order:
+      * a hand slot the game leaves empty after a play executes (-1 while the next card is drawn:
+        the cycle then holds five cards) gets the head of the cycle, as the screen already shows;
+      * each card sent and not executed yet (`sent_cards`, in the order sent) leaves its slot to
+        the next card and its cost (FirstLight's card spec, as the action mask uses) off the elixir.
+    Training (il/samples.py) builds its inputs with this function, so a model trained on them
+    must get them from it live too: the console passes its in-flight taps.
+    strict: a sent card that is not in the hand raises ValueError (training: the in-flight list
+    is wrong). Otherwise it is skipped: live or in a duel a policy can send a card that is not on
+    screen yet (the second of two plays whose first was not sent); it cannot be tapped.
+    deal_rule: the row also says which of its hand cards the game itself has dealt ('hand_dealt', per
+    slot). A card put in by either step is not dealt: the game deals it when the play before it in that
+    slot executes, and until then the client takes no tap for it (27 of 27 lost live, 2026-10-03).
+    action_mask makes such a card illegal, so a policy can only choose what the game will take.
+    """
+    from native_runner.training.v4.factory import production_semantic_bundle
+
+    specs = production_semantic_bundle().card_specs
+    deck = list(player.get('deck_card_ids') or [])
+    hand = list(player.get('hand_deck_indices') or [])
+    cycle = list(player.get('cycle_deck_indices') or [])
+    elixir = int(player.get('elixir_raw') or 0)
+    dealt = [slot >= 0 for slot in hand]
+    for position, slot in enumerate(hand):
+        if slot < 0 and len(cycle) > 4:
+            hand[position] = cycle.pop(0)
+    for card in sent_cards:
+        slot = deck.index(int(card)) if int(card) in deck else None
+        if slot is None or slot not in hand:
+            if strict:
+                raise ValueError(f'sent card {card} is not in the hand')
+            continue
+        position = hand.index(slot)
+        hand[position] = cycle.pop(0)
+        dealt[position] = False
+        cycle.append(slot)
+        spec = specs.get(int(card))
+        elixir -= int(round(float(getattr(spec, 'elixir_cost', 0) or 0) * 10000))
+    view = {**player, 'hand_deck_indices': hand, 'cycle_deck_indices': cycle,
+            'next_deck_index': cycle[0] if cycle else -1, 'elixir_raw': max(0, elixir)}
+    if deal_rule:
+        view['hand_dealt'] = dealt
+    return view
+
+
+def legal_ability_sources(abilities, elixir: float, pending=()) -> tuple[int, ...]:
+    """BattleEnvV1._ability_action_candidates' rule, verbatim in effect: Ready and available,
+    no cooldown, charges left (or unlimited), an exact cost we can pay, a live source unit, and
+    not already requested (a tap in flight)."""
+    legal = []
+    for state in abilities:
+        if (state.source_entity is None or state.source_entity in pending
+                or state.phase.value != 'ready' or state.available is not True
+                or (state.remaining_cooldown_ms or 0) != 0
+                or (state.charges is not None and state.charges <= 0)
+                or state.elixir_cost is None or state.elixir_cost > elixir):
+            continue
+        legal.append(int(state.source_entity))
+    return tuple(sorted(set(legal)))
+
+
 def action_mask(frame: dict, side: int, elixir: float, reserved: float = 0.0,
-                tower_states=()):
+                tower_states=(), hand_forms: dict | None = None, abilities=(),
+                pending_ability_sources=(), lead_ticks: int = 0, tick: int = 0):
     """Which hand slots are playable, and where -- built the way BattleEnvV1.action_mask does.
 
     reserved is elixir already committed to a play the server has not acknowledged yet. The
     client does not debit it for ~20 ticks, so without holding it back a second play can be
     chosen against elixir that is already spent. reasons['reserved_elixir'] is their own field
     for this and is read straight into the scalar features.
+
+    lead_ticks: the elixir counted is what regenerates by the time the tap goes out, this many
+    ticks after the decision (the game checks elixir at the tap). 0 is the decision tick itself.
+
+    hand_forms maps card id -> the form it would be played in (0 normal, 1 evolution, 2 hero).
+    The entry's form_code must agree with hand_runtime_by_slot, or the tensorizer raises.
+
+    A player row with 'hand_dealt' (screen_view's deal_rule) makes a hand card the game has not dealt
+    yet illegal ('not_dealt'): it is on the screen's hand, the client takes no tap for it.
     """
     from native_runner.contracts import ActionKind, ActionMaskV1
     from native_runner.training.v4.factory import production_semantic_bundle
 
     specs = production_semantic_bundle().card_specs
     available = max(0.0, elixir - max(0.0, reserved))
+    if lead_ticks > 0:
+        per_tick = float(timeline().elixir_rate(tick).raw_per_tick) / 10000.0
+        available = min(10.0, available + per_tick * lead_ticks)
     lanes, towers, buildings, unknown = placement_context(tower_states, frame, side)
     player = next((p for p in frame['players'] if p['side'] == side), None)
     slots: list[bool] = [False, False, False, False]
@@ -388,6 +722,7 @@ def action_mask(frame: dict, side: int, elixir: float, reserved: float = 0.0,
     reasons: dict[str, object] = {}
     if player:
         deck = player.get('deck_card_ids') or []
+        dealt = player.get('hand_dealt')
         for position, index in enumerate(player.get('hand_deck_indices') or []):
             if position > 3 or not (deck and 0 <= index < len(deck)):
                 continue
@@ -403,26 +738,86 @@ def action_mask(frame: dict, side: int, elixir: float, reserved: float = 0.0,
                 reasons[str(position)] = 'mirror_unsupported'
                 continue
             cost = float(spec.elixir_cost)
+            form = int((hand_forms or {}).get(card_id, 0))
             base = _placement_entry(card_id, side, lanes, towers, buildings, unknown)
             entry = {**base, 'visible_card_id': card_id, 'effective_card_id': card_id,
                      'native_effective_card_id': card_id, 'effective_cost': cost,
-                     'form_code': 0, 'native_form_code': 0,
+                     'form_code': form, 'native_form_code': form,
                      'source_native_hand_slot': position}
             masks[str(position)] = entry
-            if cost > available:
+            if dealt is not None and not dealt[position]:
+                reasons[str(position)] = 'not_dealt'
+            elif cost > available:
                 reasons[str(position)] = 'insufficient_elixir'
             elif not any(any(row) for row in entry['row_major']):
                 reasons[str(position)] = 'no_legal_placement'
             else:
                 reasons[str(position)] = 'legal'
                 slots[position] = True
-    kinds = {ActionKind.WAIT.value: True, ActionKind.PLAY_CARD.value: any(slots)}
+    ability_sources = legal_ability_sources(abilities, available, pending_ability_sources)
+    kinds = {ActionKind.WAIT.value: True, ActionKind.PLAY_CARD.value: any(slots),
+             ActionKind.ACTIVATE_ABILITY.value: bool(ability_sources)}
     return ActionMaskV1(kinds=kinds, hand_slots=tuple(slots), placement_masks=masks,
+                        ability_sources=ability_sources,
                         reasons={**reasons, 'effective_elixir': available,
                                  'reserved_elixir': max(0.0, reserved)})
 
 
 _UNTAG = 0x00FFFFFFFFFFFFFF
+_ARCHETYPE_BY_DATA: dict[int, tuple[int, str] | None] = {}
+
+
+def _addr(value) -> int | None:
+    """A heap address as an untagged int; None for anything that is not one."""
+    try:
+        return int(str(value), 16) & _UNTAG
+    except (TypeError, ValueError):
+        return None
+
+
+_CARD_BY_ARCHETYPE: dict[int, int] | None = None
+
+
+def card_of_unit(global_id: int, fallback: int) -> int:
+    """The card whose unit this archetype is (Barbarian -> Barbarians), for its stats; the
+    object's own card id otherwise."""
+    global _CARD_BY_ARCHETYPE
+    if _CARD_BY_ARCHETYPE is None:
+        _CARD_BY_ARCHETYPE = {}
+        for card, (gid, _kind) in sorted(archetype_by_card().items()):
+            _CARD_BY_ARCHETYPE.setdefault(int(gid), int(card))
+    return _CARD_BY_ARCHETYPE.get(int(global_id), int(fallback))
+
+
+def is_tower(e: dict) -> bool:
+    """Towers are card -1 AND a tower object (kind 12/13). A tower's own shots are card -1 too,
+    spawned at the tower's position; they are projectiles (kind 0), not towers."""
+    return e.get('card_id') == -1 and e.get('kind', 12) != 0
+
+
+def is_effect(e: dict) -> bool:
+    """A projectile or area effect: kind 0, identified only by its own data record."""
+    return e.get('kind') == 0
+
+
+def archetype_by_data(data_id: int) -> tuple[int, str] | None:
+    """An object's own data record -> (archetype global id, entity kind), from FirstLight's
+    catalog. This is the key their environment uses (native_data_global_id): it names the unit a
+    spawner produced (Battle Ram -> Barbarians, Tombstone -> Skeletons) and the ProjectileData /
+    AreaEffectData of a spell or shot in flight, which the card id cannot."""
+    data_id = int(data_id) & 0xFFFFFFFF
+    if data_id not in _ARCHETYPE_BY_DATA:
+        from native_runner.training.v4.factory import production_semantic_bundle
+        catalog = production_semantic_bundle().entity_archetype_catalog
+        result = None
+        vocab = catalog.runtime_global_vocab_id(data_id) if data_id else 1
+        if vocab > 1:
+            metadata = catalog.metadata_for_vocab_id(vocab)
+            kind = _ENTITY_KIND.get(str(metadata.child_kind))
+            if metadata.child_kind_known and kind is not None:
+                result = (data_id, kind)
+        _ARCHETYPE_BY_DATA[data_id] = result
+    return _ARCHETYPE_BY_DATA[data_id]
 _BASE_CARD: dict[int, int] | None = None
 
 
@@ -506,7 +901,30 @@ def troop_runtime(e: dict, entity_id: int, tick: int, target_id: int | None,
     return attack, movement, deployment
 
 
-def runtime_provenance(fields, attack, movement, deployment, tick: int):
+def projectile_state(e: dict, global_id: int, entity_id: int, velocity, tick: int):
+    """FirstLight's ProjectileStateV1 for a shot or spell in flight, as their adapter builds it:
+    in flight while the object exists, its velocity, its source card, its projectile data id.
+    Damage and radius stay unset -- the tensorizer then takes the projectile archetype's catalog
+    values, as it does for their probe. The destination is not read yet, so it stays unset too."""
+    from native_runner.contracts import (PROJECTILE_STATE_FIELDS, ProjectilePhase,
+                                         ProjectileStateV1, SemanticEvidenceLevel)
+    derived = SemanticEvidenceLevel.NATIVE_DERIVED
+    card = e['card_id'] if e.get('card_id', -1) > 0 else None
+    filled = {'phase': (derived, ('object present in the battle entity list',))}
+    if velocity is not None:
+        filled['velocity'] = (derived, ('position delta / tick delta',))
+    if card is not None:
+        filled['source_card_id'] = (derived, ('object +0xac',))
+    return ProjectileStateV1(
+        projectile_id=f'projectile:{entity_id}:{global_id}', phase=ProjectilePhase.IN_FLIGHT,
+        source_card_id=card, velocity=velocity,
+        attributes={'native_projectile_data_global_id': int(global_id),
+                    'terminal_reason': 'unknown'},
+        provenance=_state_provenance(PROJECTILE_STATE_FIELDS, filled, tick,
+                                     ('external read-only reader; destination not read',)))
+
+
+def runtime_provenance(fields, attack, movement, deployment, tick: int, projectile=None):
     """Per-domain evidence for a troop or tower: which runtime domains were really observed.
 
     Their contract refuses a domain carrying data without positive provenance, and just as
@@ -521,7 +939,8 @@ def runtime_provenance(fields, attack, movement, deployment, tick: int):
     for name, value, origin in (
             ('attack_state', attack, ('attack component +0x10/+0x20/+0x24/+0x28',)),
             ('movement_runtime', movement, ('movement component +0x1e0',)),
-            ('deployment_runtime', deployment, ('object +0x15c',))):
+            ('deployment_runtime', deployment, ('object +0x15c',)),
+            ('projectile_state', projectile, ('object +0x48 ProjectileData, frame deltas',))):
         if value is not None and name in evidence:
             evidence[name] = SemanticEvidenceLevel.NATIVE_AUTHORITATIVE
             sources[name] = origin
@@ -544,27 +963,51 @@ def play_events(plays, tick: int, decks: dict | None, battle):
     (card, owner, position, and the tick it was consumed), shaped like battle_env's.
 
     The tracker refuses a play of a card outside that player's episode deck, so a play is
-    only emitted when its card is in `decks[side]`; anything else is counted on the battle
-    as unplaceable rather than raising and losing the decision.
+    only emitted when its card is in `decks[side]`. The console registers every card a player
+    shows before calling this (FirstLightRunner.register_plays), so `decks` holds what the
+    tracker can take, and a play left out here is one the registry refused -- recorded on the
+    battle with its reason, which the console reports every time.
     """
     from native_runner.contracts import EventV1
     from native_runner.training.v4.factory import production_semantic_bundle
 
     specs = production_semantic_bundle().card_specs
     events = []
+    seen_commands = set()
     for play in plays or ():
         if not tick - EVENT_WINDOW_TICKS <= play['tick'] <= tick:
             continue
+        # The same command can be reported twice (seen missing early, then dated from its
+        # issue tick). It is one play.
+        command = (play.get('side'), play.get('issue_tick'), play.get('seq'))
+        if play.get('issue_tick') is not None:
+            if command in seen_commands:
+                continue
+            seen_commands.add(command)
+        if play.get('kind') == 'ability' and play.get('ability_card') is not None:
+            # An opponent hero ability the runner joined to its hero
+            # (attribute_opponent_abilities). Public (everyone sees it cast) and its cost is
+            # fixed, so the tracker may charge it exactly. Our own abilities are not sent:
+            # their state comes from memory (own_runtime_states).
+            owner, hero = int(play['side']), int(play['ability_card'])
+            events.append(EventV1(
+                tick=int(play['tick']), event_type='ability_activation', owner=owner,
+                card_id=hero,
+                data={'source_card_id': hero, 'fair_ability_activation_exact': True,
+                      'native_event_id': f"{play.get('issue_tick')}:{play.get('seq')}:{owner}",
+                      'source': 'native_command_queue'}))
+            continue
         if play.get('kind', 'card') != 'card':
-            continue   # champion ability activations: not a card play (see viewer)
+            continue   # unattributed abilities, unknown ids: reported by the console
         card_id, side = int(play['card_id']), int(play['side'])
-        if card_id == MIRROR_CARD_ID or (decks and card_id not in decks.get(side, ())):
+        if card_id == MIRROR_CARD_ID or (decks is not None and card_id not in decks.get(side, ())):
             battle.untracked_plays.add((side, card_id))
             continue
         spec = specs.get(card_id)
         if spec is None or spec.elixir_cost is None:
             battle.untracked_plays.add((side, card_id))
             continue
+        form_code = int(play.get('form_code') or 0)
         position = None
         if play.get('x') is not None and play.get('y') is not None:
             position = (float(play['x']), float(play['y']))
@@ -575,22 +1018,28 @@ def play_events(plays, tick: int, decks: dict | None, battle):
                   'native_event_id': f"{play.get('issue_tick')}:{play.get('seq')}:{side}",
                   'visible_card_id': card_id, 'effective_card_id': card_id,
                   'native_effective_card_id': card_id,
-                  'effective_cost': float(spec.elixir_cost), 'form_code': 0,
-                  'native_form_code': 0, 'source': 'native_command_queue'}))
+                  'effective_cost': float(spec.elixir_cost), 'form_code': form_code,
+                  'native_form_code': form_code, 'source': 'native_command_queue'}))
     events.sort(key=lambda event: (event.tick, event.owner or 0))
     return tuple(events)
 
 
 def build(frame: dict, health: dict, episode_id: str, deduced: dict | None = None,
           revealed: dict | None = None, battle: Battle | None = None,
-          reserved: float = 0.0, plays=None, decks: dict | None = None):
+          reserved: float = 0.0, plays=None, decks: dict | None = None,
+          hand_forms: dict | None = None, pending_ability_sources=(),
+          evo_required: dict | None = None, elixir_lead_ticks: int = 0):
     """One ObservationV1 for the local actor, FAIR tier.
 
     Pass the same Battle for every frame of a battle: velocity, entity identity, age, the
     clock and the crown count all need continuity, and without it the policy sees a board
     where nothing moves, nothing has history and no tower has ever fallen.
+
+    hand_forms: card id -> form for our hand (see action_mask).
+    elixir_lead_ticks: decision -> tap, for the elixir the mask counts (see action_mask).
     """
-    from native_runner.contracts import (ENTITY_RUNTIME_SEMANTIC_FIELDS,
+    from native_runner.contracts import (PLAYER_RUNTIME_SEMANTIC_FIELDS, SemanticEvidenceLevel,
+                                         ENTITY_RUNTIME_SEMANTIC_FIELDS,
                                          TOWER_RUNTIME_SEMANTIC_FIELDS,
                                          CausalGroupKind, CausalGroupRefV1, EntityStateV1,
                                          ObservationTier, ObservationV1, PlayerStateV1,
@@ -601,7 +1050,7 @@ def build(frame: dict, health: dict, episode_id: str, deduced: dict | None = Non
     if battle is None or battle.episode_id != episode_id:
         battle = Battle(episode_id)
     tick = battle.tick(frame['game_tick'])
-    live = {(e['x'], e['y']): e for e in frame['entities'] if e['card_id'] == -1}
+    live = {(e['x'], e['y']): e for e in frame['entities'] if is_tower(e)}
 
     phase, multiplier = timeline().phase(tick)
     remaining = max(0, gameplay_end_tick() - tick) * TICK_MS
@@ -610,15 +1059,23 @@ def build(frame: dict, health: dict, episode_id: str, deduced: dict | None = Non
     tower_rows: list = []
     id_by_address: dict[int, int] = {}
     crowns = {0: 0, 1: 0}
+    destroyed: set[int] = set()
     tower_ids: dict[int, list[int]] = {0: [], 1: []}
     for index, (x, y, owner, kind) in enumerate(TOWERS):
         found = live.get((x, y))
         entity_id = 5000000 + index
         tower_ids[owner].append(entity_id)
-        if found:
+        if found and float(found.get('hp', 0)) >= 0:
             battle.tower_seen.add(index)
-            battle.tower_max[index] = float(found.get('max_hp') or 1)
+            if float(found.get('max_hp') or 1) > 0:
+                battle.tower_max[index] = float(found.get('max_hp') or 1)
             hitpoints = float(found.get('hp', 0))
+            battle.tower_hp[index] = hitpoints
+        elif found:
+            # Health unreadable this frame (the reader gives -1): keep the last reading. A
+            # glitch must not read as a destroyed tower -- that is a crown, and in overtime the
+            # end of the battle.
+            hitpoints = battle.tower_hp.get(index, battle.tower_max.get(index, 1.0))
         else:
             # Absent means destroyed only if we have seen it alive in this battle; before
             # that it is simply a tower we have not resolved, and must not score a crown.
@@ -627,49 +1084,106 @@ def build(frame: dict, health: dict, episode_id: str, deduced: dict | None = Non
         active = hitpoints > 0
         if not active and index in battle.tower_seen:
             crowns[1 - owner] += 1
+            destroyed.add(index)
         tower_rows.append((found, dict(
             entity_id=entity_id, owner=owner, tower_kind=kind,
             position=(float(x), float(y)),
             tower_troop_id=None if kind == 'king' else TOWER_PRINCESS,
             hitpoints=hitpoints, max_hitpoints=maximum, active=active)))
-        if found and found.get('address'):
-            id_by_address[int(found['address'], 16) & _UNTAG] = entity_id
+        if found and _addr(found.get('address')) is not None:
+            id_by_address[_addr(found['address'])] = entity_id
+
+    battle.towers_down = destroyed
+    for index in list(battle.tower_down_tick):
+        if index not in destroyed:
+            del battle.tower_down_tick[index]
+    for index in destroyed:
+        battle.tower_down_tick.setdefault(index, tick)
 
     archetypes = archetype_by_card()
     entities = []
     addresses: set[str] = set()
+    def resolve(e: dict):
+        """Archetype for a board object. Its own data id first (what the object IS -- the unit
+        a spawner made, the projectile of a spell); the card mapping only as the fallback for
+        recordings made before the reader carried data ids. A form FirstLight never had (an
+        evolution released after 15.535) is shown as its base unit rather than dropped."""
+        if e.get('data_id'):
+            found = archetype_by_data(e['data_id'])
+            if found is not None:
+                return found
+        if is_effect(e) or e.get('card_id', -1) == -1:
+            return None
+        card_id = e['card_id']
+        found = archetypes.get(card_id)
+        if found is None and base_card(card_id) != card_id:
+            found = archetypes.get(base_card(card_id))
+            if found is not None:
+                battle.form_fallbacks.add(card_id)
+        return found
+
     for e in frame['entities']:
-        if e['card_id'] != -1 and archetypes.get(e['card_id']) is not None and e.get('address'):
-            address = str(e['address'])
-            known_id, _age, _birth = battle.identify(address, tick)
-            id_by_address[int(address, 16) & _UNTAG] = known_id
+        if not is_tower(e) and resolve(e) is not None and _addr(e.get('address')) is not None:
+            known_id, _age, _birth = battle.identify(str(e['address']), tick)
+            id_by_address[_addr(e['address'])] = known_id
 
     def target_of(e: dict) -> tuple[int | None, bool]:
-        raw_target = int(str(e.get('target') or '0x0'), 16) & _UNTAG
+        raw_target = _addr(e.get('target') or '0x0') or 0
         if raw_target == 0:
             return None, True
         found_id = id_by_address.get(raw_target)
         return found_id, found_id is not None
 
     for e in frame['entities']:
-        if e['card_id'] == -1:
+        if is_tower(e):
             continue
-        resolved = archetypes.get(e['card_id'])
+        if not is_effect(e) and (e.get('hp', 0) < 0 or e.get('max_hp', 0) < 0):
+            # Health unreadable this frame (a building being placed or torn down has read -1
+            # for one frame). Leaving the unit out for a frame costs little; passing -1 makes
+            # the strict contract reject the whole observation, and the turn with it.
+            battle.unreadable_hp += 1
+            continue
+        resolved = resolve(e)
         if resolved is None:
             # Spell area effects are the usual case: our reader reports the spell's card id,
             # which has no entity archetype, and a strict tensorizer raises on it. Leaving the
             # entity out loses a short-lived effect; sending it in loses every decision while
             # it is on the board.
-            battle.unresolved[e['card_id']] = battle.unresolved.get(e['card_id'], 0) + 1
+            key = e['card_id'] if e['card_id'] != -1 else -int(e.get('data_id') or 0)
+            battle.unresolved[key] = battle.unresolved.get(key, 0) + 1
             continue
         global_id, kind = resolved
         address = str(e.get('address') or f"{e['x']}:{e['y']}:{e['card_id']}")
         addresses.add(address)
         entity_id, age_ms, birth = battle.identify(address, tick)
-        id_by_address[int(address, 16) & _UNTAG if address.startswith('0x') else -1] = entity_id
+        if _addr(address) is not None:
+            id_by_address[_addr(address)] = entity_id
+        if is_effect(e):
+            # A shot or spell in flight: position, velocity and what it is. It has no
+            # hitpoints, attack, movement or deploy state of its own.
+            card = e['card_id'] if e['card_id'] != -1 else None
+            velocity = battle.velocity(address, tick, e['x'], e['y'])
+            projectile = (projectile_state(e, global_id, entity_id, velocity, tick)
+                          if kind == 'projectile' else None)
+            entities.append(EntityStateV1(
+                native_data_global_id=global_id, entity_id=entity_id, owner=e['side'],
+                card_id=card, entity_kind=kind,
+                position=(float(e['x']), float(e['y'])),
+                velocity=velocity, projectile_state=projectile,
+                age_ms=age_ms, visible=True,
+                # the card is part of the handle: two shots of one kind fired on the same tick by
+                # an evolved and a normal Cannon are two volleys, and one group with two source
+                # cards makes the tensorizer refuse the whole turn
+                causal_group=CausalGroupRefV1(
+                    kind=(CausalGroupKind.VOLLEY if kind == 'projectile'
+                          else CausalGroupKind.PERSISTENT_EFFECT),
+                    handle=f"{e['side']}:{card}:{global_id}:{birth}", source_card_id=card),
+                runtime_provenance=runtime_provenance(ENTITY_RUNTIME_SEMANTIC_FIELDS, None,
+                                                      None, None, tick, projectile)))
+            continue
         target_id, target_known = target_of(e)
         attack, movement, deployment = troop_runtime(e, entity_id, tick, target_id,
-                                                     target_known, _hit_speed(e['card_id']))
+                                                     target_known, _hit_speed(card_of_unit(global_id, e['card_id'])))
         # One deployment is one causal group. Without this every unit is a singleton
         # (grouping.causal_group_key falls back to "singleton:<id>"), so a Skeletons or
         # Minions play reads as three or four unrelated individuals rather than the swarm the
@@ -710,11 +1224,13 @@ def build(frame: dict, health: dict, episode_id: str, deduced: dict | None = Non
     own_elixir = next((p['elixir_raw'] / 10000.0 for p in frame['players']
                        if p['side'] == side), 0.0)
     players = []
+    own_abilities: tuple = ()
     for p in frame['players']:
         deck = p.get('deck_card_ids') or []
         # Only the actor's own hand is private state it may see. After settlement this
         # client exposes both hands; the opponent's must still go in as public-only.
-        readable = p['side'] == side and p['hand_deck_indices'][0] != -1
+        # Our hand is ours to read even mid-draw, when one slot (possibly slot 0) is -1.
+        readable = p['side'] == side and any(i >= 0 for i in p['hand_deck_indices'])
         hand_slots = p['hand_deck_indices'] if readable else (
             (deduced or {}).get(p['side'], ([], None))[0])
         hand = tuple(deck[i] for i in hand_slots if deck and 0 <= i < len(deck))
@@ -731,14 +1247,28 @@ def build(frame: dict, health: dict, episode_id: str, deduced: dict | None = Non
             # (FORM_NORMAL = 0; evolutions would carry their own code, which we do not read).
             slot_by_card = {str(deck[i]): pos for pos, i in enumerate(hand_slots)
                             if deck and 0 <= i < len(deck)}
-            runtime_by_slot = {str(pos): {'form_code': 0} for pos in range(len(hand_slots))}
+            runtime_by_slot = {str(pos): {'form_code': int((hand_forms or {}).get(deck[i], 0))}
+                               for pos, i in enumerate(hand_slots)
+                               if deck and 0 <= i < len(deck)}
+            abilities, evolutions = own_runtime_states(p, entities, side, tick, battle,
+                                                       evo_required)
             players.append(PlayerStateV1(
-                elixir_exact=p['elixir_raw'] / 10000.0,
+                elixir_exact=own_elixir,
                 hand=hand, next_card=nxt, deck=tuple(deck), cycle=cycle,
                 private_state_visible=True,
                 metadata={'hand_slot_by_card': slot_by_card,
                           'hand_runtime_by_slot': runtime_by_slot},
+                ability_runtime_states=abilities, evolution_runtime_states=evolutions,
+                runtime_provenance=_state_provenance(
+                    PLAYER_RUNTIME_SEMANTIC_FIELDS,
+                    {**({'ability_runtime_states': (SemanticEvidenceLevel.NATIVE_DERIVED,
+                                                    ('player+0x3a0/+0x3a8 controllers',))}
+                        if abilities else {}),
+                     **({'evolution_runtime_states': (SemanticEvidenceLevel.NATIVE_DERIVED,
+                                                      ('player+0x2e8 progress vector',))}
+                        if evolutions else {})}, tick, ()),
                 **common))
+            own_abilities = abilities
         else:
             # FAIR forbids handing the actor the opponent's exact private state, even though
             # this client's memory does expose their exact elixir. Only public facts go in:
@@ -753,7 +1283,9 @@ def build(frame: dict, health: dict, episode_id: str, deduced: dict | None = Non
         phase=phase,
         players=tuple(players), towers=tuple(towers), entities=tuple(entities),
         events=play_events(plays, tick, decks, battle),
-        action_mask=action_mask(frame, side, own_elixir, reserved, towers),
+        action_mask=action_mask(frame, side, own_elixir, reserved, towers, hand_forms,
+                                own_abilities, pending_ability_sources,
+                                lead_ticks=elixir_lead_ticks, tick=tick),
         episode_id=episode_id,
         ruleset_id=ruleset_id())
     return observation, battle

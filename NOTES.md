@@ -770,3 +770,1184 @@ ability runtime (14 slots: champion / hero abilities, own and opponent), tower-t
 irrelevant for Tower Princess), projectiles in flight (5), evolution counters (4), visibility (4),
 relocation (6), capture (2), shields (2), resource (1), periodic modifier (1), and every
 combat event other than card plays. Plus ~300 ms of our own latency per play.
+
+## Comparison against FirstLight's own play loop (2026-09-25)
+
+FirstLight is public (github.com/Jaasssoooonnnnn/FirstLight_CR, commit 9f622d5), so this was
+read against their source rather than inferred. How "the one in Null's" plays
+(`native_runner/training/v4/offline_agent.py`, `evaluate.py`):
+
+  * **Lockstep.** `environment.step(commands)` advances exactly five ticks per decision; the
+    game waits for the model. Rendered play backdates the command age so a play executes on
+    the **next tick** (`_rendered_action`: `execute_offset_ticks=1`), and `PolicySessionV4`
+    hard-codes `base_latency_ticks = 1`. The model has no latency input: every checkpoint
+    was trained, evaluated and hand-tested with ~50 ms from decision to execution.
+  * Their probe supplies per-card forms (`card_parameter & 0xF`), the full combat event
+    ring (`public_card_play_events_from_combat_ring`), spell/area entities, abilities.
+  * Engine: Null's Royale 15.535.13 with content 15.535.86. This client is 160402012, a
+    later balance.
+
+What that means here, and what changed:
+
+1. **~1.2 s from decision to unit, which the policy never saw.** Tried and REMOVED
+   (user decision, 2026-09-25): showing the policy an extrapolated future board. Rejected
+   because it feeds the model invented state. What is actually in that 1.2 s:
+   * **The game's own command age: 20 ticks + 1, for everyone.** A live command carries
+     `t` (issue) and `t2 = t + 20` (FirstLight `cr_native_env.py`: "Live commands normally
+     carry a 20-tick t/t2 age"; `LIVE_COMMAND_AGE_TICKS = 20`). A human's tap waits exactly
+     as long. Offline, FirstLight backdates it (`play_immediate`, `_rendered_action`), which
+     is why their models never learned it. This part cannot be made faster by any input
+     method; it has to be *trained for*.
+   * **Our pipeline** (all ours to cut): frame staleness (reader polled every 100 ms -> now
+     50 ms, `CR_READER_MS`/`CR_QUEUE_MS`), waiting for the five-tick decision grid,
+     inference, and the tap itself. The tap was `adb shell "input tap; sleep 0.05; input
+     tap"` per play: a new adb client, a shell, two Java `input` launches, a fixed 50 ms sleep,
+     blocking the loop. Now `mac012/tapper.py`: one resident `fast_tap` over a persistent
+     adb shell, a play is one stdin line, the loop does not wait. Gesture shape
+     (`CR_TAP_MODE` place/drag, `CR_TAP_GAP_MS`, `CR_TAP_HOLD_MS`) is to be chosen by
+     `mac012/tap_bench.py` in Training Camp, not assumed.
+   * The console logs one line per play: frame age, turn wait, inference, time to tap sent,
+     gesture duration, tap -> issue ticks. That is the budget to cut.
+2. **Every card was sent as its normal form (fixed).** `hand_runtime_by_slot` and the
+   placement entries carried `form_code: 0`. The Hog specialists' deck is Hero Musketeer,
+   Evo Cannon, Evo Skeletons -- three of eight cards the policy saw as a different card.
+   `FirstLightRunner.hand_forms`: hero flag (0x2) -> form 2 always (their BattleEnv does
+   the same for hero form ids); evolution flag (0x1) -> form 1 exactly when *their tracker*,
+   fed our executed plays, has counted the evolution cycles down. Derived, not read: verify
+   on the device that the tracker's "ready" matches the in-game evo glow (see below).
+3. **The second play of a turn was always dropped (fixed).** The in-flight guard skipped any
+   tap while the previous card was still in hand (~1.2 s), and a queued own command blocked
+   all taps. So `max_micro_actions = 2` never happened and Hog + Ice Spirit, one decision,
+   was always half a play. Now every play in a turn taps; only a re-tap of a card already
+   in flight is dropped; reserved elixir is the sum of all in-flight plays until
+   issue+21; a play chosen a moment before the client credits the elixir waits (≤0.5 s)
+   until the client can place it.
+4. **Taps go by card identity, not slot.** The screen position is looked up from the card
+   the policy chose in the hand as memory holds it, so a hand that changed since the frame, or any slot
+   disagreement, cannot tap the wrong card.
+5. **Deck check.** Starting fl:hog1/fl:hog2 now logs whether the deck and forms match the
+   specialist's training deck. Out of it they are a different, weaker model (their table:
+   specialist 2 vs General 88% on its deck, 59% on others).
+
+Offline, `mac012/test_forms.py` (synthetic 3-minute match, Hog deck with forms,
+tap -> queue 3 ticks -> execute +21, reader hand/elixir changing only on execution):
+all five checkpoints, both sides: 0 decide errors, forms always equal their tracker's
+readiness, hero always offered, 88-99% of the match's elixir spent.
+
+### Roadblocks that remain (not fixable from outside the process, or need the device)
+
+* **The policy was trained with no command age.** Every live play lands 21 ticks after
+  issue and the model expects 1. Not fixable at inference time without inventing state;
+  the fix is training with the real age (FirstLight's env already has the mechanism:
+  `execute_tick` / `LIVE_COMMAND_AGE_TICKS`, backdated only for the offline viewer).
+  Related: their IL anchors each human action at `native_observable_tick`, when the unit
+  appeared, not when the human committed ~21 ticks earlier.
+* **Combat events are empty** (`events` holds only card plays). Their probe fills a 32-slot
+  channel from inside the game: damage, projectiles, shields, ability casts. Needs an
+  in-process hook, i.e. what their APK patch does.
+* **Spell entities are dropped** (Log/Fireball in flight): our reader reports the card id,
+  not the AreaEffect/projectile data id.
+* **Different game version.** 15.535 vs 160402012: any balance change since then is a
+  change the policy never trained on.
+* **Tower troop assumed Tower Princess.**
+* Things to confirm on the device, in one friendly:
+  1. `python3 mac012/tap_bench.py` in Training Camp: which gesture is accepted, fastest;
+     then the per-play "latency ..." lines in a real match;
+  2. evo readiness: when the tracker offers Evo Skeletons/Cannon as evolved, does the card
+     glow in hand? If evolutions start the match charged on this build, the tracker's
+     initial state is wrong and the fix is to seed it;
+  3. whether the hand in memory changes at tap or at execution (both are handled; the
+     answer tells which path runs);
+
+## Side-1 placements were point-mirrored (found 2026-09-25)
+
+`ScreenLayout.deployment_point` takes a CANONICAL cell (local player's view, row 0 = own back
+line; the Training Camp tap test above is the proof: canonical 170 -> native (9500, 22500) as
+side 1). FirstLight decodes to NATIVE tiles. The console passed the native cell straight
+through, so as side 1 every play went to (17 - col, 31 - row): troops aimed into the enemy half
+and snapped by the client to the nearest legal tile, spells on the mirrored lane. As side 0
+native == canonical and placements were right. This is the "madman" play the user saw; it
+predates every change in this session. Fix: `console.screen_cell`. The console now also logs
+`placement <card>: asked native (x, y), game got (x, y), off N tiles` from the queue entry,
+so a mapping error can never again go unseen.
+
+Tap benchmark (Training Camp, 4 trials each): old adb path 3/4 accepted, 148 ms gesture;
+fast_tap place gap 50/hold 34 119 ms; 30/20 71 ms; 16/16 49 ms; 8/16 41 ms; 0/16 33 ms (all 4/4);
+drag 3x10 41 ms 4/4, 2x5 16 ms 3/4, 1x17 34 ms 4/4. Default now place gap 8 hold 16.
+First live latency lines (gap 30/hold 20): frame age 5-30 ms, inference 88-134 ms, tap sent
+<=1 ms after the decision, gesture 71 ms, decision frame -> issued 4-6 ticks; then the game's
+21. Inference is now the largest part we own.
+
+## Opponent plays silently lost -- fixed (2026-09-25)
+
+Three independent ways an opponent play never reached FirstLight's tracker:
+1. **Unknown opponent deck** (Training Camp always; a friendly whose other console is not
+   running). The episode used our deck as a stand-in and filtered opponent plays by
+   `decks[opp] = ()` -> *every* opponent play was dropped, reported once per card, so after
+   the first few it looked silent. The tracker then believed the opponent never spent elixir.
+   A stale published file (fallback to any old publication) did the same for most cards.
+2. **Form ids** (evo 13xxxxxx, hero 203xxxxxx): `executed_plays` filed anything outside
+   25M..30M as an ability, and `play_events` skips abilities without a word.
+3. A queue entry whose side could not be resolved was dropped silently.
+
+Now: `viewer.card_identity` normalises any command id to (base card, form code, kind) and marks
+ids outside this build's catalog `unknown`; `FirstLightRunner` keeps the opponent's side of the
+tracker as a *registry that grows*: empty when the deck is unknown (published deck when fresh),
+every card registered the first time it is played or revealed, only a ninth distinct card
+refused. The stale-file fallback is gone. Every refused play, unknown id, unattributed play and
+ability activation is logged, once per play. Status line: `opponent deck N/8 seen (learned|
+published)`. `mac012/test_opponent_registry.py`: unknown / stale / exact deck, both sides, an
+evolved play arriving as a form id, a ninth card: 8/8 recorded, ninth refused loudly, tracker's
+opponent elixir ceiling falls on every spend, 0 decide errors (fl:hog2, fl:il, fl:general).
+
+Also: **evolution units were invisible when unit and card names differ.** Our catalog names the
+evolution *card* form (Skeletons_EV1); FirstLight's archetypes are keyed by the *unit* form
+(Skeleton_EV1), which its own card spec names (evolution Transform `summoned_form`). Evo
+Skeletons, Barbarians, Bats, Recruits, Royal Hogs, Wall Breakers now resolve; forms FirstLight
+never had are shown as the base unit and logged (`mac012/drift_check.py` lists them: Goblin
+Barrel, Zap, Snowball evolutions).
+
+## Delay: what FirstLight trained with (verified in source, 2026-09-25)
+
+* PPO self-play: a play executes `base_latency_ticks (1) + policy delay offset (0..4)` ticks
+  after the decision (`decoding._timing_metadata`, `resident_batch_vector.queue_hand_action_at`).
+  No 20-tick command age.
+* Imitation: each human play is keyed by its source command tick (the execution boundary, +1 for
+  the observable state) and paired with the decision turn 0..4 ticks before it
+  (`expert.decision_tick_for_action`). The human committed ~20 ticks earlier; the model learned
+  to act on a board it could only have seen at execution.
+* Pending commands: `ObservationV1.pending_actions` is own-side only, empty in policy
+  observations (`policy_features_only`), and never read by the tensorizer. The model has no
+  input for a queued command of either side.
+* Live: decision frame -> issued 4-6 ticks (ours) + 21 (game) = the play lands ~1.3 s after the
+  board it was chosen on. Opponent commands are in our queue before they land;
+  `mac012/queue_lead.py` measures how early from any recorded session.
+
+So for a model that fits the real game: train with the 21-tick command age (plus measured
+round trip) and give it pending commands of both sides as an input, with their execute ticks.
+Neither fits inside the current checkpoints.
+
+## Real-game inputs vs cr-native-sandbox vs FirstLight (2026-09-25)
+
+cr-native-sandbox's live path (`mumu_live_private_sampler.c` + `mumu_live_controller.py`):
+entities (category, side, x, y, card id, level, hp, max hp, behaviour), players (elixir, hand,
+cycle, next, deck ids, form flags, refill timer). Enemy cards learned from board units only (no
+spells). No command queue, no reveal list, no attack state; its controller has fields for
+per-unit ability state but its reader never fills them. **Our reader is a strict superset**
+(+ attack stage/timers, charge, deploy remaining, target; + queue_probe: both sides' commands,
+accounts, reveal lists, received-tick gap).
+
+Still not supplied to the model (FirstLight fields left empty), in order of likely value:
+1. **Hero / champion ability runtime** (player `ability_runtime_states`, mask `ability_sources`)
+   -> the bot *cannot* use an ability: the mask never offers it and the console dropped
+   non-card actions. Training covered it (the Hog specialist's deck has Hero Musketeer).
+   Source on 15.535: controllers at player+0x3a0 (+0x78 cooldown, +0x80 charges, +0x98 button,
+   back-pointer +0x20). `src/runtime_probe.c` finds them on this build.
+2. **Evolution progress** (player `evolution_runtime_states`): derived from their tracker today;
+   our catalog and FirstLight disagree on cycles for 29 cards (Skeletons 3 vs 2, Ice Spirits
+   1 vs 2, Cannon 3 vs 2). 15.535 source: player+0x2e8 progress vector; the probe finds it.
+3. Pending commands (both sides) -- needs a new model input (see Delay).
+4. Combat events, spell/projectile objects, shields, statuses, tower troop identity.
+Deliberately not supplied (FAIR tier): opponent exact elixir, although the client holds it.
+
+## Maintenance after a game update
+
+What breaks, and where it shows:
+* libg SHA / offsets (manager RVA, component vtables, player struct, queue entry): the reader
+  refuses the build ("reader not attached - unverified build"); re-run the scans.
+* New cards / forms: live_card_catalog.json must be regenerated from the build; until then the
+  console logs `queue: card id N is not in this build's catalog`.
+* FirstLight's catalog is frozen at 15.535: `drift_check.py` lists cards/forms it cannot
+  represent; the console logs refusals and unit fallbacks per match.
+* Balance changes: invisible to the frozen checkpoints; only retraining fixes them.
+
+## Device results, 2026-09-25 (runtime_probe, screenshot, queue_lead)
+
+**Ability controllers: same offsets as 15.535.** player+0x3a0 and +0x3a8 (slots 1, 2), found
+by the back-pointer (+0x20 == player). Selected character (+0x90 -> +0x40) matched FirstLight's
+archetype ids exactly: 130283371 = Hero Musketeer, 2979504115 (printed signed, -1315463181) =
+Hero Ice Golem. Observed: charges (+0x80) -1 (no hero bound) / 1 (unused) / 0 (used); configured
+cooldown 0 (hero abilities are single-use, per the user: usable once, when the hero is on the
+board and elixir suffices); button state (+0x98) takes 0, 1, 2, 6, 9 -- meaning still to be
+mapped (log it next to "hero on board / enough elixir / used"). action data id 1171272209.
+**Evolution progress: player+0x2e8, unchanged.** One int per deck slot. Evo Skeletons went
+0 -> 1 -> 2 -> 0: two normal plays, then the evolved play resets it. So the requirement is 2 --
+FirstLight's number is right for this build, and our catalog's `evolution_cycles` (3) counts
+the evolved play too. Keep the tracker on FirstLight's counts; better, read this vector.
+**Ability buttons** (screenshot, 1440x2560 device): one hero -> the button is at the LEFT;
+two heroes -> left and right. Measured centres ~(140, 1955) and ~(1300, 1955), just above the
+hand. (User setting decides placement with two heroes; default is both sides.)
+*Superseded the same morning:* on the account in the 07:55 friendly a single hero's button was on
+the RIGHT (centre ~(1295, 1965)), and both left-side taps did nothing. The side is per account;
+the console now learns it (see "Friendly 2026-09-25 07:55").
+**Command lead** (queue_lead, 107 commands): opponent commands are in our queue a median
+14 ticks (700 ms, p10 11, p90 18) before they execute; ours 13. Issue -> our queue ~7-8 ticks.
+
+## HANDOFF (cloud session -> local session, 2026-09-25)
+
+Branch `main-8x1wxo`, everything pushed. FirstLight source is at
+~/Documents/GitHub/FirstLight_CR (override: FIRSTLIGHT_ROOT); native_core comes from the
+cr-native-sandbox checkout the profile already uses.
+
+Offline checks (all passing at handoff):
+    python3 mac012/test_forms.py fl:hog2 fl:il
+    python3 mac012/test_opponent_registry.py fl:hog2
+    python3 mac012/test_firstlight_churn.py
+    python3 mac012/drift_check.py --deck <ids>
+
+Done this session: side-1 placement mirroring fixed (verified live: 0 tiles off), resident
+fast_tap (place gap 8 / hold 16), 50 ms reader/queue polling, per-play latency + placement
+log, both plays of a turn tapped, evo/hero hand forms, opponent deck learned card by card
+(no silent drops), evolution units visible, form ids normalised, drift/queue-lead/runtime
+probes. The latency extrapolation was tried and REMOVED at the user's request -- do not
+reintroduce predicted board state.
+
+Next, in order:
+1. **Hero ability (implementation, not training).** Add to live_sampler_tbi.c per player: the
+   two controllers at +0x3a0/+0x3a8 (charges +0x80, button +0x98, character +0x90->+0x40) and
+   the progress vector at +0x2e8. Map button states. Then in firstlight_obs: own
+   `ability_runtime_states` (ability_id from the catalog, elixir_cost, charges, available,
+   attributes.controller_slot, attributes.source_card_id, source_entity = the hero unit's
+   entity id) and `action_mask.ability_sources` + kinds[activate_ability]; see FirstLight
+   training/v4/native_actions.ability_runtime_contract for exactly what is required. Console:
+   stop skipping ACTIVATE_ABILITY; tap the left button (right = second hero's slot 2).
+2. **Evolution state from memory** (+0x2e8) instead of the tracker derivation; fill
+   `evolution_runtime_states`.
+3. **Opponent deck memory** (user's list): remember revealed cards per opponent account
+   across matches; optional RoyaleAPI lookup by player tag and popular-deck completion as a
+   *prior* (not ground truth); evolution cycles tracked for the opponent too.
+4. **Pending commands** (both sides, ~700 ms of warning): a separate input type from real
+   troops, per the user. Needs a model input -> part of retraining, not the current
+   checkpoints.
+5. Retraining plan: command age 21 + measured round trip in the engine, IL aligned to the
+   human's decision (execute - 21), CLIENT-tier inputs (pending commands, exact own ability
+   and evolution state), oracle-tier critic.
+Reader already has attack wind-up (atk_stage / atk_timeline / atk_load) and movement charge
+progress (+0x1e0, Prince / Dark Prince charge) -- Sparky's charge is its attack load.
+
+## Overnight session, 2026-09-25 (local): hero/evo into the model, every turn reaches the policy
+
+**Hero abilities + evolution progress (read from memory).** Reader: per player, controllers at
++0x3a0/+0x3a8 (back-pointer checked; +0x78 cooldown, +0x7c configured, +0x80 charges, +0x98
+button, +0x90->+0x40 selected character) and the +0x2e8 progress vector. From the saved device
+run (build/runtime_probe.jsonl): controllers present for both players in 513/513 samples; the
+controller's action data id (1171272209) is identical for EVERY controller, so the selected
+character is what identifies the hero (130283371 Hero Musketeer, 2979504115 Hero Ice Golem =
+FirstLight's archetype ids). Button enum = FirstLight's ABILITY_BUTTON_STATE_LABELS exactly
+(1 ChampionAbsent, 2 Ready, 6 AllChargesConsumed, 9 NotEnoughElixir seen); the full lifecycle
+absent -> Ready -> used -> absent -> Ready (replayed) is in the run. Evolution vector index =
+our deck order (Cannon slot 2 read 2; Skeletons slot 0 counted 1 -> 2 -> 0). Ability joined
+character -> hero form -> base card -> the card's single FirstLight ability (Musketeer_hero_
+Ability 3 elixir, IceGolemiteHero_Ability 2). Offered under BattleEnv's legality rule.
+FirstLight's V4 contract: <= 2 heroes, <= 2 evolutions, <= 3 special cards per deck -- every
+recorded deck fits (the game allows 3 special slots). Hog specialists' training deck: Hero
+Musketeer, Evo Cannon, Evo Skeletons, plain Ice Golem (user's deck, per user, is that one;
+the Hero Ice Golem was a temporary test). Training Camp gives a preset deck with no heroes or
+evolutions, so these reads are verified offline (test_hero_evo) and against the device run,
+not yet live -- first friendly with the hero deck is the live check.
+
+**Missed decision turns: two causes, both fixed, verified live.** The log now breaks a missed
+turn down (previous turn prep/decide/after, time away, frame age). Findings:
+1. After every play the played slot reads -1 for 50-550 ms while the next card is drawn (the
+   card is already at the end of the cycle, so hand + cycle still partition the deck). The
+   console skipped the turn; the two longest draw gaps were exactly the two missed turns.
+   FirstLight's env keeps deciding with the slot unplayable -- now so do we; the builder also
+   treats our hand as ours when slot 0 is the empty one.
+2. First decision of a match: 461 ms (torch cold start) -> `FirstLightRunner.warm_up()` at load.
+   Late-match 638 ms observation build that never reproduces offline (<= 18 ms) -> Python
+   full-GC pass over the model + catalogs -> `gc.freeze()` after load.
+Live Training Camp (fl:hog2, side 1), after both fixes: 0 missed turns, 0 errors, 35/35
+placements exact (0.0 tiles), inference 72-93 ms. `mac012/replay_decide.py` replays any
+recording through build -> decide: 4 recorded matches, 2,587 decisions, 0 errors, draw-gap
+turns included.
+
+Also: input coverage on a live match with the new reader -- unit target 83%, attack cooldown
+25%, windup 10%, deploy 12%, tower target 87% (all 0% before). Remaining zeros for units and
+towers are projectile-only slots, shields, visibility, abilities-on-entity: the known gaps.
+
+## The console is a native Mac app now (2026-09-25 overnight)
+
+`Clapha.app` (SwiftUI, built by `app/build.sh`, no Xcode project; `Clapha Consoles.command` opens
+it). One window for everything: both devices side by side (live board drawn from our side,
+hand, both elixir bars, battle clock, reader health), one **Off · Watch · Play** switch per
+device (Watch = the model decides every turn and logs what it would play, no taps; Play = it
+taps; the old start/stop + "armed" checkbox is gone), the model as a short list with the
+running one marked, the bot log, and a Tasks panel (input report for the last match, replay
+the last match through the model, hero/evolution checks, all-cards sweep, tap benchmark,
+bot log). Top bar: Start everything (emulators, tool rebuild/push, both engines -- no browser
+tabs), Stop engines, Check devices. A banner says so when the engines are not running.
+
+The Python engines stay as the tested backend (the decision loop is unchanged); the app talks to
+them over localhost. New engine endpoint `/api/mode?mode=off|watch|play&model=...`: watch <-> play
+on the same model only flips taps, so the episode and recurrent state carry on; a different
+model restarts cleanly (joins the old loop first).
+
+Performance: 3-7% of a core while polling at 4 Hz in battle / 1 Hz otherwise. It started at 38%:
+SwiftUI's @Published fires on every assignment, even an unchanged one, so setting
+`reachable = true` each poll re-rendered the whole window 8x a second; plus board / summary /
+log are now separate observable objects so only what changed is redrawn.
+
+Verification without a display: `app/snapshot.sh` renders the window off-screen from recorded
+engine states (app/fixture_*.json) to build/app_snapshot.png; `build/app.log` records startup
+and polling. Native AppKit controls cannot be drawn off-screen, which is one reason the mode
+switch and model list are plain SwiftUI (the other: they are clearer).
+
+## Objects resolved by their own data id: spawned units fixed, projectiles visible (2026-09-25)
+
+`src/ent_probe.c` listed every object in a live battle, unfiltered, with object+0x48 -> +0x40 (the
+object's own data record, FirstLight's kObjectDataOffset). Findings:
+- For every unit, that data id IS FirstLight's archetype global id (Knight 34000000 = form:Knight,
+  Goblins 3565953160 = form:Goblin_Stab, ...).
+- **Spawned units were mislabelled by our card-based mapping.** A Battle Ram's Barbarians carry
+  the Battle Ram's card (+0xAC 26000036) but data 34000009 (Barbarian); a Tombstone's Skeletons
+  carry the Tombstone's card (27000009, a building archetype) but data 34000008 (Skeleton). Every
+  spawner card (Tombstone, Witch, Battle Ram, Goblin Hut, Furnace, Graveyard...) was affected.
+- **Projectiles were in the entity list all along, dropped by our reader's kind filter**: kind 0,
+  category 4xxxxxx, data = ProjectileData (Fireball 10000000, Archer arrow 10000002, Musketeer
+  10000014, Bomber 10000010, tower shots 10000003 with card -1).
+- Tower shots are card -1 like towers and spawn on the tower's tile -- anything recognising towers
+  by card -1 must also require a tower object kind (12/13). Fixed in firstlight_obs, viewer,
+  model_adapter, calibrate.
+Reader now emits `data_id` and keeps kind-0 objects whose data is ProjectileData (10xxxxxx) or
+AreaEffectData (22xxxxxx). Builder resolves every object by data id first (card mapping only as the
+fallback for older recordings); projectiles get FirstLight's ProjectileStateV1 (in flight,
+velocity, source card, data id; damage/radius from their archetype as their probe leaves them).
+Spawned units use their own unit's hit speed. `mac012/test_effects.py` covers it. Live Training
+Camp: 39 plays, 0 errors, 0 missed turns, 37/37 placements exact; over 729 decisions 13.9% of
+unit rows were projectiles in flight; unit features filled 17 -> 22 of 72; slots empty for lack
+of data 47 -> 44. Still missing for projectiles: destination and homing.
+
+## Staying current (2026-09-25)
+
+- `mac012/update_check.py`: installed build per device vs the reader's certified build (version +
+  libg SHA from the device's own install), card catalog stamp, and whether FirstLight /
+  cr-native-sandbox upstream moved. `--pull` copies a new build from the device into
+  runtime/<version>/ (git-ignored; nothing downloaded), decodes its tables and diffs cards; the
+  report lists every pinned value that must be re-derived and the probe that does it.
+- `mac012/game_data.py`: reads the build's LZMA tables (Supercell's short header) from the pulled
+  APK. `mac012/update_catalog.py` brought live_card_catalog.json from 15.535.29 to 160402012:
+  152/152 ids and names unchanged, no elixir changes, one new card (MinionGiant 26000107, 4).
+  `PrestigeCount` is where the old catalog's evolution cycles came from; it is NOT the play count
+  (Skeletons 3, measured 2) and no single rule maps it (PrestigeCount-1 fits 19/42 of FirstLight's
+  numbers) -- so the console measures the requirement from the game instead: a deck slot's
+  progress counter falling from k to 0 means the card needs k (build/evo_cycles.json).
+- FirstLight: the user's download predates the whole Sept 23-24 series. **Models identical**
+  (SHA-256 = upstream manifest); code behind in 14 files incl. policy_session.py and
+  offline_agent.py. Upstream now clones into ref-firstlight/ (git-ignored) and is the default
+  root; every test passes on it. Upstream changes that matter: their human-vs-AI loop still
+  samples; their new AI-vs-AI duel decodes greedily (force_act is only a manual GUI button); their
+  offline engine executes plays on the next tick (backdated command age) -- the policies trained
+  with ~1 tick, the live game has 21. Console decoding is now Auto (sampled vs a human/bot,
+  greedy when the other device runs a model against us), Sampled or Greedy.
+- GPU (MPS) inference is slower than CPU for this batch-1 recurrent model (137 vs 106 ms).
+
+## Friendly 2026-09-25 07:55 (fl:hog2, device 1 vs the main account) -- what memory shows
+
+Recording artifacts/viewer-sessions/20260925T115451Z (one battle, ticks 0..5040).
+- Input/timing healthy: every placement checked landed exactly (0.0 tiles), inference 83-123 ms,
+  tap -> issued 5-6 ticks, and each play shows in the hand ~1.3 s (26 ticks) after the decision.
+- **Evolution live:** "evolution requirement measured: Skeletons needs 2 plays" from +0x2e8.
+- **Hero ability taps missed.** The policy chose Musketeer_hero_Ability at t=106.5 and 109.8 s;
+  the console tapped (140, 1955) because the rule said "one hero -> left". Memory: controller 1
+  button stayed 2 (Ready) with 1 charge and elixir never dropped by 3; screenshot at t=203 shows
+  the button on the right. Fix: `_ability_side()` -- one hero defaults to RIGHT, two heroes left
+  for slot 1 / right for slot 2, and a tap that leaves the button Ready with the same charges for
+  2.5 s flips the side for that account (build/ability_buttons.json), logged once.
+- **The "repeated" Cannon/Log were taps after the battle was over.** Opponent's left princess tower
+  fell between t=235 and t=248 in overtime (sudden death -> the bot won). From t=246.1 no command
+  executed (hand frozen, elixir only rising) while the client's clock ran to 5040 and accepted
+  taps. Fix: `FLO.battle_result()` (king tower; unequal crowns at/after full time; tiebreak at
+  6000) + `OutcomeLatch` in the console: acted on only after holding 0.5 s, withdrawn if a tower
+  reappears; then no taps, deferred plays dropped, one line in the log and in build/results.jsonl
+  (model, sampled, side, won, reason, tick, plays, opponent account).
+  `mac012/test_battle_result.py` replays every recorded battle through it: ~75 battles, no
+  result ever withdrawn, none decided more than ~6 s before its recording's clock stopped. It also
+  found the one wrong verdict: a finished battle still on screen when the viewer restarted (frozen
+  at tick 5700) lost tower objects one by one as the client tore it down, reading a win as a loss.
+  No verdict now until the clock has moved while we watch (the console never acts on a frozen
+  clock anyway; this keeps results.jsonl honest when a console starts on a finished battle).
+- **Unreadable health crashed whole frames.** Session 20260925T010215Z tick 2863: a Tombstone read
+  hp -1 / max -1 for one frame -> EntityStateV1 contract error -> "decide failed", turn lost.
+  Units with health < 0 are now left out for that frame (`battle.unreadable_hp` counts them);
+  a tower with unreadable health keeps its last reading (a -1 would have counted as destroyed --
+  a crown, and in overtime the end of the battle).
+- **Evolution requirement mis-measured at every battle start.** `_measure_evolutions` compared
+  against the last snapshot from the previous battle; every counter starts a battle at 0, so a
+  battle that ended with Skeletons/Cannon at 1 logged "needs 1 plays (was 2)" at 09:34:29 and fed
+  the model a one-play evolution until the real evolved plays (09:36) measured 2 again. Now only
+  a fall inside one battle (same battle pointer, clock moved forward <= 100 ticks) counts; replayed
+  on the session that holds both battles, it keeps the two genuine measurements and drops the two
+  boundary ones. (The viewer session file keeps growing across battles while the viewer runs:
+  20260925T115451Z holds the 07:55 and the 09:34 battles.)
+- Device 2's console said "Clash Royale is not running" -- correct: the game was not open there.
+- **"load failed: No module named 'torch'" after Start everything (10:38).** The app runs tasks in
+  a login zsh, which does not read ~/.zshrc, where conda puts miniforge on PATH; `python3` there is
+  python.org 3.14 without torch (the 07:54 consoles had been started from a terminal). `./py` now
+  runs the first Python that has torch ($CLAPHA_PYTHON, cached choice in build/python_path,
+  PATH, miniforge/conda/Homebrew locations); start-consoles.sh and every app button use it.
+
+## Sandbox from the latest libg: assessment (2026-09-25)
+
+What it takes (cr-native-sandbox docs/SANDBOX_RUNTIME_TECHNICAL #27): freeze hashes; relocate
+JNI_OnLoad, key functions and struct offsets; re-verify DataTables/map resources; regenerate card
+and form catalogs; re-verify Replay, six towers, tower HP, RNG, public hashes; deploy, abilities,
+grid, tick; reset/time/elixir/terminal certificates. Their engine host (android_probe: Java JniHost
++ 7,859-line jni_bridge.cpp) loads the game's own libg into its own process and drives battles by
+calling internal functions -- every address pinned to the x86_64 15.535.29 build.
+- Their route runs x86_64 libg in an x86_64 AVD (Windows/Hyper-V) or x86_64 Linux. Not on this Mac.
+- Their ARM64 bring-up (IMAX9D/cr-native-linux-bionic, branch port/arm64-160402002-bringup,
+  2026-09-08, 160402002): ARM64 Bionic entry, real ART, FMOD, Sentry load; **libscid_sdk
+  SIGSEGVs during init** (indirect call at RVA 0x17b170 jumps to unmapped 0x681780 right after
+  reading /proc/self/maps); libg JNI_OnLoad fails the same way. Tested only under QEMU (user and
+  system emulation); they could not tell emulation artefact from a real environment requirement.
+  No battle ever created.
+- FirstLight's engine patches a Null's (private server) APK with their probe. Doing that to the
+  official current client is modifying the official app -- not done.
+- This Mac is native ARM64 and MuMu is a real ARM64 Android, the one environment their research
+  never had. Tools present: build-tools 36 (d8, aapt2, apksigner), platform 37, JDK 21/25, NDK 28.
+  The current build's APK splits are in runtime/160402012/ (SHA256SUMS), libg SHA = profile.
+Plan, in order, each a go/no-go gate:
+  1. Load gate: a minimal ARM64 host APK in a fresh, separate MuMu instance (not a game device)
+     loads libc++_shared, FMOD, libscid_sdk, then libg with JNI_OnLoad -- does SCID init pass on
+     real ARM64 Android? (Their blocker; decides whether the rest is possible.)
+  2. Relocate the host's entry points on 160402012 ARM64: resource/DataTables init, GameMain,
+     Replay/Scene creation, tick, card command, ability command, reset -- from exported JNI
+     symbols, the JNI registration table and string xrefs. No reuse of x86_64 RVAs.
+  3. Certify against the live client: same deck, same commands -> same towers/HP/elixir, using the
+     reader's live frames as the reference (we can read both).
+  4. Throughput and multi-battle stability; then training with the real 21-tick command age.
+Realistically weeks, not a night; gate 1 is a day and tells whether it is feasible at all.
+
+## Sandbox gate 1: result -- closed on ARM64 (2026-09-25 morning)
+
+Test app `sandbox/loadprobe/` (Java ProbeActivity + build.sh; aapt2/d8/apksigner, no INTERNET
+permission, extractNativeLibs) bundling the build's own ARM64 libs from
+runtime/160402012/apks/split_config.arm64_v8a.apk (build output git-ignored: it contains the
+game's libraries). Ran in a fresh MuMu instance created for it (never signed in, no game
+installed), then deleted; the game devices were not touched.
+- Order c++_shared, fmod, fmodstudio, sentry, sentry-android, scid_sdk, g: **libscid_sdk SIGSEGV**
+  (SEGV_MAPERR, pc 0x68d9c0 unmapped, lr libscid_sdk+0x173644) -- the same failure the
+  cr-native-sandbox authors saw under QEMU (RVA 0x17b170 -> 0x681780 on 160402002). Not an
+  emulation artefact. (FMOD's JNI_OnLoad returns a bad version when loaded standalone; harmless.)
+- Why: the ARM64 libscid_sdk.so (2.0 MB; x86_64 15.535 copy is 14.7 MB) and libg.so are packed:
+  5 section headers, extra loader LOAD segments (libscid 0x178000/0x1a0000, libg 0x1ab8000/
+  0x1ae4000), rwx mappings in the live game. libg's code is **encrypted on disk**: live code pages
+  differ from the file (0.4% equal bytes), entropy 7.99 bits/byte on disk vs 6.69 in memory.
+  The game loads libsupercell_clashroyale.so first (dzmxszrox.aI, from the Application) --
+  its protection runtime; 0x68d9c0 lies inside that library's size, i.e. the unpacker calls into
+  it and jumps to base 0 when it is absent.
+- Loading libsupercell_clashroyale first: loads in 95 ms, then the process vanishes (no tombstone,
+  no ApplicationExitInfo) -- consistent with it refusing to run inside anything but the genuine
+  app. Going further means spoofing the game's identity, patching the protection or dumping the
+  decrypted code: circumventing anti-tamper. **Not done; the ARM64 route is closed.**
+- Remaining in-bounds route = cr-native-sandbox's: x86_64 libraries (their 15.535 x86_64 libg
+  loads without the protection library) in an x86_64 Android. Needs the current build's
+  split_config.x86_64.apk from an official install on an Intel/AMD device (the user's own Play
+  install; nothing from mirrors) and an x86_64 host to run it. Unverified whether the current
+  x86_64 build is packed too.
+- Consequence for staying current: offsets cannot be re-derived from the file offline.
+  `mac012/rederive.py` does it from game *data* during one battle (find_manager -> reader checks
+  on hand/elixir/deck/towers/units -> comp_probe classification of the attack and movement
+  vtables), writes build/rederive_<version>.json, and with --apply updates mac_profile.py and the
+  reader's #defines. Checks tested on recordings; not yet run live (`--force` on the current build
+  must re-find 0x1A57E88 / 0x28 / 0x193ad50 / 0x193aeb8).
+
+## Opponent hero abilities charged to their elixir (2026-09-25, cloud session)
+
+The queue shows an opponent activation only as card id 65535; it was logged and dropped, so
+FirstLight's tracker believed the opponent kept that elixir. Now
+`FirstLightRunner.attribute_opponent_abilities` joins each one to the hero that cast it, using
+the opponent's controllers the reader already emits (selected character -> hero card): the only
+hero, or with two heroes the one whose charges are spent and not yet attributed. The hero card
+gets FirstLight's ability contract in the tracker (cost, charges, cooldown), and play_events
+sends a public `ability_activation` with `fair_ability_activation_exact`, so the tracker takes
+the exact cost off the opponent's elixir ceiling. Unjoinable activations are logged, never
+guessed. `mac012/test_opponent_ability.py`: one hero and two heroes, both sides: ceiling falls
+by the ability's 3 elixir (2.82 after 10 ticks of regen), 0 decide errors. Suites re-run:
+opponent_registry, hero_evo, effects -- OK. Not yet seen live: needs a friendly where the
+opponent account uses a hero ability (log line "opponent used <hero> hero ability").
+
+## TRAINING BRIEF (start here for the training session, 2026-09-25)
+
+Facts the new model must be built around:
+- **Command delay is part of the game:** every command executes at issue + 21 ticks (1.05 s),
+  for humans too. Our own overhead on top: ~4-6 ticks decision -> issued (inference 70-130 ms,
+  tap ~40 ms). FirstLight trained with ~1-5 ticks (self-play) and IL aligned to execution, so
+  its models never learned the delay. Plan: train with the real age (FirstLight's engine
+  supports scheduled execution), ideally with the delay as an input so a change needs no retrain.
+- **Opponent commands are visible ~0.7 s (median 14 ticks) before they land** (queue_lead.py).
+  The model should get them as "pending", distinct from real units.
+- **Readable live, per 50 ms frame:** units (position, hp, attack stage/timers, charge, deploy
+  remaining, target, own data id), towers, projectiles/area effects in flight, own hand / next /
+  cycle / elixir, both elixirs (opponent's exact, excluded by FAIR), evolution progress
+  (player+0x2e8), hero ability controllers both sides (+0x3a0/+0x3a8), command queue (both
+  sides), reveal lists. Opponent hand/cycle: NOT available mid-battle (proven).
+- **Opponent deck:** API deck by player tag (opponent_intel.py), trusted until contradicted;
+  otherwise learned card by card. Recorded per match.
+- **Not read yet:** combat events (damage, stun/freeze, rage, shields), tower troop identity,
+  per-turn decision logging. Decide per the chosen input set.
+- **Data on disk per match** (artifacts/viewer-sessions/<time>/): frames.jsonl (20 Hz board),
+  queue.jsonl (every play/ability, both sides), opponent_intel.jsonl; results in
+  build/results.jsonl. Human matches recorded too -> imitation data aligned to *decision* time.
+- **Tiers:** deployable = what this client holds; an oracle (opponent hand) cannot run live ->
+  use only as critic/teacher.
+- **Robustness:** prefer inputs a screen reader could also supply; memory-only extras are a
+  bonus (root/memory access could be closed by a game update).
+- **Compute / sandbox:** the ARM64 game library is encrypted and runs only inside the real app
+  (gate 1 closed). An x86_64 sandbox needs an Intel/AMD PC (campus Windows + 4080, or a
+  friend's) -- first test: is the current global x86_64 library readable.
+- **Baseline to beat:** FirstLight fl:hog2 via our pipeline, 3-1 vs the user's main account in
+  friendlies (all overtime); results logged per model.
+
+## Null's engine setup (CR_4k), checked 2026-09-25 evening
+
+- **Evo Elite Barbarians is in the engine's data.** CR_4k runs FirstLight's offline engine: Null's
+  libg SHA 110aa2b5... (same file as cr-engine-extraction/binary) with content 15.535.86
+  (fingerprint.json SHA-256 e0cb2fb9..., 986 update files incl. angry_barbarian_evo.toml). The
+  old converter lost it because it used the 15.535.29 sandbox's card list, not the engine's data.
+- **The "four lazily-fetched files" are not missing.** ghost_ev1, goblin_hut_rework,
+  hero_form/balloon_hero_spell and skeleton_balloon_ev1 are inside the Null's APK itself
+  (assets/csv_logic/...), byte-identical (SHA-1) to the fingerprint's entries. No fidelity issue;
+  the old MACOS-PORT note was wrong.
+- **Null's "broken" = full disk.** files/crlive (the probe's per-battle recordings, ~106 MB per
+  match) had filled the 10 GB AVD; an interrupted content update left fingerprint "15.535.3" with
+  most update files gone. Recordings (129 files, 4.3 GB, md5-verified) moved to
+  cr-engine-extraction/macos-port/recordings/crlive_emulator_2026-09-25/; official Clash Royale,
+  APKPure and their downloads removed (user's instruction: only Null's on that device). The
+  client then re-downloaded 15.535.86 and reached the menu. 6+ GB free = ~60 recorded battles:
+  offload crlive periodically.
+- The Sep 10 backup /data/local/tmp/gamedata.tgz holds the same 15.535.86 content (same
+  fingerprint) if the update directory is ever damaged again.
+
+## Replay conversion: from 126-256 s to ~8 s per replay (2026-09-25 evening)
+
+- **FirstLight's cache builder was the bottleneck, not the engine.** Profile of one replay: 245 of
+  256 s waiting on the engine, ~0.6 s per five-tick step, and the run died at ~256 s. The engine
+  itself simulates ~38,000 ticks/s (step(1000) = 0.03 s); a plain observe is ~4-7 ms. The cost was
+  its rich/atomic snapshot: **7.8 MB and ~0.3-0.7 s per call on a 12-unit board**, almost all event
+  histories (combat, phase, movement, state, visibility rings) appended to every snapshot.
+- **`observe-lean`** (probe command, `il/probe_observe_lean.patch` against FirstLight_CR's
+  probe, deployed to CR_4k): the rich snapshot's per-unit runtime state and players without event
+  histories or component inventories. 4.6 ms / 42 KB; every per-unit field and both players
+  identical to observe-rich. Training inputs are limited to what a snapshot shows, as live.
+  Deployed library md5 05247d1a...; the original (0883d753..., byte-identical to a clean build of
+  the unpatched source) is saved on CR_4k at /data/local/tmp/libcrprobe.installed-2026-09-25.so
+  and the source backup in runs/probe_backup_2026-09-25/ (git-ignored).
+- **`il/engine_convert.py`**: prepare + calibrate (0.1 s), create the match headless, queue every
+  recorded card play at its exact execute tick (queue_hand_action_at, FirstLight's tile +
+  sub-cell conversion), hero abilities by FirstLight's rule (newest ready unit of the named card),
+  a lean snapshot every decision tick, then the end state against the recording (winner, crowns,
+  all six towers' final HP). 9 test replays: 4.8-13.5 s each (~8 s), 8/9 winner and crowns right,
+  4 exact to the tower HP; the one failure had two abilities no unit accepted.
+- **CR_4k boot snapshot.** Every boot restored a snapshot saved 2026-09-24 17:14, an hour after an
+  interrupted content update, with a full disk: that is why Null's stayed broken and why fixes
+  vanished after a restart (the console boots with -no-snapshot-save). Redone (recordings
+  md5-verified against the Mac copy and removed; official CR, APKPure and their downloads removed;
+  content re-downloaded, 15.535.86 / 986 files) and saved as the new default_boot at the Null's
+  menu with network, 7 GB free and the lean probe installed.
+- **Why FirstLight looks stronger in its video:** in its sandbox the AI's plays are queued with
+  execute_in_ticks = max(1, offset 0-4) and the engine backdates the command 20 ticks
+  (battle_env.py, cr_native_env.queue_hand_action_at): the AI's card lands 1-4 ticks after it
+  decides, while a human's tap takes the normal ~21. No bot can do that in the live game.
+
+
+## Conversion at ~1.7 s per game; training samples through the live code (2026-09-25 night)
+
+- **Conversion speed.** FirstLight's client opened a new TCP connection per request (~5 ms each);
+  its persistent control session halves the time (8.3 -> 4.3 s per replay). The probe's new
+  `run-lean UNTIL EVERY` command (il/probe_observe_lean.patch) steps the headless battle to the
+  next recorded play and returns every decision-tick snapshot on the way in one reply, without the
+  provenance/capability tables (the same in every snapshot; kept once in meta.json), plus the plain
+  observation's elixir/hand/cycle/deck/crowns ("state"; the rich snapshot's players have none of
+  that). ~1.7 s per Hog 2.6 game (they are long, ~1,100 snapshots); identical to the step +
+  observe-lean reference on every board and state field. Probe build: runs/libcrprobe_run.so
+  (md5 d59657b8...), installed on CR_4k. tools/play_firstlight.sh still swaps in FirstLight's
+  attested probe for its sandbox.
+- **Not reproducible, excluded from inputs:** phaseRuntime's hook fields (attack/movement/deploy
+  StepTick/Input/Output, movementDelta, effectiveMovementSpeed) differ between two runs of the
+  same replay in the same mode: they carry values over from earlier battles in the engine session.
+- **Output:** runs/conv-hog26 (git-ignored): one zstd file per replay (il/frames.py, ~170 KB),
+  index.jsonl, resumable, --shard i/n to split machines, relaunches the engine if it stops
+  answering. Full Hog 2.6 run (14,040 games) started 20:55, ~6.5 h on CR_4k. So far: 74% exact
+  (towers within 100 HP), 94% right winner, 2% refused by FirstLight's deal calibration (decks
+  with several cards barred from the opening hand). Three-crown games: the recording lists all
+  the loser's towers at 0, so only the king is compared.
+- **Samples: il/samples.py.** Engine snapshot -> the reader's frame format -> firstlight_obs.build
+  and FirstLightRunner in teacher mode (mac012/firstlight_bot.py, model None) -> FirstLight's
+  tensorizer; labels re-timed (il/timeline.py) and aligned by FirstLight's own
+  build_expert_action_batch. ~6 s of CPU per game side. Rules and measurements in il/SPEC.md:
+  screen hand/elixir, elixir counted at the tap (firstlight_obs `elixir_lead_ticks`, default 0 =
+  unchanged live behaviour), 93-94% of labels aligned.
+- **L is the execution tick** (confirmed: plays' elixir spare at L peaks at 23 ticks of regen =
+  tapped when affordable + 21). ~9% of plays look tapped short of elixir; unexplained (SPEC).
+- Windows PC: not needed for Hog 2.6 conversion. For converting the other ~238k games or RL later
+  it needs an Android 12 MuMu instance (one GUI step, the user's); training needs no MuMu.
+
+## Night of 2026-09-25/26: training pipeline end to end (morning report)
+
+- **Timing corrected by one tick.** A replay tick L is execute - 1 (FirstLight queues it at L + 1;
+  the engine still has the card in hand at L; live, a command executes exactly issue + 21, elixir
+  included). So a tap is at L - 20 and the bot decides at L - (20 + overhead). Executed plays are
+  dated L + 1 as the viewer dates them (issue + 21); at L one in five fell outside the tensorizer's
+  "this turn" event window. il/params REPLAY_TICK_AFTER_ISSUE; audit passes (266k samples).
+- **Input parity confirmed.** FirstLight's own IL checkpoint predicts human play well from our
+  live-code inputs (card 0.82, tile 2.80 against chance 1.79 / ~6.3). fl:hog2 is far from human
+  play (card 1.60, tile 6.27): its self-play moved it away, so imitating humans from fl:hog2
+  changes more than its timing. Both starting points get trained; duels decide.
+- **Trainer (il/train.py)** runs on the campus 4080 (D:\crtrain\py312 has torch 2.5.1 cu124; the
+  system Python312 has no torch). Code in Desktop\arron\clapha-train (tools/windows/*.cmd). Run A
+  (fl:il, one pass over the first 2,046 games = 1,517 Hog 2.6 sides) started ~22:45 with the code
+  from before the one-tick fix: treat it as a first signal. Corrected code (with Stage B) is staged
+  in ~/crtrain-stage/train2 to send and restart.
+- **Stage B (il/extras.py):** pending commands both sides (own sent plays; opponent's visible in the
+  queue) through the model's own card encoder, the opponent's exact elixir and the command delay;
+  a gated head starting at zero (extended model = its base exactly, tested), kept out of the
+  state_dict (checkpoints stay strict FirstLight ones). il/train.py --extras.
+- **Duels (il/duel.py):** both sides fed by the live code, real delay (tap after the measured
+  overhead, elixir checked at the tap, execute 21 ticks later) or FirstLight's no-delay sandbox,
+  abilities included. Queued to run on the Mac when the conversion ends: fl:hog2 delayed vs
+  fl:hog2 no-delay (what the delay costs), fl:il vs fl:hog2 both delayed (20 matches each,
+  runs/duels.jsonl, runs/duel-*.log).
+- **Console:** opt-in path for our checkpoints only (screen hand/elixir via the same
+  firstlight_obs.screen_view as training, elixir at the tap, Stage B inputs). FirstLight's models
+  unchanged. Needs one device check before a live match.
+- **Blocked overnight:** the Mac's screen locked (~22:50), so ToDesk (the only way to the 4080 PC)
+  could not be driven: restarting run A on the corrected code and sending more data wait for the
+  Mac to be unlocked. The conversion and the duels run without it.
+- **Training routes (either finishes the job; everything is staged):**
+  - *4080 PC (free):* needs the Mac unlocked (ToDesk). Send ~/crtrain-stage/train2/
+    clapha-train-code.zip and conv-hog26-002.zip (~2 GB, ~1 h at ToDesk's ~0.5 MB/s), unpack into
+    Desktop\arron\clapha-train, then `start-train.cmd fl:hog2 train-hog2-b --extras --save-every 100`
+    (fl:hog2 first: fl:il lost its first four duels to fl:hog2 with both delayed; fl:il second).
+    Expected ~2 h (data workers are the limit).
+  - *GCP (~$5 of the $20 credit):* everything is in gs://clapha-train-aa479a94. The VM cannot read
+    the bucket because the project's default compute service account has no roles. The owner
+    would grant it on this bucket only:
+    `gcloud storage buckets add-iam-policy-binding gs://clapha-train-aa479a94 --member=serviceAccount:719595020568-compute@developer.gserviceaccount.com --role=roles/storage.objectAdmin`
+    then `tools/gcp/launch.sh clapha-train-b full g2-standard-32 4 "--init fl:hog2 --extras --workers 30 --save-every 100"`
+    and `tools/gcp/watch.sh clapha-train-b <zone>`. The VM deletes itself at 4 h at the latest.
+  - A 15-minute smoke VM (g2-standard-4) was created and deleted while finding this; under $1.
+- **Conversion finished 03:42:** all 14,040 Hog 2.6 games tried; 13,830 converted, 210 refused by
+  FirstLight's deal calibration; 10,360 exact (towers within 100 HP, 74.9%), winner right 93.8%;
+  12.7 M decision-tick snapshots, 2.27 GB (runs/conv-hog26), 1.68 s per game on one engine.
+- **What the delay costs (engine duels, 2026-09-26 03:42-04:40, il/duel.py):** fl:hog2 playing with
+  the live timing (tap after the measured overhead, execute 21 ticks later) against fl:hog2 with
+  FirstLight's sandbox timing (execute 1-4 ticks after deciding), Hog 2.6 mirrors, sides swapped:
+  **0 wins in 17** (3 matches voided by a harness bug since fixed), mostly 0-1 on crowns. The same
+  model loses every game to itself once its plays take the real time to land: the delay, not the
+  model's play, is what the live bot is up against.
+- **fl:il against fl:hog2, both with the live timing:** fl:hog2 won all 20 (several three-crown
+  games). FirstLight's imitation model is far weaker than the Hog specialist even on equal terms,
+  so re-timing fl:il alone will not beat fl:hog2: the first training run starts from fl:hog2.
+- **fl:hog1 against fl:hog2, both with the live timing:** 7-3 for fl:hog1 (10 matches; side 0
+  looks disadvantaged in these mirrors: fl:hog2 lost all 5 of its side-0 games, fl:hog1 won 5/5 on
+  side 1 and 2/5 on side 0). Weak evidence that fl:hog1 copes with the delay better; fl:hog2 stays
+  the first training start (the reference to beat), fl:hog1 the second.
+- **Beyond imitation of humans:** the strongest signal we have is fl:hog2 itself. Self-distillation
+  (fl:hog2 playing with FirstLight's instant timing in the engine; a student learns to choose, from
+  the board ~1 s earlier, what the teacher then played) would keep the specialist's strength while
+  teaching it to act ahead. Needs engine self-play data: ~2 min per match on the one Mac engine, so
+  the Windows MuMu cluster (Android 12 step) would be the way to make hundreds of games.
+
+## 2026-09-26 day: faster training, self-distillation from no-delay hog2, the benchmark
+
+**Goals (the user, 2026-09-26):** fix the delay and the pending cards -- "98% of the improvement";
+the extra inputs (opponent's exact elixir, revealed / API-pulled deck as a reference, tower troop)
+wait. **Benchmark ("true-power 2.6"):** engine duels through the live input path, real delay.
+Main: the candidate against today's live fl:hog2 (both delayed) should do about as well as fl:hog2
+with no delay does against it (17-0). Upper-bound reference: the candidate against no-delay
+fl:hog2 (50% may be out of reach for any model: the no-delay bot reacts ~0.5 s sooner than the
+real game allows, even after the ~0.7 s pending-card warning).
+
+**Compute, from FirstLight's own records** (docs/training_history.md, checkpoint metadata): each
+PPO update = 1,528 concurrent matches x 40 game-seconds (~17 game-hours); fl:hog1 192 updates,
+fl:hog2 616 (~10,500 game-hours, ~190k games), on ~190 engines (8 battles each) and 8 GPUs;
+fl:il 29,396 imitation updates. Adapting hog2 by RL under the real delay: rough guess 10-50% of
+hog2's run (2,000-10,000 game-hours ~ 120-600 CPU-hours + 16-80 GPU-hours) -- not reachable on the
+Mac's single engine; the imitation / distillation stage costs a few GPU hours.
+
+**Trainer speed (il/fused.py, il/pack.py):** FirstLight's IL evaluation runs 32 LSTMCell steps and
+32 decoder calls per chunk: 1.75 s per update at 8 sides on an L4 (24 h per pass). il/fused.py does
+what their PPO path does -- one LSTM kernel over the chunk, heads once over all T x B rows --
+with the dense decoder the imitation loss needs. Checked against the step path: losses equal to
+1e-6, final states identical, gradients equal (max abs diff 1.5e-5 of 12.7 M parameters); on
+CUDA the validation numbers are identical to 4 decimals. Batches cross processes as one packed
+buffer (il/pack.py: 122,114 tensors bit-identical; 1.3 s instead of 6.7 s in the training process).
+A name clash (the batch loop variable shadowed payload()) would have crashed the first checkpoint
+save of every run since the pickled-batch commit; fixed. **Memory:** a worker collating 32 sides
+peaks at ~8 GB and all workers peak together: the first batch-32 cloud run was OOM-killed (52 ->
+116 of 125 GB in a minute). Workers now build 8-16 sides and the trainer joins groups (--merge).
+
+**Self-distillation (il/teacher.py), the main route for delay + pending:** no-delay fl:hog2 labels
+every turn of the 10,535 converted game sides in its own timing (act probability + its greedy play
+given that it acts: FirstLight's act-after-preselected-act decode). The student's turn at tick t
+gets the teacher's turn at t + 25, matched to the student's candidates by card identity, the delay
+bin re-timed for the side's 23-27 tick delay. The student sees the board at t plus both sides'
+pending commands; the teacher sees them landed at t + 25 -- that pairing is the pending-card
+signal human replays cannot give. On 3 sides: 74-96% of turns get a matched teacher play; the
+teacher "acts" on ~15% of turns (humans ~5%): on human games it keeps wanting a play the human
+delayed (off-policy; a DAgger round on the student's own games would fix what is left). Loss:
+cross-entropy of the student's act probability against the teacher's + card / cell / delay terms
+weighted by it, plus the human replay loss at 0.25. Before any training fl:hog2 already predicts
+its own shifted plays well (card NLL 0.37, cell 0.66) against 1.8 / 7.6 on the human plays.
+
+**Runs:** clapha-train-c (per-step path, batch 8) stopped after 875 updates (2% of a pass: too
+slow); clapha-train-d (batch 32, fused) OOM-killed before its first update; clapha-distill-1
+(labels, then fused training at 32 sides per update from fl:hog2) started 11:26.
+
+**Engine (CR_4k) after a restart:** the emulator boots from its quick-boot snapshot and
+-no-snapshot-save never updates it, so the disk comes back as it was: the probe reverts to the old
+build (no run-lean). After every restart: install runs/libcrprobe_run.so into Null's lib dir
+(md5 d59657b8...) and run cr-engine-extraction/macos-port/start_offline.sh (firewall first).
+
+**4080 PC:** restarted by its owner at 21:14 China time; 64 GB RAM, 20 threads, 16 GB VRAM. Last
+night's "killed" run had left its 14 workers alive (~35 GB): `taskkill /T` reported success but
+they stayed; with a new run on top the PC stopped answering. Check with Get-CimInstance
+Win32_Process before starting anything there.
+
+**Card forms, a training quirk to fix at the next data rebuild:** il/samples' form_at gives a play
+the form its card has *now* (evolution ready as of the current turn), for pending plays and for
+every executed play, recomputed each turn -- not the form it was played in. Live, the viewer
+reports the true form. il/duel.py now follows training's rule (so the benchmark sees what the
+model trained on); the fix is to record each play's form at issue time in samples and duel alike.
+
+**Status 2026-09-26 ~12:00 (session paused at a usage limit):**
+- clapha-distill-1 (GCP, capped 5 h, self-deleting ~16:25): teacher labelling ~61 sides/min, ETA
+  ~14:30, then distillation training (checkpoints every 20 batches -> gs://clapha-train-aa479a94/
+  out/clapha-distill-1/train/; labels -> conv-hog26/teacher). tools/gcp/watch.sh copies results
+  to runs/gcp/clapha-distill-1 and deletes the VM. Continuation: launch.sh 7th argument = a gs://
+  checkpoint (--init runs/init.pt), prep "none" (labels are in the bucket).
+- Engine duels (runs/duels.jsonl): control fl:hog2 lead 9 vs lead 0 (both live) was 5-1 after 6 --
+  the elixir-at-the-tap lead alone helps a lot; then queued: no-delay vs live (lead 0), no-delay vs
+  live (lead 9). Benchmark rows to run on distill checkpoints (--a-lead 9): vs fl:hog2 live lead
+  0; vs fl:hog2 live lead 9 (training effect alone); vs fl:hog2 none (upper bound).
+- Inference 2.5x faster (cached weight-only encodings, identical moves): duels ~2x quicker, and the
+  live tap leaves sooner.
+- Console fixes (pending-card forms, landed commands) and replay_decide's console path: 0 errors
+  on a recorded match. Next: a device check with a distilled checkpoint (the user starts matches).
+- Not started: the correction-round (DAgger) recorder -- duels must save frames + a timeline and
+  ActionV1 expert actions (metadata source_command_tick = execute - 1, source_index); samples take
+  them in place of calibrated.replay. The 4080 PC: upload of conv-hog26-002.zip running; needs the
+  Mac unlocked (ToDesk) to unpack and train there.
+- The CR_4k emulator was started by me for the duels; stop it (adb emu kill) when duels are done.
+
+## 2026-09-26 evening: the distilled model live, benchmark results, extras v2
+
+**Engine duels (runs/duels.jsonl; live input path, real delay; 20 matches unless noted):** no-delay
+fl:hog2 vs today's live fl:hog2 20-0 (and 17-0 the other way round); control, live fl:hog2 with
+elixir lead 9 vs lead 0: 8-2. distill-1 (human weight 0.25) @1526: 11-9 over its two sets; @3048:
+26-14. **Pure distillation distill-t0b @1520 (640 sides): 17-3 vs today's live fl:hog2 (benchmark
+#1), 19-1 vs fl:hog2 given the same lead 9 (the training effect alone), 5-4 after 9 vs no-delay
+fl:hog2 (upper bound; paused for the live test, 11 to go, seed 1313).**
+
+**Live test (the user, clapha:distill-1520 in the console):** most delay-caused plays gone; some
+plays still mistimed (a few early) and weak plays that look like imitation limits, not delay or
+pending cards. The user's own battles are private: judge them by what the user reports; test
+with engine recordings (il.duel --record), never their recordings or match logs.
+- Live tests: pause the CR_4k emulator (`kill -STOP <qemu pid>`, `-CONT` after). With it running
+  the Mac (8 cores, two MuMu instances) was overloaded and decisions slowed.
+- The app listed only `fl:` models; it now lists `clapha:` ones too, and a named clapha checkpoint
+  gets our inputs (firstlight_bot: recipe checked for every name not starting with fl:).
+
+**Console timing = training timing (931e968; live at the next console restart, after an engine
+check):** the console taps at the play's moment (decision turn + the model's 0-4 tick offset; it
+used to tap at once, up to 0.2 s early) and measures each play's delay, moment -> issue tick, plays
+held for elixir left out. il.params.live_delay (median of the last 9 plays, prior 5, clamped
+20-32) is what an extended model is told, and our checkpoints' elixir lead follows it
+(elixir_lead = delay - 16). il.duel --a-lead auto applies the same rule.
+
+**Extras v2 (8197905):** pending cards get a 4th input, ticks until they ARRIVE (il/flight.py: a
+thrown spell or tunnelling unit lands after flying from its King Tower -- a pending Goblin Barrel's
+goblins come ~1 s after it executes; the user saw logs land before the goblins, and once one land
+perfectly). Both players' hero and champion controllers become tokens: phase (FirstLight's button
+enum), cooldown left, charges, ticks since last activation (AbilityClock). FirstLight's observation
+had only the actor's own heroes and dropped champions entirely (both sides). A v1 head loads as v2
+computing exactly what it did (checked); the ability branch and the arrival input start at zero.
+Live controllers are named by the unit's character (firstlight_obs.ability_card_by_character: 16
+heroes, 8 champions); training frames by FirstLight's ability id -> the same cards. The champion
+characters' live ids are assumed to be their archetype ids, as verified for heroes on the device.
+- FLIGHT is empty until `./py -m il.flight --measure` runs in the engine (every spell and the two
+  tunnellers cast at 7 distances; base + per_tile fit): until then arrival = execute + 1.
+
+**Habits (il/habits.py, engine recordings):** per Log, what its path held; per Ice Golem, what was
+near. Human baseline (150 public replays): Log ground 85-89%, nothing 10-15%, air only ~1%; Ice
+Golem pullable 55-58%, none near ~40%, building-targeters only 2-3%. To run on recordings of
+no-delay fl:hog2, our model and today's live bot: is a habit the teacher's or ours?
+
+**Decisions for the next run:** consistent delay (the user: "in the real game delay is
+consistent") -- per-side 23-27 as distill-t0b had (the measured live table), no --delay-range;
+extras v2 with the measured flight table; init from the better of distill-d1's final checkpoint
+and t0b @1520 (engine duels decide). Strategy habits the user reported (Ice Golem on a lone Hog,
+Log on air units, the evolved Cannon's deploy aim) come from the teacher unless the habit check
+says otherwise; improving on the teacher needs the RL stage.
+
+**distill-d1 (4080):** from t0b @1520, --delay-range 20 32 (per side, told to the model), the other
+9,677 sides; ~16.5 s per 16 sides; first checkpoint (update 1522 of this run) downloaded to
+~/crtrain-stage/train2/; validation t_gate 0.386 -> 0.368, t_candidate 0.464 -> 0.450. ETA ~20:45.
+
+**Later that evening:**
+- **Do not SIGSTOP the CR_4k emulator:** it exited on SIGCONT (after ~50 min stopped). To free the
+  Mac for a live test, stop the duel and leave the emulator running, or shut it down
+  (`adb -s emulator-5554 emu kill`) and restart it later. Restart order used (no online window
+  for Null's): boot (`emulator -avd CR_4k -no-snapshot-save -no-boot-anim -dns-server
+  1.1.1.1,8.8.8.8 -grpc 8554 -grpc-use-token`), `adb root`, `am force-stop nullsroyale.rel.free`,
+  `start_offline.sh --prepare-only` (firewall), push runs/libcrprobe_run.so into Null's lib dir
+  (md5 d59657b8...), `start_offline.sh`.
+- **Flight times measured** (il/flight.py FLIGHT; runs/flight-measure*.jsonl): linear in tiles from
+  the caster's King Tower -- Goblin Barrel goblins -0.97 + 2.515/tile (57 ticks to a princess
+  tower), Fireball -0.48 + 1.681, Rocket -0.77 + 2.881, Snowball -1.01 + 1.268, Arrows -2.34 +
+  0.975, Miner -4.19 + 1.706 (underground), Goblin Drill -10.9 + 4.04; Log / Barbarian Barrel 8
+  ticks then roll; Freeze, Lightning, Zap, Poison, Graveyard, Tornado, Earthquake, Void, Goblin
+  Curse, Vines on the tile at once. Royal Delivery not timed (left at the default).
+- **Upper bound final: distill-t0b @1520 vs no-delay fl:hog2 7-13** (5-4 in the first 9, 2-9 in
+  the 11 after the pause, seed 1314).
+- **Replay opponents (il.duel --b replay):** real games' decks, deal and the real player's plays at
+  their ticks, not reactive -- a model can 3-crown one in 78 s, so wins saturate; tower HP lost to
+  real pushes is the finer measure (duel rows now carry `tower_hp`). Comparison queued: today's
+  live fl:hog2 and distill-t0b @1520 against the same 30 real opponents (seed 5050).
+- **Correction round (DAgger) pipeline:** `il.duel --a STUDENT --a-lead auto --b replay --record
+  runs/dagger-N`; `il.teacher --frames runs/dagger-N`; `il.train --frames runs/conv-hog26
+  runs/dagger-N:5 ...` (a folder's sides repeated; each side's labels in its own folder).
+- The user's view after the live test: much better with the delay fixed, still weak overall, and a
+  lower win rate in their friendlies than they expected (few games; their battles stay private).
+  Strategy beyond hog2 needs RL; RL needs engine capacity (~1 game/min per Mac engine).
+
+## 2026-09-27 morning: v2 done, the random-delay run's result, the Windows engine blocker
+
+- **distill-d1 final** (all 10,317 sides, --delay-range 20 32): vs no-delay fl:hog2 **7-11 over 18,
+  identical to distill-t0b @1520 on the same 18 deals**. Imitation metrics kept improving (card /
+  tile vs the teacher) with no gain in results; act/wait (t_gate) flat ~0.35-0.37 in every run.
+- **distill-v2** (from d1 final, consistent per-side delay 23-27, extras v2: arrival + hero /
+  champion controllers, measured flight table; 645 batches, done 01:05 Mac time): validation vs the
+  teacher start -> end: gate 0.356 -> 0.353, card 0.313 -> 0.278, tile 1.267 -> 1.192, **timing
+  0.988 -> 0.682 (-31%)** -- the consistent delay is what the in-turn timing needed. Stripped copy:
+  runs/pc/distill-v2-final.pt. Engine benchmark queued (same deals as 1520 / d1; then v2 vs 1520).
+- Reading: the delay fix came in the first 640 games; more distillation moves imitation numbers
+  but not results against no-delay hog2 (~35-40%, bounded by the information gap and the teacher).
+  Beyond the teacher = RL.
+- **Windows engine: MuMu's Android 15 image cannot run the offline engine** (found 2026-09-18/19 in
+  ~/Documents/GitHub/clash-royale-simulator-trial, DECISIONS D-064..D-068: eglMakeCurrent
+  EGL_BAD_MATCH in libg's asset loader thread, then a .sc loader null-stream crash; content never
+  loads, coldReady never true). Fix = an **Android 12 MuMu instance**, which only MuMu's window can
+  create (新建模拟器 -> Android 12); MuMuManager `create -ver 12` fails without the engine image.
+  MuMu 6.0.1 (core 6.7.0.0) at C:\Program Files\Netease\MuMu\nx_main\MuMuManager.exe; VM 0
+  `crtrain` (Android 15, adb 127.0.0.1:16384, houdini). D:\crtrain holds that attempt's setup
+  (adbw.cmd wrapper for `svc power stayon`, FirstLight_CR, platform-tools); D:\stage5.ps1 ran
+  FirstLight's PPO (their timing and reward) -- reuse only its engine steps, with our collector.
+- **The PC is shared:** 2026-09-27 a `yolov8` conda env ran 13 python processes (GPU ~21%, 3.5 GB).
+  Check before starting anything heavy; leave them room.
+- Only the APK and /data/data/nullsroyale.rel.free/update (152 MB) are needed on a new device
+  (FirstLight's offline_install checks update/); shared_prefs (account/device ids) are not copied.
+  Staged on the Mac: ~/crtrain-stage/engine (nulls-offline.apk, nulls-update.tar, probe).
+
+## 2026-09-27 day: v2 in the console, the RL loop checked end to end, the 8-engine cluster
+
+- **v2 vs distill-t0-1520: 15-5** (10 deals x both sides, both told delay 25 / lead 9; v2 swept 6
+  deals, 1520 swept 1, 3 split; nearly every game went to overtime and was decided by tower
+  health). With v2 vs no-delay fl:hog2 at 8-12 (1520: 7-13), **v2 replaces 1520 in the console as
+  `clapha:v2`** (mac012/firstlight_bot.py CHECKPOINTS; the app label "Clapha · 2.6 Hog v2").
+  Consoles restarted idle 2026-09-27 ~09:55 (MuMu instances stopped), so the console code with
+  held landing (TARGET_DELAY 26) and extras v2 (arrival, both players' hero/champion controllers)
+  is what runs from the next battle. The console's extras path was checked offline (pending rows
+  from taps + the opponent's queue, ability rows from reader-shaped controllers, clock).
+- **RL loop, end to end on the Mac engine** (a code check, not training): il.rl collect 2 games
+  (1,210 decisions per side, lanes ~3.9 MB each, rewards zero-sum +-1.10), il.rl_learn --once:
+  PPO update, saves, **resume** from latest.pt (continues the update count; KL anchor stays --init).
+  **At the collection weights the learner reproduces the recorded log-probs to 1e-5 and the values
+  to 3e-5 (ratio exactly 1.000 on 256 steps)**, so the collector and learner agree.
+  Learner changes: used lanes are deleted (--keep-lanes to keep), latest.pt replace retries on
+  Windows file locks, optimizer switches cleanly between value warm-up and full updates on resume.
+- **Where a self-play game's time goes** (Mac CPU, cProfile): model forward 49% (25 ms per call,
+  2,412 calls), FLO.build 20% -- mostly FirstLight's contracts._freeze deep-freezing the action
+  mask's placement grids three times per decision -- tensorize 8%, the engine ~6%.
+  **il/speed.py**: an exact drop-in for _freeze (exact-type fast paths, everything else to the
+  original; 3,000 random nested values agree) -> 108 s -> 82 s per game; FLO.build 25 -> 14 s,
+  action_mask 12.8 -> 2.8 s. Installed by il.duel and il.rl (not yet the console).
+  On the PC the forward goes to the GPU (batch 1, no CUDA graph: FirstLight graphs only `act`).
+- **Why only 1 of 8 engines started** (stage6, our probe; stage6b retried with FirstLight's probe):
+  FirstLight's MuMu cluster script starts all 8 EngineNApp activities back to back, but their own
+  guest setup (native_runner/training/v4/configure_emulator_engine_guests.py) does two things the
+  script skips: **cached_apps_freezer disabled** ("otherwise suspends all but the most recently
+  launched engine process") and **cold-start one engine at a time**, attesting each before the next
+  ("libndk_translation can race while several ARM64 processes build their first translation caches
+  in one x86_64 guest"), then taskset-pins each to its vCPU. Engines 0,2-6 sat at ~130 MB with no
+  probe log: never got past the translation layer. **stage6c.ps1** (staged in ~/crtrain-stage/engine)
+  does their sequence with our run-lean probe; not run yet (needs the Mac's screen for ToDesk).
+- **PC RL launcher**: tools/windows/rl.ps1 (in the code update zip, lands next to clapha/):
+  `-Run NAME` starts il.rl_learn + one collector per engine port (cuda), `-Anchor 2` of them play
+  latest vs the fixed v2 (the running score against v2), the rest self-play; `-Stop` ends them.
+
+## 2026-09-27 evening: pilot1 left running unattended (the user away ~4 days)
+
+- pilot1 had played 0 games in 194 minutes: the YOLO job on the shared 4080 trained all day. It
+  cycles ~18 min at ~3 GB of GPU memory (~67% of the GPU) and ~5 min at ~12 GB. The user chose to
+  share at full speed: `--others-gb 7 --calm 2` (our run backs off during their 12 GB stretch).
+- The keeper (il/rl_turns.py) now restarts broken parts, the engines, or the VM and firewall
+  (stage6c / stage7); guards the disk; writes runs/rl/pilot1/status.txt every 10 min.
+  start-training.cmd / stop-training.cmd are in clapha-train. The Startup folder entry brings it
+  back after a reboot (the user's OK). Details: TRAINING.md, "Unattended".
+- Collectors exit after 5 failed games in a row (was: spin forever on a dead engine). The learner
+  keeps every 10th policy file (was: 50 MB per update, ~100 GB in 4 days). Fresh collector seeds
+  per start.
+- To read when back: status.txt (the "vs v2 (anchor)" column is the evidence question: does the
+  score against the starting model rise above 50% as games accumulate?).
+- First hour next to the other job: 64-lane updates ran the GPU out of memory and the PC out of RAM
+  (commit; collectors died of MemoryError); the keeper caught it, restarted the engines (none
+  answered after the crash) and the run by itself. Now 12 engines, 32 lanes, 2 per minibatch, one
+  epoch, backlog 64: first update (value only) 199 s. Baseline in status.txt before any update
+  (140 games, sampled play): vs v2 15-14, vs hog2 no-delay 7-10, vs General on real decks 7-19.
+- Attack survey refined per the user's review (il/attacks.py): a crossing counts as an attack only
+  with >= 400 troop health on our half at once or >= 50 tower damage (3,898 of 28,595 dropped),
+  defense only within 8 tiles of an attacking troop (12,105 of 83,969 plays dropped). Weak spot:
+  low-health but high-damage leftovers (two Elite Barbarians at 387) are dropped too; a damage-rate
+  rule from the unit tables would fix it. Viewer: runs/attacks/attack_viewer.html.
+
+## 2026-09-28: pilot1 got worse; pilot2 with smaller steps and a guard
+
+pilot1's learner fell from 46% to 32% +-5 against v2 after update 10 (hog2 ~16%, General ~18%)
+while drifting far from v2 (KL estimates up to 550, entropy 0.20 -> 0.36). pilot2 restarts from v2:
+- lr 3e-6, a step per 4 chunks;
+- a bounded anchor (0.3);
+- 16 value-only updates;
+- a keeper guard that halts the run below 42% over 150 recent games against v2 (HALT file);
+- sharing line 9.5 GB.
+
+Details: TRAINING.md journal.
+
+## 2026-10-02: training games from the PC, replays in Null's, models for the console
+
+- **CR_4k is never "emulator-5554" by name.** MuMu Pro's adbd listens on port 5555, and adb lists
+  anything there as emulator-5554: while CR_4k is down, that name is the live MuMu device (official
+  CR, model SM-S7310). An emulator booted without -port then takes console 5554 beside it, so even
+  `adb emu avd name` answers CR_4k while `adb shell` reaches MuMu. Found when a test's
+  `play_firstlight.sh --install-only` ran `getprop`, `adb root` (a no-op: MuMu's adbd is already
+  root) and an `ls` on MuMu, twice, and stopped there; nothing was written or started on it. Now
+  CR_4k boots on its own ports (`-port 5580`, emulator-5580) and is found by the property it
+  reports itself, `ro.boot.qemu.avd_name` = CR_4k (tools/play_firstlight.sh, il/watch_nulls.py).
+  Still assuming emulator-5554: il.engine_convert --serial's default, and the macos-port scripts
+  when run on their own (play_firstlight.sh exports CR_ADB_SERIAL for them).
+- **Training games** (TRAINING.md section 4): pack-recordings.cmd on the PC (one zip; --models adds
+  each run's newest model) -> Clapha Training games -> Import. Models land in runs/pc/<run>-u<N>.pt
+  and the console offers them as clapha:<run>-u<N> without a restart (firstlight_bot._discover).
+- **Watch in Null's** (il/watch_nulls.py): a recorded game played again in the stock renderer; the
+  first test (pilot3 self-play, 143 cards) ended on the recorded tick 6135 with the recorded
+  winner. The game's play button, progress bar and speed drive it: snapshots every 120 ticks for
+  the whole game (the probe keeps 64), so seeking back, or forward to anywhere already played,
+  restores one and runs at most 240 ticks; further ahead runs at 4x, the probe's fastest.
+
+## 2026-10-02 afternoon: why our model felt weak against the user, while training said it beat hog2
+
+- **Training's hog2 was weaker than the real one.** il/strength_check.py on the Mac engine, the
+  specialist's deck at L16, both no delay: hog2 as training fed it (our reconstruction, tile-centre
+  placements, our turn loop) lost **1-5** to hog2 in FirstLight's own environment (il/vs_firstlight).
+  Our model (p3, update 520, live delay) against the real hog2: **2-3**, against training's 66% on the
+  same kind of deals (640 games at updates 400-521). Deck forms did not matter in training (67% with
+  the specialist's forms, 61% without). Recordings: runs/rl/check-pipeline, check-full.
+- **98% of training's Hog 2.6 sides had evolutions and Hero Musketeer** (no evo and no hero: 0.5%). The
+  user plays the plain deck; with "the real 2.6 deck" the model's play was mostly fine (user, live).
+- **Occasional game-losing blunders: sampling.** Every checkpoint (ours and FirstLight's) samples the
+  card-and-tile pick at temperature 1.0 (gate 0.2, continue 5.0), so a 10%-likely tile is played one
+  time in ten. Console decoding **Steady** (mac012/console.py STEADY_ACTION_TEMPERATURE 0.3): when to
+  act as trained, card and tile sharpened. Trade-off: fewer random misplacements, more predictable.
+- **The user's live weakness was the deck: Arrows in place of The Log** (the user, 2026-10-02 evening:
+  with The Log back, "the real 2.6 deck", the model plays mostly fine). Every model we have holds the
+  Hog 2.6 eight in training (il/train.py, il/rl.py: the learner is always the Hog 2.6 side), as the
+  specialists do; one card out of it makes a much weaker model. The console's deck check covered
+  only fl:hog1/hog2 and only wrote to the log: it now covers clapha:* too, and a card that differs
+  shows in the app as a warning (bot.deck_warning); forms not equipped stay a log line.
+- **"I can't choose Steady": the consoles were a day old.** They had run since 2026-10-01 and refused
+  'steady' as unknown, which the app showed as nothing happening. Each console now reports its own
+  source files changed since it started (bot.code_changed, ours and FirstLight's), and the app says
+  "press Start between battles" when there are any (or when a console is too old to report it). The
+  decoding preference now survives a restart (build/console_settings_<port>.json).
+
+## 2026-10-02 night: what p3's plays depend on (il/sensitivity.py)
+
+25 engine Hog 2.6 mirrors (5 of p3 against the real hog2, 20 pilot3 league games), 1,654 plays: p3 (u520)
+decides each recorded play again from the game's own inputs, once as it was and once with one input changed.
+- **Memory is in effect 10-30 s.** Rebuilt from only the last 60 / 30 / 10 s of the match, its most likely
+  tile changes in 1 / 2 / 3% of plays (Cannon 5% at 10 s); whether it plays and which card barely move. It
+  does not adapt to how this opponent played earlier: placements and spells answer the present (board, the
+  opponent's card cycle and exact elixir, the queue) with habits from training.
+- **The opponent's queued plays (extras) carry much of its "prediction".** Something was queued in 19% of
+  plays (31% of Fireballs); hiding it changes the most likely tile in 15% of those plays (Cannon 20%,
+  Skeletons 22%), and for Cannon the card choice by 0.26.
+- **The Log -> Arrows hurts through what it plays and when, not where.** In the deck list alone (The Log
+  neither in hand nor next) and as the opponent's revealed card: under 1% top-tile change. With Arrows in
+  the hand (69% of plays): other cards' tiles stay (0-4%), but the card choice moves to Arrows -- in p3's own
+  games P(Log) 0.04 -> P(Arrows) 0.10 on other cards' turns; Arrows becomes its first choice over the card
+  it played on 23% of Musketeer turns, 29% of Ice Spirit turns, 7% of Fireball turns, no Cannon turns --
+  and its urge to play rises (+0.05 on average). Game results with Arrows were not measured (that needs
+  engine games).
+
+## 2026-10-03: what training at scale costs, and the plan the user chose
+
+- **Scale, from measured rates** (TRAINING.md section 2 and the pilot3 journal): a game is ~302 s, 2,420
+  decisions (both sides), 3.9 MB per lane. The PC as the code is: ~10 games/min while running, 6,000-11,000
+  games a day at pilot3's real availability; of a game's 66 s, 37 s wait for the inference server, and the
+  learner just keeps up (<= ~3.9 ms per learner decision). pilot3 so far: ~20,000 games (0.19 in-game years).
+  FirstLight's listed PPO chain (30 + 460 + 192 + 616 updates x 1,528 matches x 40 game-s): ~262,000 games
+  (2.5 in-game years); hog2's own stage ~190,000.
+- **Google's $300 trial credit: ~20,000-60,000 games** (L4 at $0.62 spot / $0.71 on demand per hour, ~3x
+  slower than the 4080 on this work: about a week of the PC). The trial has no GPUs and 8 cores until
+  upgraded; nested virtualization only on Intel (not E2, AMD except N4D, Arm). Playing there and learning on
+  the PC would move ~3 TB of lanes per 500,000 games: the download fees exceed the credit. The user will not
+  use it for this.
+- **The plan (the user, 2026-10-03):** 500,000-1,000,000 mirror games on the 4080 PC as the proof of concept
+  of a skilful 2.6 mirror bot. Order: (1) the delay diagnosis (timing record, marked games); (2) two
+  speed-ups, target 20-25 games/min: the inference server's wait, and the learner 2.5-3x; (3) before the long
+  run, the training opponent fixed (training's hog2 lost 1-5 to the real one). The PC is down for about a
+  week from 2026-10-03. A friend has an A100 on a machine with KVM disabled: no engines there as they run
+  today (the Android VM needs it); it could take the learner, with engines elsewhere.
+
+## 2026-10-03: the live "delay" diagnosis -- lost taps, a model without delay training, decisions
+
+Marked games (the user on their phone against clapha:p3 on device 1, from 12:35; and the 2.6 mirrors of
+2026-10-02 night against friends), read with il/live_hogs.py, il/live_towers.py and il/timing.py.
+- **Timing is fine.** 4,625 decision turns: frame on its turn tick in 98%, deciding 33 ms median (99% 86),
+  no turn missed. Plays that registered were issued on their tick or one late (tap -> issue 1-6 ticks).
+- **13% of taps never registered (35 of 276), and every one is explained** (corrected the same afternoon;
+  the first reading -- touch length -- was wrong and its change was taken back). A click counts as taken
+  when a command of that card is issued within 8 ticks of it:
+  - **29: the card was not in the game's hand yet.** The game deals the next card into a slot when the play
+    before it in that slot *executes* (issue + 21, ~1.1 s after its tap); when two plays execute within a
+    second, the second slot mostly stands empty until 20 ticks after the first deal. The client takes no tap
+    for a card before its deal: 27 of 27 sent before it were lost, and 2 of 2 sent on its tick; from two
+    ticks after it, 236 of 237 single taps registered. Our model's hand is the screen view (firstlight_obs.screen_view, il/SPEC.md): the next card
+    in at the tap. It was built for the human replays, where a play's decision turn is ~5 ticks before its
+    issue and so can fall before the deal; but with it the engine also *takes* a command issued before the
+    deal (it executes after it), so RL learned to use it: in pilot3's recordings 160 of the learner's 2,543
+    plays (6%, ~4 a game) were issued 1-12 ticks before their deal, and landed. Live the same habit is ~6
+    lost taps a game, mostly the card cycled to under pressure: 8 of them Cannons.
+  - **A lost tap put the console one card behind the game in that slot** (it held the card "in flight" for
+    3 s, so the screen view had the following card there): the next click in that slot put down the card
+    before it, on the tile meant for the other. Six such: the Cannon on the Hog's tile at the bridge (game 1,
+    3:03, the push that took the tower), a Log on the Cannon's tile, a Cannon on the Skeletons' tile (what
+    looked like the client moving a blocked Cannon from (9,9) to (12,9)), Skeletons on the Musketeer's, an
+    Ice Spirit on the Hog's, a Hog on the Skeletons' tile in our own half. And 1 click for a card such a
+    click had just used.
+  - **5: the second of two gestures written within 3 ms** (two plays in one turn): 5 of the 9 such.
+  - After a lost Cannon click (8) the Cannon came 3.4-3.9 s later on the edge column (4), was put down by
+    another card's click on that card's tile (2), or came 26-37 s later (2). In games 1, 4 and 5 the tower
+    that ended the match fell within 14 s of failed clicks (game 1: the lost Cannon, then the Cannon at the
+    bridge; game 5: four in a row).
+  **Fix, first form (14:25):** a play tapped only where the game's own hand holds its card, two ticks after
+  it appeared there; gestures 60 ms apart; a tap not in the queue after 12 ticks sent again. Replaced the
+  same afternoon by the measured rules (next section).
+  **Left for training:** the engine must refuse what the client refuses -- a card not playable until its
+  deal (+2 ticks) -- or the model keeps planning on a Cannon it cannot have for another second.
+- **The "outright missed Cannons" of 2026-10-02 night were fl:general** (switched to at 20:15; no delay
+  training): its Cannon came down 50-74 ticks after the Hog landed, p3's 26-48; a Cannon stops pulling
+  around 55-75 ticks (it must be nearer the Hog than the tower is), so a third of General's did not pull.
+  The console now warns when an fl: model is armed. il/hog_defence.py's "slack" measures to the Hog's
+  arrival at the tower, which is later than this deadline: read its numbers ~30 ticks smaller.
+- **Decisions (p3, today's first three games: 21 Hogs, 29 hits):** after the Cannon is destroyed it only
+  trickles cheap cards (6 Hogs, 14 hits); with the Cannon out of hand it does not cycle to it (2 Hogs, 9
+  hits, one with 9.5 elixir and the Cannon two cards away); once it had the Cannon and did not play it.
+  These counts include pushes with a lost tap in them: to be read again from games played with the fix.
+- Open: the same pushes replayed in the engine against the same model (the user's commands as a scripted
+  opponent), to separate what is left of the pipeline from the model for certain.
+
+## 2026-10-03 afternoon: the client's rules for a play, measured tap by tap -> docs/GAME_INTEGRATION.md
+
+The user (both bots off, 7x-elixir friendlies between the two accounts, six battles): "collect info on how
+card registration and tapping work PRECISELY ... a big doc ... the cornerstone of the project. Then use this
+info to solve the tapping problem." Tools: `mac012/tap_probe.py` (touches placed on the device's own clock
+against 20 ms samples of the game's memory; `src/fast_tap.c` version 3 starts a gesture at a given monotonic
+time and reports each touch's time), `mac012/tap_probe_report.py`. Records: docs/measurements/.
+**The document is the reference; the headlines:**
+- The game deals the next card into a slot exactly 21 ticks after the issue tick of the play before it
+  (139 of 139). On the screen the slot is *empty* until then (the next card is only under "Next:") -- our
+  screen view, which has the next card in at the tap, is wrong about the screen too, not only about what
+  can be touched.
+- A touch that begins before the deal does nothing and selects nothing (0 of 31; 0 of 9); from 100 ms after
+  the deal it is always taken (38 of 38); in between sometimes (20 of 70). The touch going down is what
+  counts.
+- Touch length and the gap inside a gesture do not matter (30 of 31 over twelve shapes). Two gestures need
+  ~5 ms between them (18 of 19 from 5 ms; 10 of 17 under).
+- The client checks the screen's elixir (the fourth card of a full-bar burst refused, 2 of 2).
+- No play is taken before about tick 94 of a battle; the first issue tick is 101.
+- A tile a card may not take moves the card to the nearest it may (28 of 28, none refused); a building
+  asked onto a standing building goes three tiles away.
+- A command first shows in the queue 1-12 ticks after its issue tick: 4-17 ticks after the tap. **The
+  morning's "sent again after 12 ticks" would have called 9% of good taps lost**; it is 20 now. The same
+  short wait made the probe's own first results wrong (plays it called refused had been taken): the report
+  now decides from the whole queue record.
+- Normal elixir only: a play executing less than 20 ticks after the previous deal is mostly dealt late, 20
+  ticks after that deal (14 of 20). Not so in 7x. It is the hand's refill timer (1000 ms; 500 in double
+  elixir, 350 in triple), as RoyaleSim measured it on 15.535.29; our reader's `refill_timer` reads 0 here.
+**Console now** (`DEALT_MS` 120, `FIRST_TAP_TICK` 95, `LOST_AFTER_TICKS` 20, `Tapper.spacing` 20): a play's
+first touch goes down 120 ms after the card was first seen in the game's own hand, started by fast_tap on
+the device's clock; never in a slot holding another card; nothing before tick 95.
+**Training** (written, not yet run in the engine -- CR_4k was kept off while the user tested): `il/duel.py`
+`deal` per side -- 'sim' (as before, and the default), 'hold' (the tap waits for the deal + 3 ticks),
+'mask' (and a card not dealt is not offered: `firstlight_obs.screen_view(deal_rule=True)`, mask reason
+`not_dealt`); `il.rl collect --deal`, `rl_learn --deal` (written into the checkpoint; the console gives such
+a model the mask), `rl.ps1 -Deal mask` by default for new runs. Old opponents play 'hold'. The counters
+`before_deal`, `held_for_deal`, `held_ticks`, `dropped_deal` are in every games.jsonl row.
+**The current model under the mask** (291 turns of 36 pilot3 games where it had played a card not yet
+dealt, decided again with that card not offered): waits in 79%, plays another card in 14% -- for the Cannon
+in half. So pilot3 keeps the hold; the mask is for the next model.
+- Training Camp, bot on, first form of the fix: 20 plays, none lost (one waited a tick for its deal, one
+  pair 100 ms apart). The measured form has not played a match yet.
+- Still to do: run `il/duel.py --a-deal hold|mask` in the engine (does it run; what the rule costs pilot3);
+  a friendly with the bot on to confirm no failed clicks; the next run with `-Deal mask`.
+
+## 2026-10-03 evening: RoyaleGym's "2.1k games an hour with learning" -- where it comes from
+
+The user asked (github.com/orgs/RoyaleGym: RoyaleSim, RoyaleGym, RoyaleLearn, read at their 2026-10-03 heads).
+- **What it is:** a from-scratch Rust battle simulator (not the game's engine), ~32,000 ticks/s raw, 1.21 ms
+  per env step through Python (0.31 engine + 0.90 observation and mask, both seats); a decision every 500 ms;
+  a ~430,000-parameter conv net (64 channels, 4 blocks); PPO with 3 epochs. Their own measurement (4-core
+  laptop, RTX 3050 4 GB, 7.8 GB RAM, other jobs running, 2026-09-22): 8,256 transitions per 30-35 s
+  iteration, the update 71-83% of it: 48 battles advancing 43 game-seconds each = 60-70x real time. The
+  2.1k figure is not in the repositories; the user (corrected the same evening): it is the author's own
+  machine, a 4070 Ti with 32 GB, not the 3050 laptop. At three-minute battles that is ~420 decisions/s
+  (720 a battle), or 105 game-hours an hour. Their docs: "Nobody has trained a bot with this yet", and against recorded real
+  matches a non-tower unit is within a quarter tile 56.5% of the time (hitpoints exact 79.5%).
+- **Ours, same units** (pilot3's games.jsonl, last 400 timed games): 69 s per game per engine -- engine 6.1 s,
+  building observations 10.7 s, deciding 51.5 s (the model's forward and the wait for the inference server)
+  -- for 6,132 ticks and 2,450 decisions; ~10 games/min on 14 engines = 50x real time, 400 decisions/s
+  against their ~420 on a 4070 Ti (~250 on the 3050), with a model 30 times larger (12.7M parameters)
+  deciding twice as often.
+- **So the gap in games/hour is decisions per game (ours ~2,450, theirs ~350-700) and model size, not the
+  simulator:** the real engine is 9% of our game's wall time. Their simulator would save us 6 s of 69 and
+  cost the fidelity. The levers are the ones already planned -- the deciding path (51 of 69 s), then
+  observation building, then the learner (3.9 ms per decision = 9.5 GPU-seconds a game, which caps the 4080
+  near 380 games/h whatever the collectors do).
+- **Worth taking:** their client measurements on 15.535.29 agree with ours of today and add the hand's
+  refill timer (docs/GAME_INTEGRATION.md); their calibration file names each rule's evidence and what would
+  overturn it.
+
+## 2026-10-03 night: the opponent on the MuMu overlay (deck guessed, deck seen, hand, elixir)
+
+For debugging (the user): `console.opponent_view` in /state, drawn by the app's overlay (Overlay.swift
+`drawOpponent`, the "Opponent info" switch) in a strip beside the game picture, or small inside its top left
+when the screen has no room. Three things kept apart: the deck held for theirs before they play (their
+console's published deck, else the API's equipped deck), faint, and gone the moment a card they play is not
+in it; the cards actually seen, with the hand that follows from the order of their plays (a card is out of
+the hand from its play, which we see ~10 ticks later in the queue; after four plays the hand is every card
+not among their last four, unknown ones as "?"), and the next card back; their exact elixir. Checked with
+made-up plays and an off-screen render (`build/clapha_snapshot --overlay state.json out.png`), not yet on a
+live battle.
+
+## 2026-10-03 night: the opponent panel moved inside the game picture; the game on a phone
+
+- **Opponent panel** (the user: "fit inside the emulator screen", and the guessed deck stays while nothing
+  contradicts it): two columns in the margins beside the arena (the outer 5.5% each side, where nothing of the
+  game stands) -- left: seen cards, hand, next; right: the deck held for theirs, their elixir. Inside the
+  picture so that a phone shown the picture gets it too. Guess ids are compared as base cards.
+- **The game on a phone** (the user remembered the Null's setup's phone link, cr-engine-extraction/macos-port/
+  phone: emulator gRPC frames -> JPEG -> the "Null's Viewer" app over `adb reverse`, touches back; "close to
+  no lag" on an OPPO A78 at 540x1200, 12 ms decode). MuMu has no such frame stream, so here the picture is taken
+  from the Mac's screen: `app/Phone/PhoneLink.swift` (build/ClaphaPhone.app, started by the **Phone** switch):
+  ScreenCaptureKit on the game picture's rectangle (the overlay is on it), JPEG at 540 wide by default (720 /
+  1080 by right-click), the same viewer app and protocol (phone/nulls-viewer.apk), touches to the MuMu
+  touchscreen through fast_tap's new `d` / `m` / `u` (version 4; `auto` finds the touchscreen). A helper of
+  its own so macOS's screen-recording permission is asked once for it and survives rebuilds of Clapha.app
+  (app/build_phone.sh rebuilds it only when its source changed).
+  **Tested here:** the helper started as the app starts it, with a made-up picture and a stand-in for the
+  phone app: config, frames with the two-in-flight window, touches arriving as input events (in a file), the
+  status the app reads. **Not tested:** the screen capture itself (this session may not record the screen;
+  the user allows the helper once in System Settings) and a real phone (none was connected).
+

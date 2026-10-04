@@ -1,0 +1,112 @@
+20261003T151426.jsonl: side 0, from tick 1603, 49 trials, experiments ['deal']
+20261003T151635.jsonl: side 0, from tick 26, 68 trials, experiments ['deal', 'pairs']
+20261003T152328.jsonl: side 0, from tick 22, 111 trials, experiments ['deal', 'pairs', 'shape', 'select', 'elixir', 'illegal', 'build', 'early']
+20261003T153144.jsonl: side 0, from tick 24, 75 trials, experiments ['occupied', 'shape', 'burst', 'deal', 'occupied', 'shape', 'pairs']
+20261003T153953.jsonl: side 0, from tick 3699, 39 trials, experiments ['deal', 'deal', 'pairs']
+
+START: one play at each of a few ticks right after a battle begins
+    touched at tick  70 (IceGolemite): refused
+    touched at tick  78 (Log): refused
+    touched at tick  86 (Fireball): refused
+    touched at tick  94 (Skeletons): taken, issued at tick 101
+
+DEAL: play a slot's card, then tap that slot for the card the game deals into it (139 trials)
+  the game dealt the next card N ticks after the first card's issue tick: {21: 139}
+  the second tap's card touch went down this long after the first sample that had the new card in the hand
+  (samples every ~20 ms: the deal itself is up to 20 ms earlier):
+    before the deal  taken   0   refused  31
+    0-49 ms          taken   1   refused  17
+    50-59            taken   1   refused   9
+    60-69            taken   3   refused   9
+    70-79            taken   4   refused   3
+    80-89            taken   7   refused  11
+    90-99            taken   4   refused   1
+    100-119          taken  17   refused   0
+    120 ms and later taken  21   refused   0
+  by the length of that card touch (it is the touch going down that counts, not its end):
+    held  2 ms: 13-, 31-, 53-, 64-, 70+, 77+, 87+, 100+   (ms after the deal the touch went down; + taken, - refused)
+    held 48 ms: 8-, 21-, 22-, 27-, 31-, 43-, 54-, 57-, 61-, 68-, 83-, 87-, 110+   (ms after the deal the touch went down; + taken, - refused)
+  taken ones were issued N ticks after the deal's tick: {2: 4, 3: 18, 4: 24, 5: 11, 7: 1}
+
+EARLY: the slot touched before its next card is dealt (no tile), a tile touched 300 ms after the deal
+    slot touched  50 ms before the deal: the dealt card was put down 0/3
+    slot touched 100 ms before the deal: the dealt card was put down 0/1
+    slot touched 200 ms before the deal: the dealt card was put down 0/2
+    slot touched 400 ms before the deal: the dealt card was put down 0/3
+
+PAIRS: two cards long in the hand; the second gesture begins N ms after the first one's last touch went up (36 trials)
+      0-1    ms:  5 pairs   both taken  3   second lost 2   first lost 0   both lost 0
+      1-3    ms:  7 pairs   both taken  5   second lost 1   first lost 0   both lost 1
+      3-5    ms:  5 pairs   both taken  2   second lost 2   first lost 0   both lost 1
+      5-10   ms:  5 pairs   both taken  5   second lost 0   first lost 0   both lost 0
+     10-20   ms:  4 pairs   both taken  4   second lost 0   first lost 0   both lost 0
+     20-40   ms:  7 pairs   both taken  6   second lost 0   first lost 1   both lost 0
+     40-1000 ms:  3 pairs   both taken  3   second lost 0   first lost 0   both lost 0
+
+SHAPE: one troop or spell long in the hand; each touch held `hold` ms, `gap` ms between the card touch and the tile touch
+    hold   2 ms  gap   0 ms   taken 4/4
+    hold   2 ms  gap   8 ms   taken 1/1
+    hold   4 ms  gap   4 ms   taken 4/4
+    hold   4 ms  gap   8 ms   taken 3/4
+    hold   8 ms  gap   0 ms   taken 1/1
+    hold   8 ms  gap   4 ms   taken 1/1
+    hold   8 ms  gap   8 ms   taken 4/4
+    hold  16 ms  gap   0 ms   taken 1/1
+    hold  16 ms  gap   8 ms   taken 3/3
+    hold  16 ms  gap  16 ms   taken 4/4
+    hold  16 ms  gap  33 ms   taken 3/3
+    hold  34 ms  gap   8 ms   taken 1/1
+
+SELECT: the touches of a play sent apart
+    card A touched, then card B, then a tile         B put down         x1
+    a tile touched, no card first                    nothing put down   x1
+    card A touched twice, then a tile                A put down         x1
+    card A touched, the tile 0 ms later              A put down         x2
+    card A touched, the tile 1500 ms later           A put down         x1
+    card A touched, the tile 200 ms later            A put down         x2
+    card A touched, the tile 50 ms later             A put down         x1
+    card A touched, the tile 600 ms later            A put down         x1
+
+BURST: the whole hand played from a full bar (10), cheapest first, the gestures a moment apart
+    60 ms apart: Skeletons (1) taken, Log (2) taken, Musketeer (4) taken, HogRider (4) REFUSED
+    30 ms apart: Skeletons (1) taken, Log (2) taken, Musketeer (4) taken, HogRider (4) REFUSED
+
+ILLEGAL: a card asked onto a tile it may not take; tiles (column, row) in the game's own coordinates
+    bridge    IceGolemite  asked (14, 15)  -> moved to (14, 14)
+    bridge    Skeletons    asked (14, 15)  -> put there
+    enemy     IceGolemite  asked (13, 22)  -> moved to (13, 14)
+    enemy     IceGolemite  asked (13, 22)  -> moved to (13, 20)  x2
+    river     IceGolemite  asked (11, 15)  -> moved to (11, 14)  x2
+    river     Skeletons    asked (11, 15)  -> moved to (11, 14)
+    spell     Fireball     asked (13, 24)  -> put there
+    spell     Log          asked (13, 24)  -> moved to (13, 14)
+    tower     IceSpirits   asked (9, 2)    -> moved to (9, 0)
+    tower     Skeletons    asked (9, 2)    -> moved to (9, 0)
+
+BUILD: a building asked next to a tower; tiles (column, row) in the game's own coordinates
+              Cannon       asked (3, 9)    -> put there
+              Cannon       asked (9, 5)    -> moved to (11, 6)
+              Cannon       asked (9, 6)    -> moved to (12, 3)
+              Cannon       asked (12, 9)   -> put there
+              Cannon       asked (14, 8)   -> moved to (15, 9)
+              Cannon       asked (14, 9)   -> moved to (12, 9)
+
+OCCUPIED: a building asked on a tile (8, 9), free or with our last one still standing on it; tiles (column, row) in the game's own coordinates
+    free      Cannon       asked (8, 9)    -> moved to (11, 9)  x2
+    free      Cannon       asked (8, 9)    -> moved to (8, 6)
+    free      Cannon       asked (8, 9)    -> put there  x2
+    standing  Cannon       asked (8, 9)    -> moved to (5, 9)  x2
+    standing  Cannon       asked (8, 9)    -> moved to (8, 6)  x2
+    standing  Cannon       asked (8, 9)    -> put there
+  plain plays right after a building the probe saw no command for (it was in fact taken, a little later):
+    play 1 after it: taken x2
+    play 2 after it: taken x2
+
+QUEUE: ticks from a command's issue tick to the tick it first showed in the queue (423 of our commands)
+    1: 4, 2: 14, 3: 27, 4: 34, 5: 38, 6: 53, 7: 40, 8: 38, 9: 36, 10: 115, 11: 22, 12: 2
+
+ISSUE TICK: a taken play's issue tick, less the tick its tile touch went up in
+    -1: 1, +0: 9, +1: 38, +2: 21, +3: 8, +4: 2
+
+THE SLOT IN THE GAME'S MEMORY: ticks it was seen empty before its deal (0: card to card in one sample)
+    0: 387, 1: 34, 2: 3

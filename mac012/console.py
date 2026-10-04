@@ -23,14 +23,279 @@ import model_adapter as MA  # noqa: E402
 import scope_gate  # noqa: E402
 import firstlight_bot as FLB  # noqa: E402
 import firstlight_obs as FLO  # noqa: E402
+import tapper as TAP  # noqa: E402
+import opponent_intel as INTEL  # noqa: E402
+import landing as LANDING  # noqa: E402
 from cycle_tracker import Tracker, opponent_deck  # noqa: E402
 from mac_profile import ADB, SERIAL  # type: ignore  # noqa: E402
 from native_core.mumu_live_actions import ScreenLayout, send_card_taps  # noqa: E402
 from native_core.mumu_live_protocol import adb_run  # noqa: E402
+if str(Path(__file__).resolve().parents[1]) not in sys.path:
+    sys.path.append(str(Path(__file__).resolve().parents[1]))   # after mac012: shadows nothing
+from il.params import elixir_lead  # noqa: E402  (the elixir lead follows the delay the model is told)
+from il.speed import install as _faster_contracts  # noqa: E402
+_faster_contracts()     # FirstLight's contract freezing, same results, ~2x less time per observation
 
 PORT = int(os.environ.get('CR_CONSOLE_PORT', '8777'))
 LOG_FILE = Path(__file__).resolve().parents[1] / 'build' / f'bot_{PORT}.log'
+# Times only, one line per decision turn and per play (il/timing.py reads it, for games the user marks).
+TIMING_FILE = Path(__file__).resolve().parents[1] / 'build' / f'timing_{PORT}.jsonl'
 X_TILES, Y_TILES = 18, 32
+# The game consumes a queued command this many ticks after its issue tick (measured 22 ticks
+# queue -> unit on every play; FirstLight's COMMAND_CONSUMPTION_STEPS = 21).
+COMMAND_AGE_TICKS = 21
+# A tap that never reaches the queue (missed, or refused by the client) is given up on.
+IN_FLIGHT_SECONDS = 3.0
+# A tap the game took is issued 1-6 ticks after it, and its command first shows in the queue 1-12 ticks after
+# that issue tick: 4-17 ticks from the tap to our first sight of it (267 plays, 2026-10-03; over 12 in 9%).
+# One not there after this many is lost, and is sent again once, the same card on the same tile: waiting the
+# 3 s out left the card blocked, the model believing it on its way. (12 was too few: it would have called one
+# good tap in eleven lost.)
+LOST_AFTER_TICKS = 20
+# How long a play chosen against elixir the client has not credited yet may wait for it (and for
+# its moment: a play is held until it will land TARGET_DELAY ticks after its decision).
+DEFER_SECONDS = 0.8
+# The client takes a touch on a hand slot only once the game has dealt the card into it, and a moment after
+# (docs/GAME_INTEGRATION.md; mac012/tap_probe.py, 2026-10-03, 139 timed taps): the game deals the next card
+# 21 ticks after the issue tick of the play before it in that slot (139 of 139); a touch that begins before the
+# deal does nothing (31 of 31) and selects nothing in advance (0 of 9); one that begins 100 ms or more after the
+# deal is first in memory is taken (38 of 38); in between, some (0-50 ms 1 of 18, 50-100 ms 19 of 52), and it
+# is the touch going down that counts (down early and held on: refused). Until the deal the slot is empty on
+# the screen. Our models' hand is the screen view, which has the next card in at the tap -- as in their
+# training, where the engine takes such a command and it lands (pilot3: 160 of the learner's 2,543 plays were
+# issued before their deal) -- so the model picks a card up to 21 ticks before it can be touched: 29 of the 35
+# lost taps in the live games of 2026-10-03, each of which also left the console a card behind in that slot,
+# so its next taps there put down the card before (the Cannon on the Hog's tile at the bridge).
+# So a play is tapped where the game's own hand holds its card, the touch going down DEALT_MS after we first
+# saw it there (on the device's clock: fast_tap starts the gesture then), and may wait DEAL_WAIT_SECONDS for it.
+DEALT_MS = 120                  # 100 measured from a 20 ms reader's first sight; ours can be the earlier one
+DEAL_WAIT_SECONDS = 2.5
+# The client takes no play in the first seconds of a battle: touches at ticks 70, 78, 86 refused, at 94 and 99
+# taken (and issued at tick 101, the first there is).
+FIRST_TAP_TICK = 95
+DEAL_MASK = os.environ.get('CR_DEAL_MASK') == '1'
+# Every play lands this many ticks after its moment (decision turn + the model's offset), counted
+# to its replay tick (issue + 20): the tap is held until then, less the measured tap -> issue lag,
+# so the landing does not wander with the pipeline's timing (the game is precise; the user,
+# 2026-09-26). 26 = the command's 20 + up to 6 ticks of our own reading, deciding and tapping; a
+# slower play lands late and is counted. The model is told this delay; training covered 23-27.
+TARGET_DELAY = int(os.environ.get('CR_TARGET_DELAY', '26'))
+# Decoding 'steady': the card-and-tile pick is sampled at this temperature instead of the trained 1.0
+# (when to act stays as trained, gate 0.2): a 60%-vs-10% tile choice goes the 10% way ~1 time in 400,
+# not 1 in 10, while near-ties still vary.
+STEADY_ACTION_TEMPERATURE = 0.3
+
+STARTED = time.time()
+_CODE_CHECK = {'at': 0.0, 'changed': []}
+
+
+def code_changed() -> list[str]:
+    """This console's own source files (ours and FirstLight's) changed since it started: it runs
+    the old code until Start restarts it, and the app says so. Checked at most every 5 s."""
+    now = time.time()
+    if now - _CODE_CHECK['at'] < 5:
+        return _CODE_CHECK['changed']
+    _CODE_CHECK['at'] = now
+    roots = [Path(__file__).resolve().parents[1], Path(FLB.FIRSTLIGHT).resolve()]
+    try:
+        modules = list(sys.modules.values())
+    except RuntimeError:            # a module being imported meanwhile: next time
+        return _CODE_CHECK['changed']
+    changed = []
+    for module in modules:
+        name = getattr(module, '__file__', None)
+        if not isinstance(name, str) or not name.endswith('.py'):
+            continue
+        path = Path(name).resolve()
+        root = next((r for r in roots if path.is_relative_to(r)), None)
+        try:
+            if root is not None and path.stat().st_mtime > STARTED:
+                changed.append(str(path.relative_to(root)))
+        except OSError:
+            continue
+    _CODE_CHECK['changed'] = sorted(changed)
+    return _CODE_CHECK['changed']
+
+
+# The user's choices that outlive a restart (Start): only the decoding preference.
+SETTINGS_FILE = Path(__file__).resolve().parents[1] / 'build' / f'console_settings_{PORT}.json'
+
+
+def load_settings() -> dict:
+    try:
+        return json.loads(SETTINGS_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(**values) -> None:
+    try:
+        SETTINGS_FILE.write_text(json.dumps(load_settings() | values))
+    except OSError:
+        pass
+
+
+# The deck the Hog 2.6 specialists trained on (FirstLight checkpoints/README.md), with the
+# forms their interface sets explicitly: 1 = evolution, 2 = hero. Our models (clapha:*) were
+# trained holding the same eight cards (il/train.py, il/rl.py: the learner is always the Hog 2.6
+# side), mostly with these forms.
+HOG26_DECK = {26000021: 0,   # Hog Rider
+              26000014: 2,   # Musketeer (hero)
+              27000000: 1,   # Cannon (evolution)
+              28000000: 0,   # Fireball
+              28000011: 0,   # The Log
+              26000010: 1,   # Skeletons (evolution)
+              26000038: 0,   # Ice Golem
+              26000030: 0}   # Ice Spirit
+
+
+def opponent_view(frame: dict, health: dict, plays: list, queue: list, accounts, prior=None) -> dict | None:
+    """What is known of the other side, for the overlay on the game (debugging). Three things, kept apart:
+
+      guess     the deck held for theirs before any card is seen -- the one their own console published, or the
+                deck the API says they have equipped. Dropped (None) the moment a card they play is not in it.
+      revealed  the cards they have actually played, in the order first seen; and from the order of their
+                plays, their hand: a played card goes to the back of an eight-card cycle, so once they have
+                played four, the hand is every card of theirs that is not among their last four plays (a card
+                not seen yet is an unknown, None), and the oldest of those four is the next to come back.
+      elixir    theirs, exact, as the game holds it.
+
+    Their plays are the commands that have executed plus the ones still in the queue: a card is out of their
+    hand from the moment it is played, and their command shows in our queue ~10 ticks after that."""
+    side = health.get('local_side')
+    if side not in (0, 1):
+        return None
+    other = 1 - side
+    tick = int(frame.get('game_tick') or 0)
+
+    def info(card_id: int, form: int = 0) -> dict:
+        card = V.CARDS.get(card_id, {})
+        return {'card_id': int(card_id), 'name': str(card.get('name', card_id)), 'form': int(form or 0),
+                'elixir': card.get('elixir')}
+    sequence = [(int(p.get('issue_tick') if isinstance(p.get('issue_tick'), int) else p['tick'] - COMMAND_AGE_TICKS),
+                 int(p['card_id']), int(p.get('form_code') or 0))
+                for p in plays if p.get('side') == other and p.get('kind', 'card') == 'card']
+    executed = {(p.get('issue_tick'), p.get('seq')) for p in plays if p.get('side') == other}
+    for entry in queue or ():
+        issue = entry.get('issue_tick')
+        if (not isinstance(issue, int) or (issue, entry.get('seq')) in executed
+                or issue + COMMAND_AGE_TICKS <= tick or V.entry_side(entry, accounts) != other):
+            continue
+        card_id, form, kind = V.card_identity(int(entry.get('card_id') or 0))
+        if kind == 'card':
+            sequence.append((issue, card_id, form))
+    sequence.sort()
+    forms = {card: form for _issue, card, form in sequence}          # the form of its latest play
+    revealed = list(dict.fromkeys(card for _issue, card, _form in sequence))
+    hand = following = None
+    if len(sequence) >= 4:
+        last = [card for _issue, card, _form in sequence[-4:]]
+        held = [card for card in revealed if card not in last]
+        hand = [info(card, forms[card]) for card in held] + [None] * max(0, 4 - len(held))
+        following = info(last[0], forms[last[0]])
+    # the deck held for theirs: shown for as long as nothing they have played contradicts it (ids compared as base
+    # cards: an evolution or hero form is the same card)
+    guess = source = kind = None
+    held_deck = [V.card_identity(int(card))[0] for card in (prior or {}).get('cards') or ()]
+    if held_deck and all(card in held_deck for card in revealed):
+        guess = [info(card, form) for card, form in zip(held_deck, prior.get('forms') or [0] * 8)]
+        source, kind = prior.get('source'), prior.get('kind')
+    them = next((p for p in frame.get('players') or () if p.get('side') == other), None)
+    return {'elixir': None if them is None else (them.get('elixir_raw') or 0) / 10000.0,
+            'guess': guess, 'guess_source': source, 'guess_kind': kind, 'plays': len(sequence),
+            'revealed': [info(card, forms[card]) for card in revealed], 'hand': hand, 'next': following}
+
+
+def pending_commands(queue: list, accounts, tick: int, local_side=None,
+                     layout=None) -> list[dict]:
+    """Every command in the queue, both sides, for the board's ghost markers.
+
+    A command executes COMMAND_AGE_TICKS after its issue tick; until then it is only a
+    promise -- which is why the app draws it apart from real units (dashed, with a countdown).
+    Opponent commands reach us ~7 ticks after issue, so they show ~0.7 s before landing.
+    """
+    out = []
+    for entry in queue or ():
+        issue = entry.get('issue_tick')
+        if not isinstance(issue, int) or int(entry.get('card_id') or 0) <= 0:
+            continue
+        card_id, form, kind = V.card_identity(entry['card_id'])
+        side = V.entry_side(entry, accounts)
+        remaining = issue + COMMAND_AGE_TICKS - int(tick)
+        if side is None or remaining < 0:
+            continue
+        out.append({**(overlay_geometry(entry.get('x'), entry.get('y'), card_id, local_side,
+                                        layout) if kind == 'card' else {}),
+                    'x': entry.get('x'), 'y': entry.get('y'), 'side': int(side),
+                    'card_id': card_id, 'form': form, 'kind': kind,
+                    'name': ('ability' if kind == 'ability' else
+                             V.CARDS.get(card_id, {}).get('name', str(card_id))),
+                    'remaining_ticks': remaining})
+    return out
+
+
+def native_to_screen(x: int, y: int, side: int, layout) -> tuple[float, float]:
+    """Native board point -> device pixel, the continuous form of layout_fix's
+    deployment_point (identical at tile centres, which the taps verify)."""
+    cx, cy = (18000 - x, 32000 - y) if side == 1 else (x, y)
+    fx = 1 - cx / 18000
+    return (layout.arena_left + fx * (layout.arena_right - layout.arena_left),
+            layout.arena_bottom - cy / 32000 * (layout.arena_bottom - layout.arena_top))
+
+
+def overlay_geometry(x, y, card_id: int, local_side, layout) -> dict:
+    """Where a marker goes on the device screen, and a spell's range as an ellipse in pixels."""
+    if layout is None or local_side not in (0, 1) or x is None or y is None:
+        return {}
+    try:
+        sx, sy = native_to_screen(int(x), int(y), local_side, layout)
+    except (AttributeError, TypeError):
+        return {}
+    radius = LANDING.SPELL_RADIUS.get(int(card_id))
+    return {'screen_x': round(sx), 'screen_y': round(sy),
+            'screen_w': layout.width, 'screen_h': layout.height,
+            'radius_x': (round(radius * 1000 / 18000 * (layout.arena_right - layout.arena_left))
+                         if radius else None),
+            'radius_y': (round(radius * 1000 / 32000 * (layout.arena_bottom - layout.arena_top))
+                         if radius else None)}
+
+
+LANDINGS = LANDING.LandingTracker()
+
+
+def landings_for_overlay(frame, health, plays, layout) -> list[dict]:
+    """Opponent spells still flying and Miner / Drill / Barrel still travelling, in the same
+    shape as pending_commands, with remaining_ticks = -1 ('incoming')."""
+    side = health.get('local_side')
+    if side not in (0, 1):
+        return []
+    out = []
+    for landing in LANDINGS.update((frame.get('chain') or {}).get('battle'),
+                                   int(frame.get('game_tick') or 0), 1 - side, plays,
+                                   frame.get('entities')):
+        out.append({**overlay_geometry(landing['x'], landing['y'], landing['card_id'], side,
+                                       layout),
+                    'x': landing['x'], 'y': landing['y'], 'side': 1 - side,
+                    'card_id': landing['card_id'], 'form': landing['form'], 'kind': 'card',
+                    'name': V.CARDS.get(landing['card_id'], {}).get('name',
+                                                                   str(landing['card_id'])),
+                    'remaining_ticks': -1})
+    return out
+
+
+def screen_cell(column: int, row: int, side: int) -> int:
+    """FirstLight's native tile -> the cell ScreenLayout.deployment_point expects.
+
+    deployment_point takes a CANONICAL cell: the local player's own view, row 0 at their own
+    back line (verified in Training Camp as side 1: canonical (8500, 9500) landed native
+    (9500, 22500)). FirstLight decodes to NATIVE tiles, which for side 1 is that view rotated
+    180 degrees. Passing the native cell straight through sent every side-1 play to the
+    point-mirrored tile: own-half troops were aimed into the enemy half (the client snaps them
+    to the nearest legal tile) and spells landed on the wrong lane.
+    """
+    if side == 1:
+        column, row = X_TILES - 1 - column, Y_TILES - 1 - row
+    return row * X_TILES + column
 
 
 def opponent_deck_file(account, *, fresh_after: float):
@@ -49,6 +314,33 @@ def opponent_deck_file(account, *, fresh_after: float):
     return list(deck), body.get('forms'), f'opponent deck from their console: {names}'
 
 
+class OutcomeLatch:
+    """Acts on a battle result only once it has held for half a second -- one misread frame
+    must not end a battle for us -- and resumes play if the result goes away again."""
+    HOLD_S = 0.5
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.result, self.since, self.over = None, None, False
+
+    def update(self, result, now: float) -> str | None:
+        """'over' the moment the battle counts as decided, 'withdrawn' if a decided result
+        goes away, otherwise None. A decided battle is recorded once."""
+        if result is None:
+            self.since = None
+            if self.over:
+                self.over, self.result = False, None
+                return 'withdrawn'
+            return None
+        self.since = self.since if self.since is not None else now
+        if not self.over and now - self.since >= self.HOLD_S:
+            self.result, self.over = result, True
+            return 'over'
+        return None
+
+
 class Bot:
     """Mirrors the user's bots.py loop: decide every STEP_TICKS, one play in flight at a
     time, never decide while our own command is still queued."""
@@ -60,16 +352,75 @@ class Bot:
         self.status = 'off'
         self.plays = 0
         self.last_play = ''
+        self.last_result = ''
         self._last_line, self._repeats, self._first_stamp = None, 0, ''
         self.log: list[str] = []
         self.thread = None
         self.layout = None
         self.gate = 'unchecked'
         self.gate_ok = False
+        self.decoding = load_settings().get('decoding', 'auto')    # auto | sampled | steady | greedy
+        self.decoding_used = None
+        self.deck_warning = ''          # the deck is not the one the model was trained on
         self.tracker = None
         self.opp_deck = None
         self.seen_plays = 0
         self.deduced = ''
+        self.rtt: list[int] = []   # our taps: game ticks from tap to the command's issue tick
+        # Each play's pipeline delay: ticks from its moment (decision turn + the model's 0-4 tick
+        # offset) to its issue tick, plays held for elixir left out -- the record of how often a
+        # play missed its TARGET_DELAY landing; kept across battles (it belongs to this setup).
+        self.overheads: list[int] = []
+        self.told_delay: int | None = None
+        self.late_plays = 0
+        self.tapper = None
+        self._timing = None
+        self._battle_key = None
+        self._resend: list[dict] = []
+        self.opponent_prior: dict | None = None       # the deck their console published, for this battle
+        self._dealt: dict[int, tuple[int, int]] = {}     # hand slot -> (deck index, device us it was first seen there)
+        self.opponent_intel = None
+
+    def prior_deck(self, battle) -> dict | None:
+        """The deck held for the opponent's before they play, in this battle: the one their own console published
+        (a friendly between the user's accounts), else the deck the API says they have equipped."""
+        if not self.running or str(battle) != str(self._battle_key):
+            return None
+        if self.opponent_prior and self.opponent_prior.get('battle') == str(battle):
+            return self.opponent_prior
+        intel = self.opponent_intel
+        if intel and intel.get('deck') and len(intel['deck']) == 8:
+            return {'cards': [int(c['card_id']) for c in intel['deck']],
+                    'forms': [2 if c.get('hero') else 1 if c.get('evolution_level') else 0 for c in intel['deck']],
+                    'source': 'guess: the deck the API says they have equipped', 'kind': 'api'}
+        return None
+
+    def model_warning(self) -> str:
+        """FirstLight's own checkpoints were trained with plays that land at once. Live a play lands ~1.3 s
+        after its decision, so they act too late (2026-10-02, fl:general in friendlies: its Cannon came down
+        50-74 ticks after a Hog, ours 26-48; a third of them no longer pulled it)."""
+        if self.running and self.armed and str(self.model).startswith('fl:'):
+            return (f'{self.model} was trained without the game\'s 1.3 s command delay: its plays land later '
+                    f'than it expects (Cannon often too late to pull). The clapha models are trained for it.')
+        return ''
+
+    def trace(self, kind: str, **row) -> None:
+        """One line of the timing record: where each turn's and each play's time goes, from the frame
+        the policy saw to the game's issue tick (il/timing.py sums it up)."""
+        try:
+            if self._timing is None:
+                self._timing = open(TIMING_FILE, 'a', encoding='utf-8', buffering=1)
+            row = {k: (round(v, 4) if isinstance(v, float) else v) for k, v in row.items()}
+            self._timing.write(json.dumps({'kind': kind, 't': round(time.time(), 4), 'port': PORT,
+                                           'battle': self._battle_key, **row}) + '\n')
+        except OSError:
+            pass
+
+    def _tap_lag(self) -> int:
+        """Ticks from our tap (the frame we tapped on) to the game's issue tick: median of the last 9
+        (self.rtt), 2 before any; the hold sends each tap this much before its landing target."""
+        recent = sorted(self.rtt[-9:])
+        return min(6, recent[len(recent) // 2]) if recent else 2
 
     def note(self, line: str) -> None:
         """Log a line on the page and to a file.
@@ -99,6 +450,7 @@ class Bot:
             return f'unknown model {model}'
         self.model, self.armed, self.plays = model, armed, 0
         self.running = True
+        self.deck_warning = ''
         self.status = f'{model}: loading'
         self.log = []
         self.thread = threading.Thread(target=self._run, daemon=True)
@@ -108,7 +460,597 @@ class Bot:
     def stop(self) -> str:
         self.running = False
         self.status = 'off'
+        thread = getattr(self, 'thread', None)
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=3.0)     # the loop checks `running` at least every 0.3 s
         return 'stopped'
+
+    EVO_FILE = Path(__file__).resolve().parents[1] / 'build' / 'evo_cycles.json'
+
+    @property
+    def evo_required(self) -> dict:
+        if not hasattr(self, '_evo_required'):
+            try:
+                self._evo_required = {int(k): int(v) for k, v in
+                                      json.loads(self.EVO_FILE.read_text()).items()}
+            except (OSError, ValueError):
+                self._evo_required = {}
+        return self._evo_required
+
+    def _measure_evolutions(self, deck: list, me: dict, battle, tick: int) -> None:
+        """The game's own evolution requirement per card: a deck slot's progress counter rises
+        by one per normal play and falls to 0 on the evolved play (device: Skeletons
+        0 -> 1 -> 2 -> 0), so a fall from k to 0 means the card needs k. Remembered across
+        runs; used instead of FirstLight's 15.535 cycle counts, which differ for many cards.
+
+        Only a fall inside one battle counts: every counter starts the next battle at 0, and
+        comparing across that boundary read "needs 1" for Skeletons and Cannon at the start of
+        the 2026-09-25 09:34 friendly (the previous battle had ended with both at 1)."""
+        progress = me.get('evo_progress') or []
+        previous = getattr(self, '_last_progress', None)
+        self._last_progress = (battle, int(tick), list(deck), list(progress))
+        if (not previous or previous[0] != battle or not 0 <= int(tick) - previous[1] <= 100
+                or previous[2] != list(deck) or len(progress) != len(deck)):
+            return
+        for slot, (before, now) in enumerate(zip(previous[3], progress)):
+            if before > 0 and now == 0:
+                card = int(deck[slot])
+                known = self.evo_required.get(card)
+                if known != before:
+                    self.evo_required[card] = int(before)
+                    self.EVO_FILE.parent.mkdir(parents=True, exist_ok=True)
+                    self.EVO_FILE.write_text(json.dumps({str(k): v for k, v in
+                                                         sorted(self.evo_required.items())}))
+                    self.note(f'evolution requirement measured: '
+                              f'{V.CARDS.get(card, {}).get("name", card)} needs {before} plays'
+                              + (f' (was {known})' if known else ''))
+
+    OTHER_CONSOLES = (8777, 8778)
+
+    def _decide_sampling(self, accounts, side) -> bool:
+        """Sampled or greedy decoding for this battle, the way FirstLight runs each setup:
+        against a human or a bot their run_offline_match samples; a model against a model is
+        their offline_duel, which decodes greedily. 'auto' tells them apart by asking the other
+        console whether it is running a model against this one's account."""
+        if self.decoding in ('sampled', 'steady', 'greedy'):
+            choice = self.decoding
+            why = ('set by hand' if choice != 'steady' else
+                   f'set by hand: when to act sampled as trained, card and tile at temperature {STEADY_ACTION_TEMPERATURE} '
+                   '(as trained: 1.0, so a 10% tile was played one time in ten)')
+        else:
+            opponent = next((a['lo'] for a in (accounts or []) if a and a.get('side') == 1 - side), None)
+            duel = False
+            for port in self.OTHER_CONSOLES:
+                if port == PORT or opponent is None:
+                    continue
+                try:
+                    import urllib.request
+                    with urllib.request.urlopen(f'http://127.0.0.1:{port}/state?log=1', timeout=1.0) as reply:
+                        other = json.loads(reply.read())
+                    theirs = (other.get('bot') or {})
+                    other_account = None
+                    for path in V.DECKS.glob('*.json'):
+                        body = json.loads(path.read_text())
+                        if body.get('account_lo') == opponent:
+                            other_account = opponent
+                    duel = bool(theirs.get('running')) and other_account is not None
+                except Exception:  # noqa: BLE001  - the other console may simply be off
+                    continue
+            choice = 'greedy' if duel else 'sampled'
+            why = ('model against model (your other device is running one): FirstLight\'s '
+                   'offline_duel decodes greedily' if duel else
+                   'against a human or a bot: FirstLight\'s run_offline_match samples')
+        self.decoding_used = choice
+        self.note(f'decoding: {choice.upper()} - {why}')
+        return choice in ('sampled', 'steady')
+
+    def set_mode(self, mode: str, model: str | None) -> str:
+        """One control instead of start/stop + an 'armed' box: off, watch (decides, never
+        taps) or play (taps). Watch <-> play on the same model only flips taps, so the policy's
+        episode and recurrent state carry on; a different model restarts it."""
+        if mode not in ('off', 'watch', 'play'):
+            return f'unknown mode {mode}'
+        if mode == 'off':
+            return self.stop()
+        model = model or self.model
+        if not model:
+            return 'pick a model'
+        if self.running and model == self.model:
+            self.armed = mode == 'play'
+            self.note(f'mode -> {mode.upper()}' + (' (taps on)' if self.armed else
+                                                   ' (decides, no taps)'))
+            return 'ok'
+        if self.running:
+            self.stop()
+        return self.start(model, mode == 'play')
+
+    def _settle_in_flight(self, in_flight: list[dict], queue: list, executed: list,
+                          local_account, side: int, tick: int) -> list[dict]:
+        """Match our taps to their queue entries, time the round trip, and drop plays that
+        have executed (issue + 21, when the client debits the elixir) or never arrived.
+
+        A command the 100 ms queue sampler never caught still shows up in the executed list,
+        so that is searched too; otherwise its elixir would stay reserved until the timeout."""
+        claimed = {(f.get('issue_tick'), f.get('seq')) for f in in_flight}
+        own_executed = [dict(p, account_lo=local_account) for p in executed
+                        if p.get('side') == side and p.get('kind', 'card') == 'card']
+        for flight in in_flight:
+            if flight.get('issue_tick') is not None:
+                continue
+            for entry in [*queue, *own_executed]:
+                key = (entry.get('issue_tick'), entry.get('seq'))
+                if (key in claimed or entry.get('card_id') != flight['card']
+                        or not isinstance(entry.get('issue_tick'), int)
+                        or entry['issue_tick'] < flight['tap_tick'] - 2
+                        or (local_account is not None
+                            and entry.get('account_lo') != local_account)):
+                    continue
+                flight['issue_tick'], flight['seq'] = key
+                claimed.add(key)
+                self.rtt.append(max(0, entry['issue_tick'] - flight['tap_tick']))
+                del self.rtt[:-50]
+                if flight.get('turn') is not None and not flight.get('elixir_wait') and not flight.get('deal_wait'):
+                    overhead = max(0, entry['issue_tick'] - flight['turn'] - flight['offset'])
+                    self.overheads.append(overhead)
+                    del self.overheads[:-50]
+                    late = overhead - (TARGET_DELAY - COMMAND_AGE_TICKS + 1)
+                    if late > 0:
+                        self.late_plays += 1
+                        self.note(f'late play: landed {late} tick(s) after its target '
+                                  f'({self.late_plays} late so far)')
+                self._report_latency(flight)
+                self._report_placement(flight, entry)
+                self._trace_play(flight, entry['issue_tick'])
+                break
+        now = time.time()
+
+        def lost(flight: dict) -> bool:
+            return flight.get('issue_tick') is None and (tick - flight['tap_tick'] > LOST_AFTER_TICKS
+                                                         or now - flight['tap_time'] > IN_FLIGHT_SECONDS)
+        for flight in in_flight:
+            if not lost(flight):
+                continue
+            name = V.CARDS.get(flight['card'], {}).get('name', flight['card'])
+            again = not flight.get('resent') and flight.get('row') is not None
+            self.note(f'tap for {name} never reached the game ({tick - flight["tap_tick"]} ticks): '
+                      + ('sending it again' if again else 'the play was lost'))
+            self._trace_play(flight, None)
+            if again:
+                self._resend.append({'card': flight['card'], 'row': flight['row'], 'column': flight['column'],
+                                     'since': now, 'turn': flight.get('turn'), 'offset': flight.get('offset', 0),
+                                     'not_before': 0, 'resend': True,
+                                     'timing': {k: v for k, v in (flight.get('timing') or {}).items()
+                                                if k in ('decided', 'inference_ms', 'frame_age_ms', 'turn_wait_ms',
+                                                         'frame_tick', 'frame_us', 'received', 'began', 'started')}})
+        return [f for f in in_flight
+                if (f.get('issue_tick') is None and not lost(f))
+                or (f.get('issue_tick') is not None
+                    and tick < f['issue_tick'] + COMMAND_AGE_TICKS)]
+
+    def _trace_play(self, flight: dict, issue_tick: int | None) -> None:
+        """A play's line in the timing record: its moment, the issue tick it was held for, the one it
+        got, and every timestamp between the frame and the tap (issue_tick None: the tap was lost)."""
+        timing = dict(flight.get('timing') or {})
+        target = (flight['turn'] + flight['offset'] + TARGET_DELAY - COMMAND_AGE_TICKS + 1
+                  if flight.get('turn') is not None else None)
+        ack = (self.tapper.timing_of(timing['tap_n'])
+               if self.tapper is not None and timing.get('tap_n') else None) or {}
+        self.trace('play' if issue_tick is not None else 'lost',
+                   card=V.CARDS.get(flight['card'], {}).get('name', flight['card']), turn=flight.get('turn'),
+                   offset=flight.get('offset'), target_issue=target, issue_tick=issue_tick,
+                   late=(issue_tick - target) if issue_tick is not None and target is not None else None,
+                   elixir_wait=bool(flight.get('elixir_wait')), deal_wait=bool(flight.get('deal_wait')),
+                   delay=TARGET_DELAY,
+                   gesture_ms=ack.get('gesture_ms'), ack_ms=ack.get('ack_ms'), **timing)
+
+    def _report_placement(self, flight: dict, entry: dict) -> None:
+        """Where the game put the command, against where the policy asked, both native.
+        A building or troop lands on the tile; anything over a tile off is a mapping bug."""
+        target = flight.get('target')
+        if not target or entry.get('x') is None or entry.get('y') is None:
+            return
+        dx, dy = (entry['x'] - target[0]) / 1000.0, (entry['y'] - target[1]) / 1000.0
+        off = (dx * dx + dy * dy) ** 0.5
+        name = V.CARDS.get(flight['card'], {}).get('name', flight['card'])
+        self.note(f'placement {name}: asked native ({target[0]}, {target[1]}), game got '
+                  f'({entry["x"]}, {entry["y"]}), off {off:.1f} tiles'
+                  + ('  <-- MISPLACED' if off > 1.5 else ''))
+
+    def _lookup_opponent(self, accounts, side: int, battle=None) -> None:
+        """Opponent's tag and currently equipped deck from the official API, in the
+        background (never delays a decision). A prior, not ground truth: logged and saved to
+        build/opponent_decks/, while the tracker still learns their real deck card by card.
+        Skipped for Training Camp (the trainer has no account) and without an API token."""
+        opponent = next((a for a in (accounts or []) if a and a.get('side') == 1 - side), None)
+        if not opponent or int(opponent.get('lo') or 0) <= 0 or INTEL.token() is None:
+            return
+
+        def work():
+            info = INTEL.lookup(int(opponent.get('hi') or 0), int(opponent['lo']))
+            if info['error']:
+                self.note(f'opponent {info["tag"]}: deck lookup failed - {info["error"][:120]}')
+                return
+            cards = ', '.join(f'{c["name"]}{" (evo)" if c["evolution_level"] else ""}'
+                              for c in info['deck'])
+            self.note(f'opponent {info["tag"]} {info["name"]} ({info["trophies"]} trophies), '
+                      f'equipped deck per API: {cards}')
+            self.opponent_intel = info
+            # Kept with the match recording (same session folder as frames.jsonl /
+            # queue.jsonl), so training data carries what the API said about each opponent.
+            try:
+                V.SESSION.mkdir(parents=True, exist_ok=True)
+                with open(V.SESSION / 'opponent_intel.jsonl', 'a', encoding='utf-8') as handle:
+                    handle.write(json.dumps({'battle': battle, 'side': 1 - side,
+                                             'looked_up': time.time(), **info}) + '\n')
+            except OSError:
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _report_queue_oddities(self, executed: list, handled: set) -> None:
+        """Say, once per play, about queue entries that cannot become a card play."""
+        for play in executed:
+            kind = play.get('kind', 'card')
+            if kind == 'card':
+                continue
+            key = (play.get('issue_tick'), play.get('seq'), play.get('raw_card_id'))
+            if key in handled:
+                continue
+            handled.add(key)
+            raw = play.get('raw_card_id', play.get('card_id'))
+            if kind == 'unknown':
+                self.note(f'queue: card id {raw} is not in this build\'s catalog '
+                          f'(game update?) - play not registered')
+            elif kind == 'unattributed':
+                self.note(f'queue: a play of {V.CARDS.get(play.get("card_id"), {}).get("name", raw)}'
+                          f' could not be attributed to a side - not registered')
+            elif kind == 'ability' and play.get('ability_card') is None:
+                self.note(f't={play["tick"]/20:5.1f}s  side {play["side"]} activated an ability')
+
+    def _report_latency(self, flight: dict) -> None:
+        """One line per play: where the time went between the frame the policy saw and the
+        command reaching the game. Everything after that (issue + 21 ticks to execute) is the
+        game's own command delay, the same for a human."""
+        timing = flight.get('timing') or {}
+        gesture = ''
+        if self.tapper is not None and self.tapper.timings:
+            last = self.tapper.timings[-1]
+            gesture = f', gesture {last["gesture_ms"]:.0f} ms'
+        ticks = flight['issue_tick'] - flight['tap_tick']
+        self.note(f'latency {V.CARDS.get(flight["card"], {}).get("name", flight["card"])}: '
+                  f'frame age {timing.get("frame_age_ms", 0):.0f} ms, '
+                  f'turn wait {timing.get("turn_wait_ms", 0):.0f} ms, '
+                  f'inference {timing.get("inference_ms", 0):.0f} ms, '
+                  f'tap sent {timing.get("send_ms", 0):.0f} ms after decision{gesture}, '
+                  f'tap -> issued {ticks} ticks ({ticks * 50} ms), then 21 ticks to land')
+
+    @staticmethod
+    def _input_view(runner, frame: dict, me: dict, in_flight: list[dict], holding=()):
+        """(frame for the observation, own row to tap from, elixir reserved) for this runner.
+
+        FirstLight's checkpoints get the game state, with in-flight taps' elixir reserved -- what
+        they have always had here. Ours (il/train.py) were trained on the screen: in-flight cards
+        already out of the hand, the next card in, their cost off the elixir (il/SPEC.md), built
+        by the same firstlight_obs.screen_view as their training data; taps then find a card at
+        its screen position. If the reader's hand does not fit the in-flight list, the game state
+        is used for this frame rather than a guess.
+
+        holding: plays chosen and still waiting for the game to deal their card. Their elixir is as good as
+        spent -- the bar will not have it when they go out -- so it is taken off for every other choice (a
+        Cannon picked against elixir a waiting Musketeer was about to take was dropped, 2026-10-03)."""
+        held = sum(float(V.CARDS.get(m['card'], {}).get('elixir') or 0) for m in holding)
+        if not getattr(runner, 'clapha_inputs', False):
+            return frame, me, sum(f['cost'] for f in in_flight) + held
+        try:
+            # a model trained with the game's deal rule is offered only the cards the game has dealt
+            # (CR_DEAL_MASK=1: any of our models, to try it); for the others the tap waits (DEALT_MS)
+            view = FLO.screen_view(me, [f['card'] for f in in_flight],
+                                   deal_rule=getattr(runner, 'deal_rule', False) or DEAL_MASK)
+        except ValueError:
+            return frame, me, sum(f['cost'] for f in in_flight) + held
+        if held:
+            view = {**view, 'elixir_raw': max(0, int(view['elixir_raw']) - int(round(held * 10000)))}
+        side = me.get('side')
+        players = [view if p.get('side') == side else p for p in frame['players']]
+        return {**frame, 'players': players}, view, 0.0
+
+    @staticmethod
+    def _holding(deferred: list[dict], apart_from: dict | None = None) -> list[dict]:
+        """The deferred plays that wait for their card's deal, apart from the one being tried (and any other
+        entry for its card: a newer choice of a card replaces the waiting one)."""
+        return [d for d in deferred if d.get('deal_wait') and d is not apart_from
+                and (apart_from is None or d['card'] != apart_from['card'])]
+
+    def _feed_extras(self, runner, frame: dict, side: int, in_flight: list[dict], queue: list,
+                     accounts, hand_forms: dict, delay: int = COMMAND_AGE_TICKS - 1 + 5) -> None:
+        """Stage B inputs for a checkpoint with the extras head (il/extras.py), as its training
+        built them: our taps not executed yet (landing tick = tap + 21 until the queue gives the
+        issue tick), the opponent's commands now in our queue, their exact elixir, our delay; each
+        pending card's arrival (il/flight.py) and both players' hero and champion controllers."""
+        from il.extras import AbilityClock, build_extras, install_session_hook
+        from il.flight import flight_ticks
+        tick = int(frame['game_tick'])
+        pending = []
+        for flight in in_flight:
+            issue = flight.get('issue_tick', flight['tap_tick'])
+            column, row = (flight['target'][0] // 1000, flight['target'][1] // 1000) if flight.get('target') else (None, None)
+            # the form it was tapped in: once sent, the card is no longer in the hand to ask
+            # (a hero read as 0 here would contradict training, which gives heroes 2)
+            form = flight['form'] if 'form' in flight else int(hand_forms.get(flight['card'], 0))
+            tile = (column, row) if column is not None else None
+            pending.append((flight['card'], int(form), 0, tile, issue + COMMAND_AGE_TICKS - tick,
+                            issue + COMMAND_AGE_TICKS - tick + flight_ticks(flight['card'], side, tile)))
+        own_account = next((a['lo'] for a in (accounts or []) if a and a.get('side') == side), None)
+        for entry in queue or ():
+            if entry.get('account_lo') == own_account or not isinstance(entry.get('issue_tick'), int):
+                continue
+            card_id, form_code, kind = V.card_identity(entry.get('card_id'))
+            if kind != 'card' or entry.get('x') is None:
+                continue
+            if entry['issue_tick'] + COMMAND_AGE_TICKS - tick <= 0:
+                continue       # executed already: the queue keeps landed commands for a while
+            tile = (int(entry['x']) // 1000, int(entry['y']) // 1000)
+            pending.append((card_id, form_code, 1, tile, entry['issue_tick'] + COMMAND_AGE_TICKS - tick,
+                            entry['issue_tick'] + COMMAND_AGE_TICKS - tick + flight_ticks(card_id, 1 - side, tile)))
+        opponent = next((p for p in frame['players'] if p.get('side') == 1 - side), {})
+        # the controllers, ours first; the clock lives with the battle's session
+        clock = getattr(runner.session, '_ability_clock', None)
+        if clock is None:
+            clock = AbilityClock()
+            runner.session._ability_clock = clock
+        by_character = FLO.ability_card_by_character()
+        abilities = []
+        for player in sorted(frame['players'], key=lambda q: q.get('side') != side):
+            for controller in player.get('abilities') or ():
+                joined = by_character.get(int(controller.get('character_id') or 0) & 0xFFFFFFFF)
+                if joined is None:
+                    continue
+                button, remaining = int(controller.get('button', 0)), int(controller.get('cooldown_ms') or 0)
+                charges = int(controller.get('charges', -1))
+                since = clock.update((player.get('side'), int(controller.get('controller_slot', 0))), tick,
+                                     button, remaining, charges)
+                abilities.append((joined[0], joined[1], 0 if player.get('side') == side else 1, button, remaining,
+                                  int(controller.get('configured_ms') or 0), charges, since))
+        install_session_hook(runner.session)
+        runner.session.next_extras = build_extras(
+            runner.session.tensorizer, pending, opponent_elixir=(opponent.get('elixir_raw') or 0) / 10000.0,
+            delay=delay, abilities=abilities)
+
+    def _note_hand(self, hand, sample_us: int) -> None:
+        """Since when (the device's clock) each slot of the game's own hand has held its card; the hand the
+        console first sees in a battle: always."""
+        first = not self._dealt
+        for position, index in enumerate(hand):
+            if self._dealt.get(position, (None, 0))[0] != index:
+                self._dealt[position] = (index, -10 ** 15 if first else int(sample_us))
+
+    @staticmethod
+    def _wait_limit(move: dict) -> float:
+        """Seconds a play may wait for what it is waiting for."""
+        return DEAL_WAIT_SECONDS if move.get('wait') == 'not dealt yet' else DEFER_SECONDS
+
+    def _try_play(self, move: dict, me: dict, deck: list, reserved: float,
+                  in_flight: list[dict], accounts, side: int, frame: dict) -> bool:
+        """Tap one play. True when it is done with (tapped, or refused for good); False when it
+        should wait for elixir.
+
+        `me` is the hand the model chose from (the screen view for our models: a card sent is out, the
+        next one in). The tap goes to the slot where the game's own hand in `frame` holds the card, its first
+        touch DEALT_MS after the card was first seen there: before that the client may not take it (DEALT_MS).
+        """
+        card = move['card']
+        name = V.CARDS.get(card, {}).get('name', str(card))
+        if any(f['card'] == card for f in in_flight):
+            return True        # already on its way; the policy's state includes it
+        if int(frame['game_tick']) < move.get('not_before', 0):
+            move['wait'] = 'held for its moment'
+            return False       # its moment in the turn (the model's 0-4 tick offset) has not come
+        positions = [pos for pos, index in enumerate(me['hand_deck_indices'])
+                     if 0 <= index < len(deck) and deck[index] == card]
+        if not positions:
+            move['wait'] = 'not in the hand'
+            return False       # not in the hand (yet): the hand changed since the frame
+        if int(frame['game_tick']) < FIRST_TAP_TICK:
+            move['wait'] = 'the battle has not opened'
+            return False
+        own = next((p for p in frame['players'] if p.get('side') == side), None) or me
+        position = next((pos for pos, index in enumerate(own['hand_deck_indices'])
+                         if 0 <= index < len(deck) and deck[index] == card
+                         and self._dealt.get(pos, (index, 0))[0] == index), None)
+        if position is None:
+            move['wait'] = 'not dealt yet'
+            move['deal_wait'] = True
+            return False       # the game has not dealt it (the play before it in that slot has not executed)
+        # the first touch goes down DEALT_MS after the card was first seen in the game's hand, on the device's
+        # clock. A fast_tap that can start a gesture at a given time (version 3) is handed it one frame ahead;
+        # otherwise the play waits here until that time has passed.
+        ready_us = self._dealt[position][1] + DEALT_MS * 1000
+        now_us = int(frame.get('sample_monotonic_us') or 0)
+        timed = self.tapper is not None and self.tapper.alive() and getattr(self.tapper, 'version', 2) >= 3
+        if now_us and now_us < ready_us - (80_000 if timed else 0):
+            move['wait'] = 'not dealt yet'
+            move['deal_wait'] = True
+            return False
+        at_us = ready_us if now_us and now_us < ready_us else None
+        cost = float(V.CARDS.get(card, {}).get('elixir') or 0)
+        if me['elixir_raw'] / 10000.0 - reserved < cost - 1e-6:
+            move['elixir_wait'] = True
+            move['wait'] = 'waiting for elixir'
+            return False       # the client cannot place it yet
+        cell = screen_cell(move['column'], move['row'], side)
+        allowed, reason = scope_gate.check(accounts, side)
+        if reason != self.gate:
+            self.gate, self.gate_ok = reason, allowed
+            self.note(('scope: ' if allowed else 'SCOPE BLOCK: ') + reason)
+        if not self.armed or not allowed:
+            why = ' [dry run]' if not self.armed else ' [BLOCKED by scope gate]'
+            self.note(f't={frame["game_tick"]/20:5.1f}s  would play {name} '
+                      f'slot {position} at row {move["row"]} col {move["column"]}{why}')
+            return True
+        try:
+            if self.tapper is not None and self.tapper.alive():
+                sent = self.tapper.play(self.layout.hand_point(position),
+                                        self.layout.deployment_point(cell, side), at_us=at_us,
+                                        wait_ms=(at_us - now_us) / 1000.0 if at_us else 0.0)
+            else:
+                send_card_taps(ADB, SERIAL, self.layout, position, cell, side=side)
+                sent = time.time()
+        except Exception as error:  # noqa: BLE001
+            self.note(f'tap failed: {error}')
+            return True
+        timing = dict(move.get('timing') or {})
+        if 'decided' in timing:
+            timing['send_ms'] = (sent - timing['decided']) * 1000.0
+        timing.update(resend=bool(move.get('resend')),
+                      tap_sent=sent, tap_tick=int(frame['game_tick']), tap_us=frame.get('sample_monotonic_us'),
+                      not_before=move.get('not_before'), lag_used=self._tap_lag(), at_us=at_us,
+                      tap_n=self.tapper.count if self.tapper is not None and self.tapper.alive() else None)
+        in_flight.append({'slot': own['hand_deck_indices'][position], 'card': card,
+                          'form': int((getattr(self, '_hand_forms', None) or {}).get(card, 0)),
+                          'cost': cost, 'tap_tick': int(frame['game_tick']),
+                          'tap_time': sent, 'timing': timing,
+                          'turn': move.get('turn'), 'offset': int(move.get('offset', 0)),
+                          'elixir_wait': bool(move.get('elixir_wait')), 'deal_wait': bool(move.get('deal_wait')),
+                          'row': move['row'], 'column': move['column'], 'resent': bool(move.get('resend')),
+                          'target': (move['column'] * 1000 + 500, move['row'] * 1000 + 500)})
+        self.plays += 1
+        self.last_play = f'{name} at row {move["row"]} col {move["column"]}'
+        waited = time.time() - move['since']
+        why = ('for the card to be dealt' if move.get('deal_wait')
+               else 'for elixir' if move.get('elixir_wait') else '')
+        self.note(f't={frame["game_tick"]/20:5.1f}s  {name:<14} row {move["row"]:2} '
+                  f'col {move["column"]:2}' + (f'  (waited {waited:.1f}s {why})'
+                                               if why and waited > 0.15 else ''))
+        return True
+
+    # Hero ability buttons on the 1440x2560 device: centres ~(140, 1955) and ~(1300, 1955), just
+    # above the hand. Which side a button uses is a game setting, so it differs per account: one
+    # screenshot (2026-09-24) had a single hero on the LEFT, the 2026-09-25 friendly had it on the
+    # RIGHT (and taps on the left did nothing). The side is therefore learned per account: a tap
+    # that leaves the button Ready with the same charges for 2.5 s missed, and the other side is
+    # used from then on (build/ability_buttons.json).
+    ABILITY_BUTTONS = {'left': (140, 1955), 'right': (1300, 1955)}
+    ABILITY_DEFAULTS = {'single': 'right', 'dual_1': 'left', 'dual_2': 'right'}
+    ABILITY_SIDES = Path(__file__).resolve().parents[1] / 'build' / 'ability_buttons.json'
+
+    def _ability_sides(self) -> dict:
+        try:
+            return json.loads(self.ABILITY_SIDES.read_text())
+        except (OSError, ValueError):
+            return {}
+
+    def _ability_side(self, controller_slot: int, me: dict, account) -> tuple[str, str]:
+        bound = [a for a in me.get('abilities') or () if int(a.get('character_id') or 0)]
+        key = 'single' if len(bound) < 2 else f'dual_{controller_slot}'
+        learned = self._ability_sides().get(str(account), {})
+        return key, learned.get(key, self.ABILITY_DEFAULTS.get(key, 'right'))
+
+    def _ability_point(self, side_name: str) -> tuple[int, int]:
+        x, y = self.ABILITY_BUTTONS[side_name]
+        return (round(x * self.layout.width / 1440), round(y * self.layout.height / 2560))
+
+    def _ability_missed(self, flight: dict) -> None:
+        """The button stayed Ready with its charges: the tap was on the wrong side."""
+        other = 'left' if flight['side'] == 'right' else 'right'
+        sides = self._ability_sides()
+        sides.setdefault(str(flight['account']), {})[flight['side_key']] = other
+        try:
+            self.ABILITY_SIDES.write_text(json.dumps(sides, indent=1) + '\n')
+        except OSError:
+            pass
+        self.note(f'ability tap on the {flight["side"].upper()} did nothing (button still Ready '
+                  f'after 2.5 s) - this account has it on the {other.upper()}; using that now')
+
+    def _try_ability(self, move, observation, me: dict, in_flight: list[dict], accounts,
+                     side: int, frame: dict) -> None:
+        """Tap the hero ability the policy chose: its source unit -> the controller that owns it
+        -> that controller's button. Gated exactly like card plays (arming, scope gate)."""
+        source = getattr(move, 'source_entity', None)
+        player = next((p for p in observation.players if p.owner == side), None)
+        state = next((a for a in (player.ability_runtime_states if player else ())
+                      if a.source_entity == source), None)
+        if state is None:
+            self.note(f'ability for unit {source} has no controller in this frame - not tapped')
+            return
+        slot = int(state.attributes.get('controller_slot', 1))
+        if any(a['slot'] == slot for a in in_flight):
+            return
+        name = state.ability_id
+        allowed, reason = scope_gate.check(accounts, side)
+        if reason != self.gate:
+            self.gate, self.gate_ok = reason, allowed
+            self.note(('scope: ' if allowed else 'SCOPE BLOCK: ') + reason)
+        if not self.armed or not allowed:
+            why = ' [dry run]' if not self.armed else ' [BLOCKED by scope gate]'
+            self.note(f't={frame["game_tick"]/20:5.1f}s  would use {name}{why}')
+            return
+        account = next((a['lo'] for a in (accounts or []) if a and a.get('side') == side), None)
+        side_key, side_name = self._ability_side(slot, me, account)
+        point = self._ability_point(side_name)
+        try:
+            if self.tapper is not None and self.tapper.alive():
+                self.tapper.tap(point)
+            else:
+                adb_run(ADB, SERIAL, 'shell', 'input', 'tap', str(point[0]), str(point[1]))
+        except Exception as error:  # noqa: BLE001
+            self.note(f'ability tap failed: {error}')
+            return
+        charges = next((int(a.get('charges', -1)) for a in me.get('abilities') or ()
+                        if int(a.get('controller_slot', 0)) == slot), -1)
+        in_flight.append({'slot': slot, 'source': source, 'cost': float(state.elixir_cost or 0),
+                          'time': time.time(), 'charges': charges, 'account': account,
+                          'side': side_name, 'side_key': side_key})
+        self.plays += 1
+        self.last_play = name
+        self.note(f't={frame["game_tick"]/20:5.1f}s  ABILITY {name} (controller {slot}, '
+                  f'button at {point[0]},{point[1]})')
+
+    RESULTS = Path(__file__).resolve().parents[1] / 'build' / 'results.jsonl'
+
+    def _record_result(self, result, side: int, tick: int, runner, accounts) -> None:
+        """Say who won, and keep one line per battle in build/results.jsonl."""
+        winner, reason = result
+        verdict = 'no winner yet (tiebreak)' if winner is None else \
+            ('YOU WON' if winner == side else 'you lost')
+        self.last_result = f'{verdict} - {reason}'
+        self.note(f'battle over at t={tick / 20:.1f}s: {self.last_result}. {self.plays} plays; '
+                  f'no more taps this battle')
+        opponent = next((a['lo'] for a in (accounts or []) if a and a.get('side') == 1 - side),
+                        None)
+        entry = {'utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'port': PORT,
+                 'serial': SERIAL, 'model': self.model, 'sampled': bool(runner.sample),
+                 'side': side, 'won': None if winner is None else winner == side,
+                 'reason': reason, 'tick': tick, 'plays': self.plays,
+                 'opponent_account': opponent}
+        try:
+            with self.RESULTS.open('a') as handle:
+                handle.write(json.dumps(entry) + '\n')
+        except OSError:
+            pass
+
+    def _check_deck_fit(self, deck, forms) -> None:
+        """The Hog specialists and our models were trained holding one deck. Say so when this
+        deck differs: out of it they are a different, weaker model (the user, 2026-10-02: The Log
+        swapped for Arrows made ours much weaker in the 2.6 mirror). A card that differs shows in
+        the app (deck_warning); forms not equipped only in the log."""
+        self.deck_warning = ''
+        if self.model not in ('fl:hog1', 'fl:hog2') and not str(self.model).startswith('clapha:'):
+            return
+        flags = {int(c): int(f or 0) for c, f in zip(deck or [], forms or [0] * 8)}
+
+        def name(card):
+            return str(V.CARDS.get(card, {}).get('name', card))
+        missing = [name(c) for c in HOG26_DECK if c not in flags]
+        extra = [name(c) for c in flags if c not in HOG26_DECK]
+        wrong_form = [name(c) for c, form in HOG26_DECK.items() if c in flags and form and not flags[c] & form]
+        if missing:
+            self.deck_warning = (f'Not the deck {self.model} was trained on: {", ".join(extra) or "?"} in place of '
+                                 f'{", ".join(missing)}. Expect much weaker play.')
+            self.note('DECK MISMATCH - ' + self.deck_warning)
+        if wrong_form:
+            self.note(f'forms not equipped (trained mostly with them): {", ".join(wrong_form)}')
+        if not missing and not wrong_form:
+            self.note(f'deck matches the deck {self.model} was trained on')
 
     def _hand_position(self, hand_indices: list[int], deck_slot: int) -> int | None:
         return hand_indices.index(deck_slot) if deck_slot in hand_indices else None
@@ -124,20 +1066,44 @@ class Bot:
             return
         sizes = re.findall(r'(\d+)x(\d+)', adb_run(ADB, SERIAL, 'shell', 'wm size'))
         self.layout = ScreenLayout.from_size(*map(int, sizes[-1]))
+        if self.armed:
+            try:
+                if self.tapper is None or not self.tapper.alive():
+                    self.tapper = TAP.Tapper(ADB, SERIAL, *map(int, sizes[-1]))
+                self.note(f'taps: {self.tapper.describe()}')
+            except Exception as error:  # noqa: BLE001
+                self.tapper = None
+                self.note(f'fast_tap unavailable ({error}); falling back to adb input tap')
         self.note(f'{self.model} loaded (FirstLight V4, FAIR tier, '
                   f'{20.0/runner.decision_ticks:.0f} Hz); '
                   f'{"ARMED - will tap" if self.armed else "dry run - no taps"}')
+        # Pay the model's cold start now, not on the first decision of the match, then take the
+        # model and FirstLight's catalogs out of the garbage collector's scans: a full pass over
+        # them stalled the decision loop past a turn (live: a 638 ms turn late in a match).
+        try:
+            warm_ms = runner.warm_up()
+            import gc
+            gc.collect()
+            gc.freeze()
+            self.note(f'model warmed up in {warm_ms:.0f} ms; long-lived objects frozen out of GC')
+        except Exception as error:  # noqa: BLE001
+            self.note(f'warm-up failed (first decision will be slow): {error}')
         battle = None
         fl_battle = None
+        latch = OutcomeLatch()
         reported: set[int] = set()
-        reported_plays: set[tuple[int, int]] = set()
+        reported_untracked: set[tuple[int, int]] = set()
         pending_battle, pending_since = None, 0.0
-        episode_decks: dict = {}
+        handled_queue: set = set()
         last_turn = -10 ** 9
-        in_flight = None
+        in_flight: list[dict] = []
+        deferred: list[dict] = []
+        reported_abilities: set[int] = set()
+        abilities_in_flight: list[dict] = []
         while self.running:
             with V.LOCK:
                 frame, health = V.STATE['frame'], V.STATE['health']
+                frame_time = V.STATE['updated'] or time.time()
                 reader_error = V.STATE['error']
                 queue = list(V.STATE['queue'])
                 accounts = V.STATE['accounts']
@@ -155,13 +1121,20 @@ class Bot:
                 time.sleep(0.2)
                 continue
             me = next((p for p in frame['players'] if p['side'] == side), None)
-            if not me or len(me['hand_deck_indices']) != 4 or any(h < 0 for h in me['hand_deck_indices']):
+            # For up to ~0.5 s after a play the played slot reads -1 while the next card is drawn
+            # (the card has already moved to the end of the cycle, so hand + cycle still make the
+            # deck). FirstLight's env keeps deciding through that with the slot simply not
+            # playable; skipping the turn instead left the policy's recurrent state behind the
+            # game on every such draw (the "missed decision turn" lines).
+            if not me or len(me['hand_deck_indices']) != 4 or not any(
+                    h >= 0 for h in me['hand_deck_indices']):
                 time.sleep(0.05)
                 continue
             our_deck = me.get('deck_card_ids') or []
             if len(our_deck) != 8:
                 time.sleep(0.2)
                 continue
+            self._measure_evolutions(our_deck, me, frame['chain']['battle'], frame['game_tick'])
 
             if frame['chain']['battle'] != battle:
                 # The episode config needs both decks, and FirstLight's tracker needs the
@@ -176,31 +1149,34 @@ class Bot:
                                          if a and a.get('side') == 1 - side), None)
                 opponent, opponent_forms, deck_note = opponent_deck_file(
                     opponent_account, fresh_after=pending_since - 5)
-                if opponent is None and frame['game_tick'] >= 60:
-                    # nothing fresh: an earlier publication beats a stand-in
-                    opponent, opponent_forms, deck_note = opponent_deck_file(
-                        opponent_account, fresh_after=0)
-                if opponent is None and frame['game_tick'] < 60:
+                if (opponent is None and opponent_account is not None
+                        and frame['game_tick'] < 60):
                     self.status = f'{self.model}: waiting for the opponent deck'
                     time.sleep(0.05)
                     continue
-                opponent_known = opponent is not None
-                if not opponent_known:
-                    opponent, opponent_forms = our_deck, None
-                    deck_note = ('opponent deck unknown - stand-in used; opponent plays will not '
-                                 'reach the tracker (run both consoles for friendlies)')
+                # No fallback to an older publication: a stale file is someone's previous
+                # deck, and its wrong cards were refused by the tracker all match. Unknown is
+                # better -- the runner learns the deck from what the opponent plays.
+                if opponent is None:
+                    deck_note = ('opponent deck not published - learning it from their plays '
+                                 '(Training Camp, or the other console is not running)')
                 self.note(deck_note)
-                seen = {index: list(cards) for index, cards
-                        in enumerate(revealed or [[], []])}
+                self.opponent_intel = None
+                self.opponent_prior = None if opponent is None else {
+                    'battle': str(frame['chain']['battle']), 'cards': [int(c) for c in opponent],
+                    'forms': [2 if int(f) & 2 else 1 if int(f) & 1 else 0 for f in (opponent_forms or [0] * 8)],
+                    'source': 'their deck, as their own console published it', 'kind': 'published'}
+                self._lookup_opponent(accounts, side, frame['chain']['battle'])
                 observation, fl_battle = FLO.build(
-                    frame, health, episode_id=str(frame['chain']['battle']),
-                    revealed=seen)
+                    frame, health, episode_id=str(frame['chain']['battle']))
                 try:
                     runner.end_battle()
                     # The tracker is seeded with exact initial elixir for BOTH owners, which
                     # is what BattleEnv passes and what the tensorizer demands of a
                     # tracker-backed episode. Read, not assumed: a battle joined late does not
                     # start at five.
+                    runner.sample = self._decide_sampling(accounts, side)
+                    runner.set_action_temperature(STEADY_ACTION_TEMPERATURE if self.decoding_used == 'steady' else None)
                     runner.start_battle(our_deck, opponent, side, observation,
                                         {p['side']: p['elixir_raw'] / 10000.0
                                          for p in frame['players']},
@@ -210,112 +1186,238 @@ class Bot:
                     self.note(f'episode start failed: {error}')
                     time.sleep(1.0)
                     continue
-                episode_decks = {side: tuple(our_deck),
-                                 1 - side: tuple(opponent) if opponent_known else ()}
                 battle = frame['chain']['battle']
-                last_turn, in_flight = -10 ** 9, None
+                self._battle_key = str(battle)
+                handled_queue: set = set()
+                last_turn, in_flight, deferred = -10 ** 9, [], []
+                self._resend = []
+                self._dealt = {}
+                abilities_in_flight.clear()
+                latch.reset()
                 self.plays = 0
                 self.note(f'new battle, you are side {side}; '
                           f'warm-up until tick {runner.first_decision_tick}')
+                self._check_deck_fit(our_deck, me.get('deck_form_flags'))
+
+            local_account = next((a['lo'] for a in (accounts or [])
+                                  if a and a.get('side') == side), None)
+            deck = me['deck_card_ids']
+            self._note_hand(me['hand_deck_indices'], int(frame.get('sample_monotonic_us') or 0))
+            with V.LOCK:
+                executed = list(V.STATE['plays'])
+            in_flight = self._settle_in_flight(in_flight, queue, executed, local_account,
+                                               side, frame['game_tick'])
+            deferred += self._resend
+            self._resend = []
+
+            # A tap chosen a moment before the client credits the elixir (frame age, rounding)
+            # waits here, briefly, until the client can actually place it.
+            for d in deferred:
+                if time.time() - d['since'] > self._wait_limit(d) and not latch.over:
+                    name = V.CARDS.get(d['card'], {}).get('name', d['card'])
+                    self.note(f'{name} decided for tick {d["turn"] + d["offset"]} was dropped: '
+                              f'{d.get("wait", "?")} after {self._wait_limit(d):.1f} s')
+                    self.trace('dropped', card=name, turn=d['turn'], offset=d['offset'], wait=d.get('wait'),
+                               decided=d['since'], frame_tick=int(frame['game_tick']))
+            deferred = [d for d in deferred if time.time() - d['since'] <= self._wait_limit(d)
+                        and not latch.over]
+            for move in list(deferred):
+                _f, view_me, reserved = self._input_view(runner, frame, me, in_flight, self._holding(deferred, move))
+                if self._try_play(move, view_me, deck, reserved, in_flight, accounts, side, frame):
+                    deferred.remove(move)
+            view_frame, view_me, reserved = self._input_view(runner, frame, me, in_flight, self._holding(deferred))
 
             # One turn per five-tick window, and never a skipped one. decide() advances a
             # recurrent state and feeds its own chosen action into the next turn, so the
             # schedule belongs to the policy: our tap bookkeeping may suppress a tap, but it
             # must not suppress a turn. Ticks before their first decision tick are warm-up,
             # fed to the tensorizer without acting, as PolicyService's 'observe' op does.
-            local_account = next((a['lo'] for a in (accounts or [])
-                                  if a and a.get('side') == side), None)
             turn = runner.turn_tick(frame['game_tick'])
             if turn <= last_turn:
                 time.sleep(0.02)
                 continue
             skipped = (turn - last_turn) // runner.decision_ticks - 1 if last_turn > 0 else 0
             last_turn = turn
+            turn_began = time.time()
+            # Ticks this frame is past the start of its decision turn: time the policy could
+            # have acted but the five-tick grid it was trained on made it wait.
+            turn_wait_ms = (frame['game_tick'] - turn) * 50.0
 
             try:
-                seen = {index: list(cards) for index, cards
-                        in enumerate(revealed or [[], []])}
-                reserved = 0.0
-                if in_flight and time.time() - in_flight[1] <= 2.5:
-                    reserved = float(in_flight[2])
-                with V.LOCK:
-                    plays = list(V.STATE['plays'])
-                observation, fl_battle = FLO.build(frame, health, episode_id=str(battle),
-                                                   battle=fl_battle, revealed=seen,
-                                                   reserved=reserved, plays=plays,
-                                                   decks=episode_decks)
-                for side_card in sorted(fl_battle.untracked_plays - reported_plays):
-                    reported_plays.add(side_card)
-                    who = 'opponent' if side_card[0] != side else 'own'
-                    self.note(f'{who} play of {V.CARDS.get(side_card[1], {}).get("name", side_card[1])}'
-                              f' not in the episode deck - not given to the tracker')
+                # Every card either side has shown is registered with the tracker first, so
+                # the opponent's deck grows as they play; anything refused is said, per play.
+                revealed_cards = {
+                    index: [V.card_identity(c)[0] for c in cards
+                            if V.card_identity(c)[2] == 'card']
+                    for index, cards in enumerate(revealed or [[], []])}
+                intel = self.opponent_intel
+                if intel and runner.api_deck_state == 'none' and intel.get('deck'):
+                    note = runner.adopt_api_deck([c['card_id'] for c in intel['deck']])
+                    if note:
+                        self.note(note)
+                for owner, card_id, reason in runner.register_plays(executed, revealed_cards):
+                    who = 'opponent' if owner != side else 'own'
+                    self.note(f'{who} {V.CARDS.get(card_id, {}).get("name", card_id)} NOT '
+                              f'registered: {reason}')
+                opponent_player = next((p for p in frame['players']
+                                        if p.get('side') == 1 - side), None)
+                for line in runner.attribute_opponent_abilities(executed, opponent_player):
+                    self.note(line)
+                for line in runner.messages:
+                    self.note(line)
+                runner.messages.clear()
+                self._report_queue_oddities(executed, handled_queue)
+                seen = {side: revealed_cards.get(side, []),
+                        1 - side: [c for c in revealed_cards.get(1 - side, [])
+                                   if c in runner.opponent_seen]}
+                delay = TARGET_DELAY
+                if runner.clapha_inputs:
+                    runner.elixir_lead = elixir_lead(delay)
+                if delay != self.told_delay:
+                    self.told_delay = delay
+                    self.note(f'plays land {delay} ticks after their moment (held to it; tap lag '
+                              f'{self._tap_lag()} ticks)' + (f'; elixir lead {runner.elixir_lead}'
+                                                               if runner.clapha_inputs else ''))
+                observation, fl_battle = FLO.build(
+                    view_frame, health, episode_id=str(battle), battle=fl_battle, revealed=seen,
+                    reserved=reserved + sum(a['cost'] for a in abilities_in_flight),
+                    plays=executed, decks=runner.tracked_decks(),
+                    hand_forms=runner.hand_forms(deck, me.get('deck_form_flags'),
+                                                 me.get('evo_progress'), self.evo_required),
+                    pending_ability_sources=tuple(a['source'] for a in abilities_in_flight),
+                    evo_required=self.evo_required, elixir_lead_ticks=runner.elixir_lead)
+                self._hand_forms = runner.hand_forms(deck, me.get('deck_form_flags'),
+                                                     me.get('evo_progress'), self.evo_required)
+                if runner.has_extras:
+                    self._feed_extras(runner, frame, side, in_flight, queue, accounts, self._hand_forms,
+                                      delay=delay)
+                for character in sorted(fl_battle.unresolved_abilities - reported_abilities):
+                    reported_abilities.add(character)
+                    self.note(f'hero controller character {character} has no single FirstLight '
+                              f'ability - not offered to the policy')
                 for card_id in sorted(set(fl_battle.unresolved) - reported):
                     reported.add(card_id)
-                    name = V.CARDS.get(card_id, {}).get('name', card_id)
-                    self.note(f'{name} has no entity archetype - that entity is left out '
-                              f'(spell effects; units are unaffected)')
+                    base = FLO.base_card(card_id)
+                    name = V.CARDS.get(base, {}).get('name', card_id)
+                    if V.CARDS.get(base, {}).get('type') == 'spell':
+                        self.note(f'{name}: spell effect on the board is not shown to the '
+                                  f'model (no FirstLight archetype for spell objects yet)')
+                    else:
+                        self.note(f'UNIT {name} ({card_id}) is not shown to the model: '
+                                  f'FirstLight has no archetype for it (newer card?)')
+                for side_card in sorted(fl_battle.untracked_plays - reported_untracked):
+                    reported_untracked.add(side_card)
+                    who = 'opponent' if side_card[0] != side else 'own'
+                    self.note(f'{who} play of '
+                              f'{V.CARDS.get(side_card[1], {}).get("name", side_card[1])} not given '
+                              f'to the tracker (Mirror, or no FirstLight card spec)')
+                for card_id in sorted(fl_battle.form_fallbacks - reported):
+                    reported.add(card_id)
+                    base = FLO.base_card(card_id)
+                    self.note(f'{V.CARDS.get(base, {}).get("name", base)} form {card_id} is '
+                              f'unknown to FirstLight - shown to the model as the base unit')
+                # Once the battle is decided the client keeps its clock running for a few
+                # seconds and accepts taps it never executes (2026-09-25: four taps after a
+                # sudden-death win). Stop acting then; a result that does not hold for half a
+                # second is not acted on, and one that is withdrawn resumes play.
+                event = latch.update(FLO.battle_result(fl_battle, frame['game_tick']),
+                                     time.time())
+                if event == 'over':
+                    self._record_result(latch.result, side, frame['game_tick'], runner,
+                                        accounts)
+                elif event == 'withdrawn':
+                    self.note('battle result withdrawn (a tower read as down is back) - '
+                              'playing on')
+                if latch.over:
+                    self.status = f'{self.model}: battle over - {self.last_result}'
+                    continue
                 if turn < runner.first_decision_tick:
                     runner.observe(observation)
                     self.status = (f'{self.model}: warm-up '
                                    f'{turn}/{runner.first_decision_tick}')
                     continue
+                started = time.time()
                 moves = runner.decide(observation)
+                decided = time.time()
+                timing_now = {'prep_ms': (started - turn_began) * 1000.0,
+                              'decide_ms': (decided - started) * 1000.0,
+                              'frame_age_ms': (turn_began - frame_time) * 1000.0}
             except Exception as error:  # noqa: BLE001
                 self.note(f'decide failed: {error}')
                 self.status = f'{self.model}: DECIDE FAILING - {str(error)[:80]}'
                 continue
+            self.trace('turn', turn=turn, frame_tick=int(frame['game_tick']),
+                       frame_us=frame.get('sample_monotonic_us'), received=frame_time, began=turn_began,
+                       prep_ms=timing_now['prep_ms'], decide_ms=timing_now['decide_ms'], moves=len(moves),
+                       skipped=skipped)
             if skipped > 0:
-                self.note(f'missed {skipped} decision turn(s) at tick {turn} - '
-                          f'the policy state is behind the game')
+                # Where the time went, so the cause is in the log rather than guessed at: the
+                # previous turn's own cost, how long the loop was away between turns, and how
+                # old the frame was when this turn began.
+                prev = getattr(self, '_prev_turn_timing', {}) or {}
+                self.note(f'missed {skipped} decision turn(s) at tick {turn} - the policy state '
+                          f'is behind the game. previous turn: prep '
+                          f'{prev.get("prep_ms", 0):.0f} ms, decide {prev.get("decide_ms", 0):.0f} '
+                          f'ms, after {prev.get("after_ms", 0):.0f} ms; away '
+                          f'{(turn_began - prev.get("ended", turn_began)) * 1000:.0f} ms; '
+                          f'this frame {timing_now["frame_age_ms"]:.0f} ms old')
             self.status = (f'{self.model} playing - {me["elixir_raw"]/10000:.1f} elixir - '
-                           f'{self.plays} plays')
+                           f'{self.plays} plays - opponent deck {len(runner.opponent_seen)}/8 '
+                           f'seen ({runner.opponent_source})')
 
-            # A turn can carry two plays. Take them in the order the policy asked for.
-            for kind, hand_slot, card_id, target_grid, _offset in moves:
+            # A turn can carry two plays. Take them in the order the policy asked for; the
+            # second is a real play (Hog + Ice Spirit is one decision), not a duplicate.
+            # An ability stays "in flight" until its button leaves Ready (the command, like a
+            # card, takes ~21 ticks to execute) or 2.5 s pass; until then it is not re-offered.
+            live_buttons = {int(a.get('controller_slot', 0)): int(a.get('button', 0))
+                            for a in me.get('abilities') or ()}
+            live_charges = {int(a.get('controller_slot', 0)): int(a.get('charges', -1))
+                            for a in me.get('abilities') or ()}
+            for a in abilities_in_flight:
+                if (time.time() - a['time'] >= 2.5 and live_buttons.get(a['slot']) in (2, 4)
+                        and live_charges.get(a['slot']) == a['charges']):
+                    self._ability_missed(a)
+            abilities_in_flight[:] = [
+                a for a in abilities_in_flight
+                if time.time() - a['time'] < 2.5 and live_buttons.get(a['slot']) in (2, 4)]
+            for move in moves:
+                if str(getattr(move[0], 'value', move[0])) == 'activate_ability':
+                    self._try_ability(move, observation, me, abilities_in_flight, accounts,
+                                      side, frame)
+            for kind, _hand_slot, card_id, target_grid, offset in moves:
                 if str(getattr(kind, 'value', kind)) != 'play_card' or target_grid is None:
                     continue
-                name = V.CARDS.get(card_id, {}).get('name', str(card_id))
                 # FirstLight decodes to a NATIVE grid point [x, y] (perspective already
                 # undone), so x is the column and y is the row. Reading it as (row, col)
                 # transposed every placement the model asked for.
                 column, row = int(target_grid[0]), int(target_grid[1])
-                cell = row * X_TILES + column
-                position = hand_slot if isinstance(hand_slot, int) else None
-                if position is None or not 0 <= position < 4 or not 0 <= cell < 576:
+                if not (0 <= column < X_TILES and 0 <= row < Y_TILES):
                     continue
-
-                allowed, reason = scope_gate.check(accounts, side)
-                if reason != self.gate:
-                    self.gate, self.gate_ok = reason, allowed
-                    self.note(('scope: ' if allowed else 'SCOPE BLOCK: ') + reason)
-                if not self.armed or not allowed:
-                    why = ' [dry run]' if not self.armed else ' [BLOCKED by scope gate]'
-                    self.note(f't={frame["game_tick"]/20:5.1f}s  would play {name} '
-                              f'slot {position} at row {row} col {column}{why}')
-                    continue
-                # The client needs ~20 ticks to accept a play. Suppress a duplicate tap for
-                # the same slot while one is outstanding -- but the turn above was still
-                # taken, so the policy's state stays aligned.
-                if in_flight:
-                    slot, since = in_flight[0], in_flight[1]
-                    if slot in me['hand_deck_indices'] and time.time() - since <= 2.5:
-                        continue
-                    in_flight = None
-                ours_pending = [e for e in queue if e['card_id'] > 0 and
-                                (e['account_lo'] == local_account
-                                 if local_account is not None else e['account_lo'] >= 0)]
-                if ours_pending:
-                    continue
-                try:
-                    send_card_taps(ADB, SERIAL, self.layout, position, cell, side=side)
-                except Exception as error:  # noqa: BLE001
-                    self.note(f'tap failed: {error}')
-                    continue
-                in_flight = (me['hand_deck_indices'][position], time.time(),
-                             float(V.CARDS.get(card_id, {}).get('elixir') or 0))
-                self.plays += 1
-                self.last_play = f'{name} at row {row} col {column}'
-                self.note(f't={frame["game_tick"]/20:5.1f}s  {name:<14} row {row:2} col {column:2}')
+                # tapped at its moment in the turn, as il.duel and training time it: the turn's
+                # tick plus the model's offset (0-4), then the pipeline's own delay
+                move = {'card': int(card_id), 'row': row, 'column': column,
+                        'since': decided, 'turn': turn, 'offset': int(offset or 0),
+                        'not_before': turn + int(offset or 0) + TARGET_DELAY - COMMAND_AGE_TICKS + 1
+                                      - self._tap_lag(),
+                        'timing': {'decided': decided,
+                                   'inference_ms': (decided - started) * 1000.0,
+                                   'frame_age_ms': (started - frame_time) * 1000.0,
+                                   'turn_wait_ms': turn_wait_ms,
+                                   'frame_tick': int(frame['game_tick']),
+                                   'frame_us': frame.get('sample_monotonic_us'),
+                                   'received': frame_time, 'began': turn_began, 'started': started}}
+                waiting = next((d for d in deferred if d['card'] == move['card'] and d.get('deal_wait')), None)
+                if waiting is not None:
+                    # chosen again while it waits for its deal: the newer tile, the earlier moment (it is overdue)
+                    move['not_before'] = min(move['not_before'], waiting['not_before'])
+                _f, view_me, reserved = self._input_view(runner, frame, me, in_flight, self._holding(deferred, move))
+                if not self._try_play(move, view_me, deck, reserved, in_flight, accounts, side,
+                                      frame):
+                    deferred = [d for d in deferred if d['card'] != move['card']] + [move]
+                view_frame, view_me, reserved = self._input_view(runner, frame, me, in_flight, self._holding(deferred))
+            ended = time.time()
+            self._prev_turn_timing = {**timing_now, 'after_ms': (ended - decided) * 1000.0,
+                                      'ended': ended}
         runner.end_battle()
         self.status = 'off'
 
@@ -507,15 +1609,40 @@ class Handler(BaseHTTPRequestHandler):
                 result = 'unknown action'
             self._send(json.dumps({'result': result}).encode(), 'application/json')
             return
+        if route.path == '/api/decoding':
+            value = (parse_qs(route.query).get('value') or [''])[0]
+            if value in ('auto', 'sampled', 'steady', 'greedy'):
+                BOT.decoding = value
+                save_settings(decoding=value)
+                BOT.note(f'decoding preference -> {value} (applies from the next battle)')
+                result = 'ok'
+            else:
+                result = f'unknown decoding {value}'
+            self._send(json.dumps({'result': result}).encode(), 'application/json')
+            return
+        if route.path == '/api/mode':
+            query = parse_qs(route.query)
+            result = BOT.set_mode((query.get('mode') or [''])[0],
+                                  (query.get('model') or [None])[0])
+            self._send(json.dumps({'result': result}).encode(), 'application/json')
+            return
         if route.path == '/state':
             with V.LOCK:
                 frame, health = V.STATE['frame'], V.STATE['health']
                 reader_error = V.STATE['error']
                 age = time.time() - V.STATE['updated'] if V.STATE['updated'] else None
                 queue, gap = list(V.STATE['queue']), V.STATE['gap']
+                accounts = V.STATE['accounts']
+                plays = list(V.STATE['plays'])
             bot = {'running': BOT.running, 'armed': BOT.armed, 'model': BOT.model,
                    'status': BOT.status, 'plays': BOT.plays, 'last_play': BOT.last_play,
-                   'log': BOT.log[-14:], 'models': list(MA.MODELS) + FLB.available(),
+                   'log': BOT.log[-int((parse_qs(route.query).get('log') or ['14'])[0]):],
+                   'models': list(MA.MODELS) + FLB.available(),
+                   'mode': ('off' if not BOT.running else 'play' if BOT.armed else 'watch'),
+                   'serial': SERIAL, 'port': PORT,
+                   'decoding': BOT.decoding, 'decoding_used': BOT.decoding_used,
+                   'deck_warning': ' '.join(filter(None, (BOT.model_warning(), BOT.deck_warning))),
+                   'code_changed': code_changed(),
                    'gate': BOT.gate, 'gate_ok': BOT.gate_ok, 'deduced': BOT.deduced,
                    'reader_error': reader_error}
             if frame and health and frame.get('battle_active'):
@@ -527,7 +1654,13 @@ class Handler(BaseHTTPRequestHandler):
                 for player in frame['players']:
                     revealed[player['side']] = []
                 body = {'ok': True, 'age': age, 'pending': pending, 'lag_ticks': gap,
+                        'pending_commands': pending_commands(
+                            queue, accounts, frame.get('game_tick') or 0,
+                            health.get('local_side'), BOT.layout)
+                        + landings_for_overlay(frame, health, plays, BOT.layout),
                         'session': V.SESSION.name, 'bot': bot, 'revealed': revealed,
+                        'opponent': opponent_view(frame, health, plays, queue, accounts,
+                                                  BOT.prior_deck(frame['chain']['battle'])),
                         **V.to_state(frame, health)}
             else:
                 body = {'ok': False, 'age': age, 'bot': bot,
@@ -543,6 +1676,7 @@ PAGE = V.PAGE.replace('</div>\n</div>\n<script>', """</div>
     <label style="display:flex;gap:8px;align-items:center;margin:10px 0">
       <input type="checkbox" id="armed"><span>arm taps (Training Camp / own account only)</span>
     </label>
+
     <div style="display:flex;gap:8px">
       <button id="botStart" style="flex:1;padding:8px;border-radius:8px;border:1px solid var(--line);
         background:#2b3446;color:var(--ink);cursor:pointer">start</button>

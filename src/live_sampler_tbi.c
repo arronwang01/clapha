@@ -41,6 +41,14 @@ typedef struct {
   int32_t deck_card_ids[8];
   int32_t deck_form_flags[8];
   int32_t deck_visible;
+  /* Per-deck-slot evolution progress (player+0x2e8 native vector) and the two hero/champion
+     ability controllers (player+0x3a0, +0x3a8). Offsets are FirstLight's (Null's 15.535.13
+     probe) and were confirmed on this build by src/runtime_probe.c on the device. */
+  int32_t evo_count;
+  int32_t evo_progress[8];
+  int32_t ability_present[2];
+  int32_t ability_charges[2], ability_button[2], ability_cooldown[2], ability_configured[2];
+  uint32_t ability_character[2];
 } PlayerFrame;
 
 typedef struct {
@@ -62,6 +70,10 @@ typedef struct {
      component vtables located on this build by src/comp_probe.c. -1 / 0 = component absent. */
   int32_t deploy_remaining, has_attack, atk_stage, atk_timeline, atk_load, has_move, charge;
   uint64_t target;
+  /* The object's own data record (+0x48 -> +0x40, FirstLight's kObjectDataOffset): the unit a
+     spawner produced (a Battle Ram's Barbarians, a Tombstone's Skeletons) or the ProjectileData
+     / AreaEffectData of a spell in flight -- the id FirstLight's archetype catalog is keyed by. */
+  uint32_t data_id;
 } EntityFrame;
 
 /* Component vtables as offsets into libg for build 160402012 (libg sha256 aec6cc5e...),
@@ -221,6 +233,39 @@ static int read_visible_deck(int fd, PlayerFrame *player) {
   return 1;
 }
 
+/* Never fails the frame: a battle with no heroes or a transient read simply reports none. */
+static void read_player_runtime(int fd, PlayerFrame *player) {
+  player->evo_count = 0;
+  for (int i = 0; i < 2; ++i) player->ability_present[i] = 0;
+  if (!player->address) return;
+  uint64_t data = 0;
+  int32_t capacity = 0, count = 0;
+  if (read_exact(fd, player->address + 0x2E8, &data, 8) &&
+      read_exact(fd, player->address + 0x2F0, &capacity, 4) &&
+      read_exact(fd, player->address + 0x2F4, &count, 4) && data && count > 0 && count <= 8 &&
+      capacity >= count && capacity <= 64 &&
+      read_exact(fd, data, player->evo_progress, (size_t)count * sizeof(int32_t)))
+    player->evo_count = count;
+  for (int i = 0; i < 2; ++i) {
+    uint64_t controller = 0, back = 0, character = 0;
+    if (!read_exact(fd, player->address + 0x3A0 + (uint64_t)i * 8, &controller, 8) || !controller)
+      continue;
+    /* the controller's back-pointer is how the probe identified it; keep it as the check */
+    if (!read_exact(fd, controller + 0x20, &back, 8) ||
+        (back & 0x00FFFFFFFFFFFFFFULL) != (player->address & 0x00FFFFFFFFFFFFFFULL))
+      continue;
+    if (!read_exact(fd, controller + 0x78, &player->ability_cooldown[i], 4) ||
+        !read_exact(fd, controller + 0x7C, &player->ability_configured[i], 4) ||
+        !read_exact(fd, controller + 0x80, &player->ability_charges[i], 4) ||
+        !read_exact(fd, controller + 0x98, &player->ability_button[i], 4))
+      continue;
+    player->ability_character[i] = 0;
+    if (read_exact(fd, controller + 0x90, &character, 8) && character)
+      read_exact(fd, character + 0x40, &player->ability_character[i], 4);
+    player->ability_present[i] = 1;
+  }
+}
+
 static int read_player_pair(int fd, uint64_t player_state,
                             PlayerFrame players[2]) {
   uint64_t addresses[2] = {0, 0};
@@ -230,7 +275,8 @@ static int read_player_pair(int fd, uint64_t player_state,
          read_player(fd, addresses[0], &players[0]) &&
          read_player(fd, addresses[1], &players[1]) &&
          read_visible_deck(fd, &players[0]) &&
-         read_visible_deck(fd, &players[1]);
+         read_visible_deck(fd, &players[1]) &&
+         (read_player_runtime(fd, &players[0]), read_player_runtime(fd, &players[1]), 1);
 }
 
 static int seen_insert(uint64_t *table, size_t capacity, uint64_t value) {
@@ -336,14 +382,34 @@ static int read_entities(int fd, ChainFrame *frame) {
     memcpy(&item.card_id, raw + 0xAC, 4);
     memcpy(&item.level, raw + 0x120, 4);
     memcpy(&item.behavior, raw + 0x11C, 4);
-    if (item.category < 5000000 || item.category >= 6000000 ||
-        item.kind < 10 || item.kind > 20 || item.side < 0 || item.side > 1 ||
+    uint64_t data_record = 0;
+    memcpy(&data_record, raw + 0x48, 8);
+    if (data_record) read_exact(fd, data_record + 0x40, &item.data_id, 4);
+    /* Projectiles and area effects (kind 0, category 4xxxxxx) carry a ProjectileData (10xxxxxx)
+       or AreaEffectData (22xxxxxx) record; keep exactly those, as FirstLight's catalog names
+       them. Everything else keeps the original unit filter. */
+    int effect = item.kind == 0 && item.category >= 4000000 && item.category < 5000000 &&
+                 ((item.data_id >= 10000000 && item.data_id < 11000000) ||
+                  (item.data_id >= 22000000 && item.data_id < 23000000));
+    if (!effect && (item.category < 5000000 || item.category >= 6000000 ||
+        item.kind < 10 || item.kind > 20) ) {
+      frame->filtered_count++;
+      continue;
+    }
+    if (item.side < 0 || item.side > 1 ||
         item.x < 0 || item.x > 18000 || item.y < 0 || item.y > 32000 ||
-        item.level < 0 || item.level > 16 ||
+        (!effect && (item.level < 0 || item.level > 16)) ||
         (item.card_id != -1 && (item.card_id < 20000000 || item.card_id >= 1000000000) &&
          /* evolution unit forms carry 13xxxxxx, below the card-id range */
          (item.card_id < 13000000 || item.card_id >= 14000000))) {
       frame->filtered_count++;
+      continue;
+    }
+    if (effect) {
+      /* a projectile or area effect: no level, hitpoints, deploy timer or components of a unit */
+      item.level = 0;
+      item.deploy_remaining = 0;
+      frame->entities[frame->entity_count++] = item;
       continue;
     }
     item.level++;
@@ -492,6 +558,22 @@ static void emit_player(const PlayerFrame *player, int side) {
       printf("%d", player->deck_form_flags[index]);
     }
   }
+  printf("],\"evo_progress\":[");
+  for (int index = 0; index < player->evo_count; ++index) {
+    if (index) putchar(',');
+    printf("%d", player->evo_progress[index]);
+  }
+  printf("],\"abilities\":[");
+  int first = 1;
+  for (int i = 0; i < 2; ++i) {
+    if (!player->ability_present[i]) continue;
+    printf("%s{\"controller_slot\":%d,\"charges\":%d,\"button\":%d,\"cooldown_ms\":%d,"
+           "\"configured_ms\":%d,\"character_id\":%u}",
+           first ? "" : ",", i + 1, player->ability_charges[i], player->ability_button[i],
+           player->ability_cooldown[i], player->ability_configured[i],
+           player->ability_character[i]);
+    first = 0;
+  }
   printf("]}");
 }
 
@@ -556,11 +638,11 @@ int main(int argc, char **argv) {
                "\"x\":%d,\"y\":%d,\"card_id\":%d,\"level\":%d,\"hp\":%d,\"max_hp\":%d,"
                "\"behavior_state_raw\":%d,\"deploy_remaining\":%d,\"has_attack\":%d,"
                "\"target\":\"0x%" PRIx64 "\",\"atk_stage\":%d,\"atk_timeline\":%d,"
-               "\"atk_load\":%d,\"has_move\":%d,\"charge\":%d}",
+               "\"atk_load\":%d,\"has_move\":%d,\"charge\":%d,\"data_id\":%u}",
                e->address, e->category, e->kind, e->side,
                e->x, e->y, e->card_id, e->level, e->hp, e->max_hp, e->behavior,
                e->deploy_remaining, e->has_attack, e->target, e->atk_stage, e->atk_timeline,
-               e->atk_load, e->has_move, e->charge);
+               e->atk_load, e->has_move, e->charge, e->data_id);
       }
       putchar(']');
     }

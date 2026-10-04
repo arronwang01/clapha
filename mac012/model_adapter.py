@@ -36,14 +36,15 @@ def to_state(frame: dict, local_side: int, deduced: dict | None = None) -> dict:
     units are kind 15. Coordinates and elixir stay in native units, as the engine expects.
     """
     entities = []
-    live = {(e['x'], e['y']): e for e in frame['entities'] if e['card_id'] == -1}
+    live = {(e['x'], e['y']): e for e in frame['entities']
+            if e['card_id'] == -1 and e.get('kind') != 0}
     for x, y, side, kind in TOWERS:
         tower = live.get((x, y))
         entities.append({'kind': kind, 'side': side, 'card_id': -1, 'x': x, 'y': y,
                          'hp': (tower or {}).get('hp', 0),
                          'max_hp': (tower or {}).get('max_hp', 1)})
     for e in frame['entities']:
-        if e['card_id'] == -1:
+        if e['card_id'] == -1 or e.get('kind') == 0:   # towers; projectiles are not units
             continue
         # tensors() treats kind 12/13 as crown towers, and buildings (Cannon, Tombstone)
         # come through with those kinds - passing them straight through would corrupt the

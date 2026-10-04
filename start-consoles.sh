@@ -8,7 +8,7 @@ ADB="$HOME/Library/Android/sdk/platform-tools/adb"
 MUMU="/Applications/MuMuPlayer Pro.app/Contents/MacOS/mumu-cli"
 DEV0_PORT=26624     # main account
 DEV1_PORT=26656     # second account
-TOOLS="live_sampler_tbi queue_probe deck_vector_scan player_dump peek fast_tap"
+TOOLS="live_sampler_tbi queue_probe deck_vector_scan player_dump peek fast_tap runtime_probe"
 
 say() { printf '%s\n' "$*"; }
 
@@ -34,7 +34,20 @@ for port in $DEV0_PORT $DEV1_PORT; do
 done
 "$ADB" devices | sed -n '2,$p' | sed '/^$/d' | sed 's/^/  /'
 
-# 3. make sure each device has the native tools
+# 3. rebuild the native tools whose source is newer than their binary, then make sure each
+#    device has them
+NDK_CC="$(ls -d "$HOME"/Library/Android/sdk/ndk/*/toolchains/llvm/prebuilt/*/bin/aarch64-linux-android31-clang 2>/dev/null | tail -1)"
+for tool in live_sampler_tbi queue_probe fast_tap runtime_probe comp_probe; do
+  if [ "$CLAPHA/src/$tool.c" -nt "$CLAPHA/build/$tool" ]; then
+    if [ -n "$NDK_CC" ]; then
+      mkdir -p "$CLAPHA/build"
+      "$NDK_CC" -O2 -o "$CLAPHA/build/$tool" "$CLAPHA/src/$tool.c" &&
+        say "rebuilt $tool" || say "$tool build FAILED"
+    else
+      say "$tool source changed but no NDK clang found"
+    fi
+  fi
+done
 for port in $DEV0_PORT $DEV1_PORT; do
   serial="127.0.0.1:$port"
   "$ADB" -s "$serial" shell 'id' >/dev/null 2>&1 || continue
@@ -61,7 +74,7 @@ done
 
 # 4. say, per device, whether the reader can actually attach
 say "checking readers..."
-CR_MUMU_SERIAL="127.0.0.1:$DEV0_PORT" python3 "$CLAPHA/mac012/preflight.py" \
+CR_MUMU_SERIAL="127.0.0.1:$DEV0_PORT" "$CLAPHA/py" "$CLAPHA/mac012/preflight.py" \
   "127.0.0.1:$DEV0_PORT" "127.0.0.1:$DEV1_PORT" 2>&1 | sed 's/^/  /'
 
 # 5. replace any running consoles
@@ -71,9 +84,9 @@ sleep 1
 
 cd "$CLAPHA" || exit 1
 CR_MUMU_SERIAL="127.0.0.1:$DEV0_PORT" CR_CONSOLE_PORT=8777 \
-  nohup python3 mac012/console.py > build/console_dev0.log 2>&1 &
+  nohup ./py mac012/console.py > build/console_dev0.log 2>&1 &
 CR_MUMU_SERIAL="127.0.0.1:$DEV1_PORT" CR_CONSOLE_PORT=8778 \
-  nohup python3 mac012/console.py > build/console_dev1.log 2>&1 &
+  nohup ./py mac012/console.py > build/console_dev1.log 2>&1 &
 
 # 6. wait until they answer, then open them
 for p in 8777 8778; do
@@ -86,7 +99,7 @@ done
 for p in 8777 8778; do
   if curl -sf "http://127.0.0.1:$p/state" >/dev/null 2>&1; then
     say "  console on http://127.0.0.1:$p  (ready)"
-    open "http://127.0.0.1:$p"
+    [ -z "${CLAPHA_NO_BROWSER:-}" ] && open "http://127.0.0.1:$p"
   else
     say "  console on http://127.0.0.1:$p  FAILED - see build/console_dev*.log"
   fi
